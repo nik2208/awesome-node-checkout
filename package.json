@@ -1,0 +1,48 @@
+{
+  "name": "awesome-node-checkout",
+  "version": "1.0.0",
+  "description": "Framework-agnostic payment checkout library for Node.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "commonjs",
+  "exports": {
+    ".": "./dist/index.js",
+    "./express": "./dist/adapters/express/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "payment",
+    "checkout",
+    "paypal",
+    "nexi",
+    "satispay",
+    "stripe",
+    "node",
+    "typescript",
+    "framework-agnostic"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "@types/supertest": "^7.2.0",
+    "express": "^5.0.0",
+    "supertest": "^7.2.2",
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.1"
+  },
+  "dependencies": {
+    "@paypal/paypal-server-sdk": "^2.2.0"
+  }
+}

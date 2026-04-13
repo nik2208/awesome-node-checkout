@@ -56,6 +56,15 @@ export class SatispayProvider extends BasePaymentProvider {
         ? 'https://authservices.satispay.com/g_business/v1'
         : 'https://staging.authservices.satispay.com/g_business/v1';
     this.transactionStore = config.transactionStore ?? new InMemoryTransactionStore();
+
+    if (!config.webhookPublicKey) {
+      console.warn(
+        '[SatispayProvider] webhookPublicKey is not configured: ' +
+        'incoming webhook signatures will NOT be verified. ' +
+        'Anyone who knows the webhook URL can send fake payment notifications. ' +
+        'Set webhookPublicKey in SatispayProviderConfig before deploying to production.',
+      );
+    }
   }
 
   // ---------------------------------------------------------------------------

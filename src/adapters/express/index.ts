@@ -113,7 +113,7 @@ export function createCheckoutRouter(
     try {
       const result = await checkout.handleRedirect(
         String(req.params.provider),
-        req.query as Record<string, any>,
+        req.query as Record<string, string>,
       );
       res.status(result.success ? 200 : 400).json(result);
     } catch (err) {

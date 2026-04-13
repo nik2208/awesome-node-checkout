@@ -3,7 +3,7 @@ import { PaymentRequest } from './models/payment-request.model';
 import { PaymentResult, WebhookResult } from './models/payment-result.model';
 import { CheckoutConfig } from './models/checkout-config.model';
 import { CheckoutError } from './models/errors';
-import { CheckoutEventBus } from './events/checkout-event-bus';
+import { CheckoutEventBus, CheckoutEventName, CheckoutEventPayload } from './events/checkout-event-bus';
 
 /**
  * Main entry point for awesome-node-checkout.
@@ -33,6 +33,16 @@ export class CheckoutConfigurator {
   readonly events: CheckoutEventBus = new CheckoutEventBus();
 
   constructor(private readonly config: CheckoutConfig = {}) {}
+
+  /** Emits an event only when `config.emitEvents` is not explicitly `false`. */
+  private async emit(
+    event: CheckoutEventName,
+    data: Omit<CheckoutEventPayload, 'timestamp'>,
+  ): Promise<void> {
+    if (this.config.emitEvents !== false) {
+      await this.events.emit(event, data);
+    }
+  }
 
   /**
    * Register a payment provider. Chainable.
@@ -76,7 +86,7 @@ export class CheckoutConfigurator {
   async createPayment(providerName: string, request: PaymentRequest): Promise<PaymentResult> {
     const provider = this.getProvider(providerName);
     const result = await provider.createPayment(request);
-    await this.events.emit(result.success ? 'payment.created' : 'payment.failed', {
+    await this.emit(result.success ? 'payment.created' : 'payment.failed', {
       provider: providerName,
       paymentId: result.paymentId,
       orderId: request.orderId,
@@ -90,11 +100,11 @@ export class CheckoutConfigurator {
   async executePayment(
     providerName: string,
     paymentId: string,
-    data?: any,
+    data?: Record<string, string>,
   ): Promise<PaymentResult> {
     const provider = this.getProvider(providerName);
     const result = await provider.executePayment(paymentId, data);
-    await this.events.emit(result.success ? 'payment.completed' : 'payment.failed', {
+    await this.emit(result.success ? 'payment.completed' : 'payment.failed', {
       provider: providerName,
       paymentId,
       status: result.status,
@@ -117,7 +127,7 @@ export class CheckoutConfigurator {
   ): Promise<PaymentResult> {
     const provider = this.getProvider(providerName);
     const result = await provider.refundPayment(paymentId, amount);
-    await this.events.emit('payment.refunded', {
+    await this.emit('payment.refunded', {
       provider: providerName,
       paymentId,
       status: result.status,
@@ -132,7 +142,7 @@ export class CheckoutConfigurator {
    */
   async handleWebhook(
     providerName: string,
-    body: any,
+    body: Record<string, unknown>,
     headers: Record<string, string>,
   ): Promise<WebhookResult> {
     const provider = this.getProvider(providerName);
@@ -144,7 +154,7 @@ export class CheckoutConfigurator {
       );
     }
     const result = await provider.handleWebhook(body, headers);
-    await this.events.emit('webhook.received', {
+    await this.emit('webhook.received', {
       provider: providerName,
       paymentId: result.paymentId,
       status: result.status,
@@ -160,7 +170,7 @@ export class CheckoutConfigurator {
    */
   async handleRedirect(
     providerName: string,
-    query: Record<string, any>,
+    query: Record<string, string>,
   ): Promise<PaymentResult> {
     const provider = this.getProvider(providerName);
     if (!provider.handleRedirect) {
@@ -171,7 +181,7 @@ export class CheckoutConfigurator {
       );
     }
     const result = await provider.handleRedirect(query);
-    await this.events.emit(result.success ? 'payment.completed' : 'payment.failed', {
+    await this.emit(result.success ? 'payment.completed' : 'payment.failed', {
       provider: providerName,
       paymentId: result.paymentId,
       status: result.status,

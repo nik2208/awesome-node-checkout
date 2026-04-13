@@ -20,7 +20,7 @@ export abstract class BasePaymentProvider implements IPaymentProvider {
   abstract readonly flow: PaymentFlow;
 
   abstract createPayment(request: PaymentRequest): Promise<PaymentResult>;
-  abstract executePayment(paymentId: string, data?: any): Promise<PaymentResult>;
+  abstract executePayment(paymentId: string, data?: Record<string, string>): Promise<PaymentResult>;
   abstract getPaymentDetails(paymentId: string): Promise<PaymentResult>;
   abstract refundPayment(paymentId: string, amount?: number): Promise<PaymentResult>;
 

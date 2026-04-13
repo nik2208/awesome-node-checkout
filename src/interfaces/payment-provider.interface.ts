@@ -19,7 +19,7 @@ export interface IPaymentProvider {
   createPayment(request: PaymentRequest): Promise<PaymentResult>;
 
   /** Execute/capture a previously created payment */
-  executePayment(paymentId: string, data?: any): Promise<PaymentResult>;
+  executePayment(paymentId: string, data?: Record<string, string>): Promise<PaymentResult>;
 
   /** Retrieve the current status and details of a payment */
   getPaymentDetails(paymentId: string): Promise<PaymentResult>;
@@ -31,11 +31,11 @@ export interface IPaymentProvider {
    * Handle an incoming webhook notification from the provider.
    * Optional — implement only for providers that use the `webhook` flow.
    */
-  handleWebhook?(body: any, headers: Record<string, string>): Promise<WebhookResult>;
+  handleWebhook?(body: Record<string, unknown>, headers: Record<string, string>): Promise<WebhookResult>;
 
   /**
    * Handle the redirect callback from the provider (query params from returnUrl).
    * Optional — implement only for providers that use the `redirect` flow.
    */
-  handleRedirect?(query: Record<string, any>): Promise<PaymentResult>;
+  handleRedirect?(query: Record<string, string>): Promise<PaymentResult>;
 }

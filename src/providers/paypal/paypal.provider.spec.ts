@@ -28,6 +28,24 @@ vi.mock('@paypal/paypal-server-sdk', () => {
                     status: 'COMPLETED'
                 }
             });
+            getOrder = vi.fn().mockResolvedValue({
+                result: {
+                    id: 'PAYPAL-ORD-123',
+                    status: 'COMPLETED',
+                    purchaseUnits: [{
+                        amount: { currencyCode: 'EUR', value: '50.00' },
+                        payments: { captures: [{ id: 'CAPTURE-123' }] }
+                    }]
+                }
+            });
+        },
+        PaymentsController: class {
+            refundCapturedPayment = vi.fn().mockResolvedValue({
+                result: {
+                    id: 'REFUND-123',
+                    status: 'COMPLETED'
+                }
+            });
         }
     };
 });
@@ -99,5 +117,29 @@ describe('PayPalProvider', () => {
 
         expect(result.success).toBe(false);
         expect(result.error).toContain('Network error Paypal API');
+    });
+
+    it('should successfully refund a captured payment', async () => {
+        const result = await provider.refundPayment('PAYPAL-ORD-123');
+
+        expect(result.success).toBe(true);
+        expect(result.paymentId).toBe('REFUND-123');
+        expect(result.status).toBe('COMPLETED');
+    });
+
+    it('should return failure when no capture is found for the order', async () => {
+        (provider as any).ordersController = {
+            getOrder: vi.fn().mockResolvedValue({
+                result: {
+                    id: 'PAYPAL-ORD-NO-CAPTURE',
+                    purchaseUnits: [{ payments: { captures: [] } }]
+                }
+            })
+        };
+
+        const result = await provider.refundPayment('PAYPAL-ORD-NO-CAPTURE');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('No capture found');
     });
 });

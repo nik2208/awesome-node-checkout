@@ -1,7 +1,11 @@
 /**
  * Global configuration for CheckoutConfigurator.
- * Currently a placeholder for future global options (e.g. logging, retries).
  */
 export interface CheckoutConfig {
-  // Reserved for future global options
+  /**
+   * When `true`, the event bus emits lifecycle events for every payment
+   * operation (payment.created, payment.completed, payment.failed, etc.).
+   * @default true
+   */
+  emitEvents?: boolean;
 }

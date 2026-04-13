@@ -3,6 +3,7 @@ import {
   Environment,
   LogLevel,
   OrdersController,
+  PaymentsController,
 } from '@paypal/paypal-server-sdk';
 import { BasePaymentProvider } from '../../abstract/base-payment-provider.abstract';
 import { PaymentRequest } from '../../models/payment-request.model';
@@ -26,6 +27,7 @@ export class PayPalProvider extends BasePaymentProvider {
 
   private client: Client;
   private ordersController: OrdersController;
+  private paymentsController: PaymentsController;
 
   constructor(private readonly config: PayPalProviderConfig) {
     super();
@@ -44,6 +46,7 @@ export class PayPalProvider extends BasePaymentProvider {
     });
 
     this.ordersController = new OrdersController(this.client);
+    this.paymentsController = new PaymentsController(this.client);
   }
 
   async createPayment(request: PaymentRequest): Promise<PaymentResult> {
@@ -123,27 +126,67 @@ export class PayPalProvider extends BasePaymentProvider {
     }
   }
 
-  async refundPayment(paymentId: string): Promise<PaymentResult> {
-    // Full refund via PayPal requires the capture ID, not the order ID.
-    // Retrieve order details first, extract the capture ID, then POST to
-    // /v2/payments/captures/{captureId}/refund.
-    // This is left as a note since it requires additional API calls.
-    return {
-      success: false,
-      error:
-        'PayPal refund requires the capture ID. ' +
-        'Retrieve it from getPaymentDetails(), then call the PayPal Refunds API directly.',
-      paymentId,
-      status: 'REFUND_REQUIRES_CAPTURE_ID',
-    };
+  async refundPayment(paymentId: string, amount?: number): Promise<PaymentResult> {
+    try {
+      // Retrieve order to find the capture ID and currency
+      const { result: order } = await this.ordersController.getOrder({ id: paymentId });
+
+      // The PayPal SDK types nested objects as `any`; extract with explicit guards
+      const purchaseUnit = Array.isArray((order as any)?.purchaseUnits)
+        ? (order as any).purchaseUnits[0]
+        : undefined;
+      const captureId: string | undefined =
+        Array.isArray(purchaseUnit?.payments?.captures) && purchaseUnit.payments.captures.length > 0
+          ? String(purchaseUnit.payments.captures[0].id)
+          : undefined;
+
+      if (!captureId) {
+        return {
+          success: false,
+          error: 'No capture found for this order. Ensure the payment has been captured before refunding.',
+          paymentId,
+          status: 'REFUND_FAILED',
+        };
+      }
+
+      const refundBody: Record<string, unknown> = {};
+      if (amount !== undefined) {
+        const currencyCode = typeof purchaseUnit?.amount?.currencyCode === 'string'
+          ? purchaseUnit.amount.currencyCode
+          : undefined;
+        if (!currencyCode) {
+          return {
+            success: false,
+            error: 'Cannot determine currency code from order. Refund a specific amount is not possible.',
+            paymentId,
+            status: 'REFUND_FAILED',
+          };
+        }
+        refundBody['amount'] = { value: amount.toFixed(2), currencyCode };
+      }
+
+      const { result: refund } = await this.paymentsController.refundCapturedPayment({
+        captureId,
+        body: refundBody as any,
+      });
+
+      return {
+        success: (refund as any)?.status === 'COMPLETED',
+        paymentId: String((refund as any)?.id ?? ''),
+        status: String((refund as any)?.status ?? ''),
+        raw: refund,
+      };
+    } catch (error) {
+      return this.errorResult(error, 'Failed to refund PayPal payment');
+    }
   }
 
   /**
    * Handles the redirect from PayPal after the user approves the payment.
    * PayPal appends `token` (order ID) and `PayerID` to the returnUrl.
    */
-  async handleRedirect(query: Record<string, any>): Promise<PaymentResult> {
-    const paymentId = query.token as string | undefined;
+  async handleRedirect(query: Record<string, string>): Promise<PaymentResult> {
+    const paymentId = query['token'];
     if (!paymentId) {
       return {
         success: false,

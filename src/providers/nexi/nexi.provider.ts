@@ -16,6 +16,9 @@ export interface NexiProviderConfig {
  * Nexi eCommerce provider.
  * Flow: `redirect` — builds a signed checkout URL, redirects the user to Nexi,
  * then handles the POST-back via `handleRedirect`.
+ *
+ * Note: Nexi XPay mandates SHA-1 for MAC computation. This is a requirement of
+ * the Nexi API and cannot be changed on the client side.
  */
 export class NexiProvider extends BasePaymentProvider {
   readonly name = 'nexi';
@@ -34,10 +37,51 @@ export class NexiProvider extends BasePaymentProvider {
   /**
    * Computes the SHA-1 MAC required by Nexi to authenticate the payment request.
    * Format: `codTrans={val}divisa={val}importo={val}{macKey}`
+   *
+   * SHA-1 is used here because Nexi XPay mandates it for MAC computation.
    */
   private generateMac(codTrans: string, divisa: string, importoCents: number): string {
     const raw = `codTrans=${codTrans}divisa=${divisa}importo=${importoCents}${this.config.macKey}`;
     return crypto.createHash('sha1').update(raw).digest('hex');
+  }
+
+  /**
+   * Computes the SHA-1 MAC for the status (getPaymentDetails) API call.
+   * Format: `alias={alias}codTrans={codTrans}timestamp={timestamp}{macKey}`
+   */
+  private generateStatusMac(alias: string, codTrans: string, timestamp: string): string {
+    const raw = `alias=${alias}codTrans=${codTrans}timestamp=${timestamp}${this.config.macKey}`;
+    return crypto.createHash('sha1').update(raw).digest('hex');
+  }
+
+  /**
+   * Computes the SHA-1 MAC for the refund (storno) API call.
+   * Format: `alias={alias}codTrans={codTrans}importo={importo}timestamp={timestamp}{macKey}`
+   */
+  private generateRefundMac(
+    alias: string,
+    codTrans: string,
+    importo: string,
+    timestamp: string,
+  ): string {
+    const raw = `alias=${alias}codTrans=${codTrans}importo=${importo}timestamp=${timestamp}${this.config.macKey}`;
+    return crypto.createHash('sha1').update(raw).digest('hex');
+  }
+
+  /**
+   * Verifies the SHA-1 MAC included in a Nexi POST-back response.
+   * Format: `codTrans={val}esito={val}importo={val}divisa={val}{macKey}`
+   */
+  private verifyResponseMac(
+    codTrans: string,
+    esito: string,
+    importo: string,
+    divisa: string,
+    mac: string,
+  ): boolean {
+    const raw = `codTrans=${codTrans}esito=${esito}importo=${importo}divisa=${divisa}${this.config.macKey}`;
+    const expected = crypto.createHash('sha1').update(raw).digest('hex');
+    return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(mac, 'hex'));
   }
 
   async createPayment(request: PaymentRequest): Promise<PaymentResult> {
@@ -76,11 +120,33 @@ export class NexiProvider extends BasePaymentProvider {
   /**
    * Validates the POST-back data from Nexi.
    * `data` is the query/body object sent by Nexi to the returnUrl.
+   * The MAC is verified before the result is considered authoritative.
    */
-  async executePayment(paymentId: string, data?: any): Promise<PaymentResult> {
+  async executePayment(paymentId: string, data?: Record<string, string>): Promise<PaymentResult> {
     try {
       const esito: string = data?.esito ?? '';
       const codTrans: string = data?.codTrans ?? paymentId;
+      const importo: string = data?.importo ?? '';
+      const divisa: string = data?.divisa ?? '';
+      const mac: string = data?.mac ?? '';
+
+      if (mac) {
+        let macValid: boolean;
+        try {
+          macValid = this.verifyResponseMac(codTrans, esito, importo, divisa, mac);
+        } catch {
+          macValid = false;
+        }
+        if (!macValid) {
+          return {
+            success: false,
+            paymentId: codTrans,
+            status: 'FAILED',
+            error: 'MAC verification failed: response may have been tampered with',
+          };
+        }
+      }
+
       return {
         success: esito === 'OK',
         paymentId: codTrans,
@@ -94,11 +160,14 @@ export class NexiProvider extends BasePaymentProvider {
 
   async getPaymentDetails(paymentId: string): Promise<PaymentResult> {
     try {
+      const timestamp = new Date().toISOString();
+      const mac = this.generateStatusMac(this.config.merchantId, paymentId, timestamp);
+
       const params = {
         alias: this.config.merchantId,
         codTrans: paymentId,
-        timestamp: new Date().toISOString(),
-        mac: this.config.macKey,
+        timestamp,
+        mac,
       };
 
       const response = await fetch(`${this.apiUrl}/ecomm/api/vas/igfs/status/plain`, {
@@ -108,9 +177,9 @@ export class NexiProvider extends BasePaymentProvider {
       });
 
       if (!response.ok) throw new Error(`Nexi API error: ${response.statusText}`);
-      const result = await response.json() as any;
+      const result = await response.json() as Record<string, unknown>;
 
-      return { success: true, paymentId, status: result.status, raw: result };
+      return { success: true, paymentId, status: result['status'] as string, raw: result };
     } catch (error) {
       return this.errorResult(error, 'Failed to get Nexi payment details');
     }
@@ -118,12 +187,16 @@ export class NexiProvider extends BasePaymentProvider {
 
   async refundPayment(paymentId: string, amount?: number): Promise<PaymentResult> {
     try {
+      const timestamp = new Date().toISOString();
+      const importo = amount ? Math.round(amount * 100).toString() : '';
+      const mac = this.generateRefundMac(this.config.merchantId, paymentId, importo, timestamp);
+
       const params: Record<string, string> = {
         alias: this.config.merchantId,
         codTrans: paymentId,
-        importo: amount ? Math.round(amount * 100).toString() : '',
-        timestamp: new Date().toISOString(),
-        mac: this.config.macKey,
+        importo,
+        timestamp,
+        mac,
       };
 
       const response = await fetch(`${this.apiUrl}/ecomm/api/vas/igfs/storno/plain`, {
@@ -133,12 +206,12 @@ export class NexiProvider extends BasePaymentProvider {
       });
 
       if (!response.ok) throw new Error(`Nexi API error: ${response.statusText}`);
-      const result = await response.json() as any;
+      const result = await response.json() as Record<string, unknown>;
 
       return {
-        success: result.esito === 'OK',
+        success: result['esito'] === 'OK',
         paymentId,
-        status: result.esito === 'OK' ? 'REFUNDED' : 'REFUND_FAILED',
+        status: result['esito'] === 'OK' ? 'REFUNDED' : 'REFUND_FAILED',
         raw: result,
       };
     } catch (error) {
@@ -148,9 +221,10 @@ export class NexiProvider extends BasePaymentProvider {
 
   /**
    * Handles the POST-back from Nexi to the returnUrl.
-   * Nexi sends `esito`, `codTrans`, `importo`, `mac`, etc. as query/body params.
+   * Nexi sends `esito`, `codTrans`, `importo`, `divisa`, `mac`, etc. as query/body params.
+   * The MAC is verified to ensure the response was not spoofed.
    */
-  async handleRedirect(query: Record<string, any>): Promise<PaymentResult> {
-    return this.executePayment(query.codTrans as string, query);
+  async handleRedirect(query: Record<string, string>): Promise<PaymentResult> {
+    return this.executePayment(query['codTrans'] ?? '', query);
   }
 }

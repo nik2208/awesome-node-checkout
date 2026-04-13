@@ -12,6 +12,14 @@ export interface SatispayProviderConfig {
    * Load with: `fs.readFileSync('private.pem', 'utf8')`
    */
   privateKey: string;
+  /**
+   * Satispay RSA public key in PEM format, used to verify incoming webhook
+   * HTTP Signatures. Obtain it by calling GET /g_business/v1/consumers/{keyId}
+   * on Satispay's API for the keyId present in the webhook Authorization header.
+   * When provided, every inbound webhook whose signature cannot be verified is
+   * rejected before any business logic is executed.
+   */
+  webhookPublicKey?: string;
   /** @default 'sandbox' */
   environment?: 'sandbox' | 'production';
   /**
@@ -89,7 +97,80 @@ export class SatispayProvider extends BasePaymentProvider {
     };
   }
 
-  private async request<T = any>(method: string, url: string, body?: unknown): Promise<T> {
+  /**
+   * Verifies the HTTP Signature in an inbound Satispay webhook request.
+   * Satispay signs webhooks with their own RSA private key; we verify using
+   * the corresponding public key supplied in `config.webhookPublicKey`.
+   *
+   * Returns `true` if the signature is valid, `false` otherwise.
+   * If no `webhookPublicKey` is configured the check is skipped and `true`
+   * is returned — callers should treat this as an unverified state.
+   */
+  private verifyWebhookSignature(
+    body: unknown,
+    headers: Record<string, string>,
+  ): boolean {
+    if (!this.config.webhookPublicKey) {
+      return true; // verification skipped — no public key configured
+    }
+
+    try {
+      const authHeader = headers['authorization'] ?? headers['Authorization'];
+      if (!authHeader) return false;
+
+      // Parse the Signature params from the Authorization header.
+      // Format: Signature keyId="...", algorithm="...", headers="...", signature="..."
+      // Use indexOf-based parsing to avoid ReDoS-prone regexes on untrusted input.
+      const sigParams: Record<string, string> = {};
+      const schemePrefix = 'Signature ';
+      const paramStr = authHeader.startsWith(schemePrefix)
+        ? authHeader.slice(schemePrefix.length)
+        : authHeader;
+
+      for (const part of paramStr.split(',')) {
+        const eqIdx = part.indexOf('="');
+        if (eqIdx === -1) continue;
+        const key = part.slice(0, eqIdx).trim();
+        const valueStart = eqIdx + 2;
+        const valueEnd = part.lastIndexOf('"');
+        if (valueEnd <= valueStart) continue;
+        const value = part.slice(valueStart, valueEnd);
+        if (key) sigParams[key] = value;
+      }
+
+      const { signature, headers: signedHeaders = '(request-target) host date digest' } = sigParams;
+      if (!signature) return false;
+
+      // Reconstruct the signed message from the incoming headers
+      const headerNames = signedHeaders.split(' ');
+      const bodyString = body ? JSON.stringify(body) : '';
+      const digest =
+        'SHA-256=' + crypto.createHash('sha256').update(bodyString).digest('base64');
+
+      const parts: string[] = [];
+      for (const name of headerNames) {
+        if (name === 'digest') {
+          parts.push(`digest: ${digest}`);
+        } else {
+          const value =
+            headers[name] ??
+            headers[name.toLowerCase()] ??
+            headers[name.toUpperCase()];
+          if (value === undefined) return false;
+          parts.push(`${name}: ${value}`);
+        }
+      }
+      const message = parts.join('\n');
+
+      const verify = crypto.createVerify('RSA-SHA256');
+      verify.update(message);
+      return verify.verify(this.config.webhookPublicKey, signature, 'base64');
+    } catch {
+      return false;
+    }
+  }
+
+  private async request<T = Record<string, unknown>>(method: string, url: string, body?: unknown): Promise<T> {
     const parsed = new URL(url);
     const headers = this.buildSignatureHeaders(method, parsed.pathname, parsed.host, body);
 
@@ -130,21 +211,21 @@ export class SatispayProvider extends BasePaymentProvider {
         metadata: request.metadata,
       };
 
-      const payment = await this.request<any>('POST', `${this.apiUrl}/payments`, body);
+      const payment = await this.request<Record<string, unknown>>('POST', `${this.apiUrl}/payments`, body);
 
       // Persist the mapping orderId → paymentId for later webhook correlation
       await this.transactionStore.save(orderId, {
         provider: 'satispay',
         orderId,
-        paymentId: payment.id,
+        paymentId: payment['id'] as string,
         createdAt: new Date().toISOString(),
       });
 
       return {
         success: true,
-        paymentId: payment.id,
-        approvalUrl: payment.redirect_url ?? payment.url_checkout,
-        status: payment.status,
+        paymentId: payment['id'] as string,
+        approvalUrl: (payment['redirect_url'] ?? payment['url_checkout']) as string | undefined,
+        status: payment['status'] as string,
         raw: payment,
       };
     } catch (error) {
@@ -159,11 +240,11 @@ export class SatispayProvider extends BasePaymentProvider {
 
   async getPaymentDetails(paymentId: string): Promise<PaymentResult> {
     try {
-      const payment = await this.request<any>('GET', `${this.apiUrl}/payments/${paymentId}`);
+      const payment = await this.request<Record<string, unknown>>('GET', `${this.apiUrl}/payments/${paymentId}`);
       return {
         success: true,
-        paymentId: payment.id,
-        status: payment.status,
+        paymentId: payment['id'] as string,
+        status: payment['status'] as string,
         raw: payment,
       };
     } catch (error) {
@@ -174,15 +255,15 @@ export class SatispayProvider extends BasePaymentProvider {
   async refundPayment(paymentId: string, amount?: number): Promise<PaymentResult> {
     try {
       const body = amount ? { amount_unit: Math.round(amount * 100) } : {};
-      const refund = await this.request<any>(
+      const refund = await this.request<Record<string, unknown>>(
         'POST',
         `${this.apiUrl}/payments/${paymentId}/refunds`,
         body,
       );
       return {
         success: true,
-        paymentId: refund.id,
-        status: refund.status,
+        paymentId: refund['id'] as string,
+        status: refund['status'] as string,
         raw: refund,
       };
     } catch (error) {
@@ -193,19 +274,26 @@ export class SatispayProvider extends BasePaymentProvider {
   /**
    * Handles the async webhook notification from Satispay.
    * Satispay calls this URL with `payment_id` (the Satispay payment UUID).
-   * We verify the current payment status via an API call.
+   * The HTTP Signature in the Authorization header is verified against
+   * `config.webhookPublicKey` (when configured) before processing.
+   * We then confirm the payment status via an authenticated API call.
    */
-  async handleWebhook(body: any, _headers: Record<string, string>): Promise<WebhookResult> {
-    const paymentId: string | undefined = body.payment_id ?? body.id;
+  async handleWebhook(body: Record<string, unknown>, headers: Record<string, string>): Promise<WebhookResult> {
+    if (!this.verifyWebhookSignature(body, headers)) {
+      return { success: false, error: 'Webhook signature verification failed' };
+    }
+
+    const paymentId: string | undefined =
+      (body['payment_id'] as string | undefined) ?? (body['id'] as string | undefined);
     if (!paymentId) {
       return { success: false, error: 'Missing payment_id in webhook body' };
     }
     try {
-      const payment = await this.request<any>('GET', `${this.apiUrl}/payments/${paymentId}`);
+      const payment = await this.request<Record<string, unknown>>('GET', `${this.apiUrl}/payments/${paymentId}`);
       return {
-        success: payment.status === 'ACCEPTED',
-        paymentId: payment.id,
-        status: payment.status,
+        success: payment['status'] === 'ACCEPTED',
+        paymentId: payment['id'] as string,
+        status: payment['status'] as string,
         raw: payment,
       };
     } catch (error) {
@@ -218,8 +306,8 @@ export class SatispayProvider extends BasePaymentProvider {
    * Handles the redirect back to the merchant app after the Satispay flow.
    * Looks up the transaction by `order_id` in the store, then verifies status.
    */
-  async handleRedirect(query: Record<string, any>): Promise<PaymentResult> {
-    const orderId = query.order_id as string | undefined;
+  async handleRedirect(query: Record<string, string>): Promise<PaymentResult> {
+    const orderId = query['order_id'];
     if (!orderId) {
       return { success: false, error: 'Missing order_id in redirect query' };
     }

@@ -32,7 +32,15 @@
     "typescript",
     "framework-agnostic"
   ],
-  "author": "",
+  "author": "Nicola Brecciaroli <nicola.brecciaroli@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nik2208/awesome-node-checkout.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nik2208/awesome-node-checkout/issues"
+  },
+  "homepage": "https://github.com/nik2208/awesome-node-checkout#readme",
   "license": "MIT",
   "devDependencies": {
     "@types/express": "^5.0.0",

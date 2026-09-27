@@ -1,0 +1,144 @@
+{{#> layout}}
+<div class="row justify-content-center">
+    <div class="col-md-6">
+        <div class="card mb-4">
+            <div class="card-header">
+                <h2>Test Payment Gateway</h2>
+            </div>
+            <div class="card-body">
+                <form id="paymentForm" action="/payments" method="POST">
+                    <div class="mb-4">
+                        <label class="form-label">Payment Provider</label>
+                        <div class="d-flex flex-row justify-content-around align-items-center"
+                            style="min-height: 150px;">
+                            {{#each providers}}
+                            <div class="provider-option text-center">
+                                <input type="radio" class="btn-check" name="provider" id="provider-{{this}}"
+                                    value="{{this}}" required {{#if @first}}checked{{/if}}>
+                                <label class="btn provider-btn p-2" for="provider-{{this}}">
+                                    {{#if (eq this "paypal")}}
+                                    <img src="https://cdn.iconscout.com/icon/free/png-256/free-paypal-icon-download-in-svg-png-gif-file-formats--logo-payment-method-pack-e-commerce-shopping-icons-711793.png?f=webp&w=256"
+                                        alt="PayPal" class="img-fluid" style="max-width: 130px;">
+                                    {{else if (eq this "nexi")}}
+                                    <img src="https://cdn.brandfetch.io/nexigroup.com/fallback/lettermark/theme/dark/h/256/w/256/icon?c=1bfwsmEH20zzEfSNTed"
+                                        alt="Nexi" class="img-fluid" style="max-width: 130px;">
+                                    {{else if (eq this "satispay")}}
+                                    <img src="https://ps.w.org/woo-satispay/assets/icon-256x256.png?rev=3098775"
+                                        alt="Satispay" class="img-fluid" style="max-width: 130px;">
+                                    {{else}}
+                                    <div class="text-center p-3 border rounded">{{this}}</div>
+                                    {{/if}}
+                                </label>
+                                <div class="mt-2 fw-bold">{{this}}</div>
+                            </div>
+                            {{/each}}
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="amount" class="form-label">Amount</label>
+                        <input type="number" class="form-control" id="amount" name="amount"
+                            value="{{testPayment.amount}}" step="0.01" required>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="currency" class="form-label">Currency</label>
+                        <select class="form-select" id="currency" name="currency" required>
+                            <option value="EUR" {{#if (eq testPayment.currency "EUR" )}}selected{{/if}}>EUR</option>
+                            <option value="USD" {{#if (eq testPayment.currency "USD" )}}selected{{/if}}>USD</option>
+                            <option value="GBP" {{#if (eq testPayment.currency "GBP" )}}selected{{/if}}>GBP</option>
+                        </select>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="description" class="form-label">Description</label>
+                        <input type="text" class="form-control" id="description" name="description"
+                            value="{{testPayment.description}}">
+                    </div>
+
+                    <input type="hidden" name="returnUrl" value="{{testPayment.returnUrl}}">
+                    <input type="hidden" name="cancelUrl" value="{{testPayment.cancelUrl}}">
+                    <input type="hidden" name="orderId" value="{{testPayment.orderId}}">
+                    <input type="hidden" id="metadata" name="metadata" value="">
+
+                    <div class="d-grid">
+                        <button type="submit" class="btn btn-primary">Proceed to Payment</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Credenziali di Test -->
+        <div class="card">
+            <div class="card-header">
+                <h3 class="h5 mb-0">Test Credentials</h3>
+            </div>
+            <div class="card-body">
+                <!-- PayPal -->
+                <div class="mb-4 border-bottom pb-3">
+                    <h4 class="h5">PayPal</h4>
+                    <div class="ps-3 mb-3">
+                        <h5 class="h6">Personal Account (Buyer)</h5>
+                        <div class="mb-2">
+                            <strong>Email:</strong> <code>{{testCredentials.personal.email}}</code>
+                        </div>
+                        <div>
+                            <strong>Password:</strong> <code>{{testCredentials.personal.password}}</code>
+                        </div>
+                    </div>
+                    <div class="ps-3">
+                        <h5 class="h6">Business Account (Seller)</h5>
+                        <div class="mb-2">
+                            <strong>Email:</strong> <code>{{testCredentials.business.email}}</code>
+                        </div>
+                        <div>
+                            <strong>Password:</strong> <code>{{testCredentials.business.password}}</code>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Nexi -->
+                <div class="mb-4 border-bottom pb-3">
+                    <h4 class="h5">Nexi</h4>
+                    <div class="ps-3">
+                        <div class="mb-2">
+                            <strong>Card Number:</strong> <code>4539970000000006</code>
+                        </div>
+                        <div class="mb-2">
+                            <strong>Expiry Date:</strong> <code>12/30</code>
+                        </div>
+                        <div>
+                            <strong>CVV2:</strong> <code>123</code>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Satispay -->
+                <div class="mb-4">
+                    <h4 class="h5">Satispay</h4>
+                    <div class="ps-3">
+                        <div class="fst-italic text-muted mb-3">
+                            Necessaria l'app Sandbox installata sul proprio smartphone.
+                        </div>
+                        <div class="d-flex flex-wrap gap-3 mb-3">
+                            <a href="https://install.appcenter.ms/orgs/development-is9v/apps/satispay-staging/distribution_groups/public"
+                                target="_blank" class="btn btn-outline-secondary btn-sm">
+                                <i class="bi bi-android"></i> Android
+                            </a>
+                            <a href="https://install.appcenter.ms/orgs/development-is9v/apps/satispay-staging-1/distribution_groups/public"
+                                target="_blank" class="btn btn-outline-secondary btn-sm">
+                                <i class="bi bi-apple"></i> iOS
+                            </a>
+                        </div>
+                        <div class="mt-2">
+                            <a href="https://satispay-sandbox.paperform.co/" target="_blank" class="btn btn-link ps-0">
+                                Richiedi attivazione account sandbox
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{{/layout}}

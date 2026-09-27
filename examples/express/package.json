@@ -1,0 +1,37 @@
+{
+  "name": "awesome-node-checkout-express-example",
+  "version": "1.1.0",
+  "description": "Example application demonstrating awesome-node-checkout with Express, SQLite and Handlebars",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node --env-file=.env -r ts-node/register index.ts",
+    "build": "tsc && cp -r views public dist/",
+    "test": "echo \"No test specified\" && exit 0"
+  },
+  "keywords": [
+    "checkout",
+    "express",
+    "example",
+    "paypal",
+    "nexi",
+    "satispay"
+  ],
+  "author": "Nicola Brecciaroli",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "@paypal/paypal-server-sdk": "^2.2.0",
+    "awesome-node-checkout": "file:../..",
+    "better-sqlite3": "^12.8.0",
+    "express": "^5.2.1",
+    "hbs": "^4.2.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.5.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.0"
+  }
+}

@@ -68,11 +68,39 @@ import { createCheckoutRouter } from 'awesome-node-checkout/express';
 const app = express();
 app.use(express.json());
 
-// Mounts all checkout routes under /checkout
-app.use('/checkout', createCheckoutRouter(checkout));
+// Mount checkout routes with secure server-side request builder
+app.use(
+  '/checkout',
+  createCheckoutRouter(checkout, {
+    // Recommended: verify order and compute amount on the server
+    buildPaymentRequest: async (req) => {
+      const order = await myOrderService.getOrder(req.body.orderId);
+      return {
+        amount: order.totalAmount,
+        currency: order.currency, // e.g. 'EUR'
+        orderId: order.id,
+        returnUrl: 'https://myapp.com/payment/success',
+        cancelUrl: 'https://myapp.com/payment/cancel',
+        description: `Order #${order.id}`,
+      };
+    },
+    // Opt-in: mount POST /:provider/refund protected by admin middleware
+    refund: {
+      middleware: [requireAdminAuth],
+    },
+    // Optional: guard execution before capturing payment
+    execute: {
+      onBeforeExecute: async (req, paymentId) => {
+        // Verify payment belongs to current session or user
+      },
+    },
+  }),
+);
 
 app.listen(3000);
 ```
+
+> **Security Note**: Never trust client-sent amounts directly. Always define `buildPaymentRequest` so the payment amount and order parameters are derived server-side. If `buildPaymentRequest` is omitted, the router will issue a warning at mount time and validate that client bodies contain positive finite amounts and valid currencies.
 
 ### With Fastify (or any other framework)
 
@@ -92,16 +120,22 @@ fastify.post('/checkout/:provider/webhook', async (req, reply) => {
 
 ---
 
+## Example Application
+
+A full-featured reference implementation using Express 5, SQLite (`ITransactionStore`), and Handlebars is available in [examples/express](./examples/express).
+
+---
+
 ## Routes (Express adapter)
 
-| Method | Path                        | Description                      |
-|--------|-----------------------------|----------------------------------|
-| POST   | `/:provider`                | Create a payment                 |
-| POST   | `/:provider/execute`        | Execute/capture a payment        |
-| GET    | `/:provider/redirect`       | Handle provider redirect callback|
-| GET    | `/:provider/:id`            | Get payment details              |
-| POST   | `/:provider/refund`         | Refund a payment                 |
-| POST   | `/:provider/webhook`        | Handle provider webhook          |
+| Method | Path                        | Description                                                    |
+|--------|-----------------------------|----------------------------------------------------------------|
+| POST   | `/:provider`                | Create a payment (server-built or validated)                  |
+| POST   | `/:provider/execute`        | Execute/capture a payment (supports `onBeforeExecute`)         |
+| GET    | `/:provider/redirect`       | Handle provider redirect callback                             |
+| GET    | `/:provider/:id`            | Get payment details                                            |
+| POST   | `/:provider/refund`         | Refund a payment (*opt-in*: mounted only when `refund` option is set)|
+| POST   | `/:provider/webhook`        | Handle provider webhook                                        |
 
 ---
 

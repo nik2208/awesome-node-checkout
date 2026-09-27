@@ -11,6 +11,12 @@ export interface PaymentResult {
   /** Current payment status (provider-specific string, e.g. 'COMPLETED', 'ACCEPTED') */
   status?: string;
 
+  /** Amount reported by the provider, major units (same unit as PaymentRequest.amount) */
+  amount?: number;
+
+  /** ISO 4217 alpha code reported by the provider (e.g. 'EUR') */
+  currency?: string;
+
   /** Error message if success is false */
   error?: string;
 
@@ -23,6 +29,13 @@ export interface WebhookResult {
   success: boolean;
   paymentId?: string;
   status?: string;
+
+  /** Amount reported by the provider, major units (same unit as PaymentRequest.amount) */
+  amount?: number;
+
+  /** ISO 4217 alpha code reported by the provider (e.g. 'EUR') */
+  currency?: string;
+
   error?: string;
   raw?: any;
 }

@@ -2,24 +2,51 @@ import { Router, Request, Response, RequestHandler } from 'express';
 import { CheckoutConfigurator } from '../../checkout-configurator';
 import { CheckoutError } from '../../models/errors';
 import { PaymentRequest } from '../../models/payment-request.model';
+import { PaymentResult } from '../../models/payment-result.model';
+
+export interface PaymentRequestContext {
+  provider: string;
+  res: Response;
+}
 
 export interface ExpressCheckoutOptions {
   /**
    * Middleware applied to ALL checkout routes (e.g. API key auth).
-   * Webhooks are typically public — use `publicPaths` to exclude them.
+   * Webhooks and redirects are typically public — use `publicPaths` to exclude them.
    */
   middleware?: RequestHandler[];
 
   /**
-   * Route suffixes that bypass `middleware` (e.g. [':provider/webhook']).
-   * Matched against the path suffix after the mount point.
+   * Route patterns that bypass `middleware` (e.g. [':provider/webhook', ':provider/redirect']).
+   * Matched by path segments after the mount point (:provider matches any single segment).
    */
   publicPaths?: string[];
 
   /**
    * Builds the PaymentRequest on the server (amount from your own order), ignoring the client body.
    */
-  buildPaymentRequest?: (req: Request) => PaymentRequest | Promise<PaymentRequest>;
+  buildPaymentRequest?: (
+    req: Request,
+    ctx: PaymentRequestContext,
+  ) => PaymentRequest | Promise<PaymentRequest>;
+
+  /**
+   * When configured, GET /:provider/redirect responds with a 302 redirect
+   * to the URL returned by onSuccess or onFailure instead of JSON.
+   */
+  redirect?: {
+    onSuccess: (result: PaymentResult, req: Request) => string;
+    onFailure: (result: PaymentResult, req: Request) => string;
+  };
+
+  /**
+   * Configuration for GET /:provider/:id (getPaymentDetails).
+   * Default: enabled: true. Set enabled: false to return 404.
+   */
+  details?: {
+    enabled?: boolean;
+    middleware?: RequestHandler[];
+  };
 
   /**
    * Configuration for POST /:provider/refund.
@@ -39,23 +66,44 @@ export interface ExpressCheckoutOptions {
 }
 
 /**
+ * Matches a request path against public path patterns by segments.
+ * ':provider' matches any single non-empty segment.
+ */
+export function isPathPublic(reqPath: string, publicPaths: string[]): boolean {
+  const reqSegments = reqPath.split('/').filter(Boolean);
+  return publicPaths.some((pattern) => {
+    const patternSegments = pattern.split('/').filter(Boolean);
+    if (reqSegments.length !== patternSegments.length) {
+      return false;
+    }
+    return patternSegments.every((patSeg, i) => {
+      if (patSeg === ':provider') {
+        return reqSegments[i].length > 0;
+      }
+      return patSeg === reqSegments[i];
+    });
+  });
+}
+
+/**
  * Creates an Express Router with all checkout endpoints pre-wired.
  *
  * Routes mounted:
  * ```
  * POST   /:provider              → createPayment
  * POST   /:provider/execute      → executePayment
+ * POST   /:provider/refund       → refundPayment (only if options.refund is configured)
+ * GET    /:provider/webhook      → handleWebhook
+ * POST   /:provider/webhook      → handleWebhook
  * GET    /:provider/redirect     → handleRedirect  (must come before /:provider/:id)
  * GET    /:provider/:id          → getPaymentDetails
- * POST   /:provider/refund       → refundPayment (only if options.refund is configured)
- * POST   /:provider/webhook      → handleWebhook
  * ```
  *
  * Usage:
  * ```typescript
  * import { createCheckoutRouter } from 'awesome-node-checkout/express';
  * app.use('/checkout', createCheckoutRouter(checkout, {
- *   buildPaymentRequest: async (req) => {
+ *   buildPaymentRequest: async (req, ctx) => {
  *     const order = await getOrder(req.body.orderId);
  *     return {
  *       amount: order.total,
@@ -80,15 +128,11 @@ export function createCheckoutRouter(
     );
   }
 
-  // Apply shared middleware (skipping public paths)
+  // Apply shared middleware (skipping public paths by segment match)
   if (options.middleware?.length) {
     const publicPaths = options.publicPaths ?? [];
     router.use((req, res, next) => {
-      const providerParam = String(req.params?.provider ?? '');
-      const isPublic = publicPaths.some((p) =>
-        req.path.endsWith(p) || req.path.includes(p.replace(':provider', providerParam)),
-      );
-      if (isPublic) return next();
+      if (isPathPublic(req.path, publicPaths)) return next();
       // Chain all middleware in sequence
       const handlers = options.middleware!;
       const run = (i: number): void => {
@@ -102,9 +146,34 @@ export function createCheckoutRouter(
   // ---- POST /:provider — create payment ------------------------------------
   router.post('/:provider', async (req: Request, res: Response) => {
     try {
+      const provider = String(req.params.provider);
       let paymentRequest: PaymentRequest;
       if (options.buildPaymentRequest) {
-        paymentRequest = await options.buildPaymentRequest(req);
+        paymentRequest = await options.buildPaymentRequest(req, {
+          provider,
+          res,
+        });
+
+        if (
+          !paymentRequest ||
+          typeof paymentRequest !== 'object' ||
+          typeof paymentRequest.amount !== 'number' ||
+          !Number.isFinite(paymentRequest.amount) ||
+          paymentRequest.amount <= 0 ||
+          typeof paymentRequest.currency !== 'string' ||
+          paymentRequest.currency.trim() === '' ||
+          typeof paymentRequest.returnUrl !== 'string' ||
+          paymentRequest.returnUrl.trim() === '' ||
+          typeof paymentRequest.cancelUrl !== 'string' ||
+          paymentRequest.cancelUrl.trim() === ''
+        ) {
+          return res.status(400).json({
+            success: false,
+            code: 'INVALID_PAYMENT_REQUEST',
+            error:
+              'Invalid payment request returned by buildPaymentRequest: amount must be a positive number, currency, returnUrl, and cancelUrl are required strings',
+          });
+        }
       } else {
         const body = req.body;
         const amount = body?.amount;
@@ -123,7 +192,7 @@ export function createCheckoutRouter(
         }
         paymentRequest = body;
       }
-      const result = await checkout.createPayment(String(req.params.provider), paymentRequest);
+      const result = await checkout.createPayment(provider, paymentRequest);
       res.status(result.success ? 201 : 400).json(result);
     } catch (err) {
       sendError(res, err);
@@ -165,19 +234,24 @@ export function createCheckoutRouter(
     });
   }
 
-  // ---- POST /:provider/webhook — handle webhook ----------------------------
-  router.post('/:provider/webhook', async (req: Request, res: Response) => {
+  // ---- GET & POST /:provider/webhook — handle webhook ----------------------
+  const webhookHandler = async (req: Request, res: Response) => {
     try {
       const result = await checkout.handleWebhook(
         String(req.params.provider),
         req.body,
         req.headers as Record<string, string>,
+        req.query as Record<string, string>,
+        { method: req.method, path: req.originalUrl || req.url },
       );
       res.status(result.success ? 200 : 400).json(result);
     } catch (err) {
       sendError(res, err);
     }
-  });
+  };
+
+  router.get('/:provider/webhook', webhookHandler);
+  router.post('/:provider/webhook', webhookHandler);
 
   // ---- GET /:provider/redirect — handle redirect callback ------------------
   // NOTE: must be defined BEFORE /:provider/:id to avoid "redirect" being
@@ -188,6 +262,12 @@ export function createCheckoutRouter(
         String(req.params.provider),
         req.query as Record<string, string>,
       );
+      if (options.redirect) {
+        const targetUrl = result.success
+          ? options.redirect.onSuccess(result, req)
+          : options.redirect.onFailure(result, req);
+        return res.redirect(302, targetUrl);
+      }
       res.status(result.success ? 200 : 400).json(result);
     } catch (err) {
       sendError(res, err);
@@ -195,7 +275,14 @@ export function createCheckoutRouter(
   });
 
   // ---- GET /:provider/:id — get payment details ----------------------------
-  router.get('/:provider/:id', async (req: Request, res: Response) => {
+  const detailsHandlers: RequestHandler[] = [];
+  if (options.details?.middleware?.length) {
+    detailsHandlers.push(...options.details.middleware);
+  }
+  router.get('/:provider/:id', ...detailsHandlers, async (req: Request, res: Response) => {
+    if (options.details?.enabled === false) {
+      return res.status(404).json({ success: false, error: 'Payment details route is disabled' });
+    }
     try {
       const result = await checkout.getPaymentDetails(String(req.params.provider), String(req.params.id));
       res.status(result.success ? 200 : 404).json(result);

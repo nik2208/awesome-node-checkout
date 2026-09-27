@@ -21,8 +21,12 @@ class DummyProvider extends BasePaymentProvider {
   async refundPayment(id: string, amount?: number): Promise<PaymentResult> {
     return { success: true, paymentId: id, status: 'REFUNDED', raw: { amount } };
   }
-  async handleWebhook(body: any, headers: Record<string, string>): Promise<WebhookResult> {
-    return { success: true, paymentId: 'dummy-123', status: 'WEBHOOK', raw: body };
+  async handleWebhook(
+    body?: any,
+    headers: Record<string, string> = {},
+    query?: Record<string, string>,
+  ): Promise<WebhookResult> {
+    return { success: true, paymentId: 'dummy-123', status: 'WEBHOOK', raw: body ?? query };
   }
   async handleRedirect(query: Record<string, any>): Promise<PaymentResult> {
     return { success: true, paymentId: query.id, status: 'REDIRECT', raw: query };
@@ -54,7 +58,7 @@ describe('CheckoutConfigurator', () => {
         expect(() => configurator.getProvider('non-existent')).toThrowError(CheckoutError);
     });
 
-    it('should delegate createPayment and emit events', async () => {
+    it('should delegate createPayment and emit events with orderId and raw', async () => {
         const spyEmit = vi.spyOn(configurator.events, 'emit');
         const req: PaymentRequest = { amount: 10, currency: 'EUR', description: 'test', orderId: 'ord-123', returnUrl: 'http://ret', cancelUrl: 'http://can' };
         
@@ -67,7 +71,8 @@ describe('CheckoutConfigurator', () => {
             paymentId: 'dummy-123',
             orderId: 'ord-123',
             status: 'CREATED',
-            error: undefined
+            error: undefined,
+            raw: req,
         });
     });
 
@@ -92,26 +97,36 @@ describe('CheckoutConfigurator', () => {
             paymentId: 'err-id',
             orderId: undefined,
             status: 'FAILED',
-            error: 'Simulated failure'
+            error: 'Simulated failure',
+            raw: undefined,
         });
     });
 
-    it('should delegate executePayment and emit events', async () => {
+    it('should delegate executePayment and emit events with remembered orderId and raw', async () => {
         const spyEmit = vi.spyOn(configurator.events, 'emit');
-        
-        const result = await configurator.executePayment('dummy', 'test-id', { data: '123' });
+        await configurator.createPayment('dummy', {
+            amount: 10,
+            currency: 'EUR',
+            orderId: 'ORD-REMEMBERED',
+            returnUrl: '',
+            cancelUrl: '',
+        });
+
+        const result = await configurator.executePayment('dummy', 'dummy-123', { data: '123' });
         
         expect(result.success).toBe(true);
         expect(result.status).toBe('COMPLETED');
         expect(spyEmit).toHaveBeenCalledWith('payment.completed', {
             provider: 'dummy',
-            paymentId: 'test-id',
+            paymentId: 'dummy-123',
+            orderId: 'ORD-REMEMBERED',
             status: 'COMPLETED',
-            error: undefined
+            error: undefined,
+            raw: { data: '123' },
         });
     });
 
-    it('should delegate webhook handling', async () => {
+    it('should delegate webhook handling with body and headers', async () => {
         const spyEmit = vi.spyOn(configurator.events, 'emit');
         const result = await configurator.handleWebhook('dummy', { id: 'evt-1' }, { sign: '123' });
         expect(result.success).toBe(true);
@@ -119,22 +134,50 @@ describe('CheckoutConfigurator', () => {
         expect(spyEmit).toHaveBeenCalledWith('webhook.received', {
             provider: 'dummy',
             paymentId: 'dummy-123',
+            orderId: undefined,
             status: 'WEBHOOK',
             error: undefined,
-            data: { id: 'evt-1' }
+            data: { id: 'evt-1' },
+            raw: { id: 'evt-1' },
+        });
+    });
+
+    it('should forward query in handleWebhook and emit data: body ?? query', async () => {
+        const spyEmit = vi.spyOn(configurator.events, 'emit');
+        const spyHandleWebhook = vi.spyOn(provider, 'handleWebhook');
+
+        await configurator.handleWebhook('dummy', { id: 'evt-1' }, { sign: '123' }, { payment_id: 'X' });
+        expect(spyHandleWebhook).toHaveBeenCalledWith(
+            { id: 'evt-1' },
+            { sign: '123' },
+            { payment_id: 'X' },
+            undefined,
+        );
+
+        await configurator.handleWebhook('dummy', undefined, {}, { payment_id: 'X' });
+        expect(spyEmit).toHaveBeenCalledWith('webhook.received', {
+            provider: 'dummy',
+            paymentId: 'dummy-123',
+            orderId: undefined,
+            status: 'WEBHOOK',
+            error: undefined,
+            data: { payment_id: 'X' },
+            raw: { payment_id: 'X' },
         });
     });
 
     it('should delegate redirect handling', async () => {
         const spyEmit = vi.spyOn(configurator.events, 'emit');
-        const result = await configurator.handleRedirect('dummy', { id: 'test-id' });
+        const result = await configurator.handleRedirect('dummy', { id: 'test-id', order_id: 'ORD-REDIR' });
         expect(result.success).toBe(true);
         expect(result.paymentId).toBe('test-id');
         expect(spyEmit).toHaveBeenCalledWith('payment.completed', {
             provider: 'dummy',
             paymentId: 'test-id',
+            orderId: 'ORD-REDIR',
             status: 'REDIRECT',
-            error: undefined
+            error: undefined,
+            raw: { id: 'test-id', order_id: 'ORD-REDIR' },
         });
     });
 });

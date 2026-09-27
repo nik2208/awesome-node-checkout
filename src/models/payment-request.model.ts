@@ -18,6 +18,9 @@ export interface PaymentRequest {
   /** URL to redirect the user to if the payment is cancelled */
   cancelUrl: string;
 
+  /** Optional webhook / server-to-server notification URL forwarded to providers that support it */
+  notifyUrl?: string;
+
   /** External order identifier from the merchant's system */
   orderId?: string;
 

@@ -29,6 +29,11 @@ export interface SatispayProviderConfig {
    */
   serverUrl?: string;
   /**
+   * Path component for the callback webhook URL.
+   * @default '/checkout/satispay/webhook'
+   */
+  callbackPath?: string;
+  /**
    * Custom transaction store for correlating webhooks with orders.
    * Defaults to InMemoryTransactionStore.
    * Use a persistent store (Redis, DB) in multi-instance deployments.
@@ -111,20 +116,41 @@ export class SatispayProvider extends BasePaymentProvider {
    * Satispay signs webhooks with their own RSA private key; we verify using
    * the corresponding public key supplied in `config.webhookPublicKey`.
    *
-   * Returns `true` if the signature is valid, `false` otherwise.
-   * If no `webhookPublicKey` is configured the check is skipped and `true`
-   * is returned — callers should treat this as an unverified state.
+   * Supports (request-target) via context or headers, and verifies signature over
+   * headers with constant-time security.
    */
-  private verifyWebhookSignature(
-    body: unknown,
-    headers: Record<string, string>,
+  verifyWebhookSignature(
+    bodyOrHeaders?: unknown,
+    headersOrBody?: Record<string, string> | unknown,
+    context?: { method?: string; path?: string },
   ): boolean {
     if (!this.config.webhookPublicKey) {
       return true; // verification skipped — no public key configured
     }
 
     try {
-      const authHeader = headers['authorization'] ?? headers['Authorization'];
+      let body = bodyOrHeaders;
+      let headers = headersOrBody as Record<string, string> | undefined;
+
+      // Handle argument order flexibility: verifyWebhookSignature(body, headers) or (headers, body)
+      if (
+        typeof body === 'object' &&
+        body !== null &&
+        (('authorization' in body) || ('Authorization' in body) || ('signature' in body) || ('Signature' in body)) &&
+        (!headers || !('authorization' in headers || 'signature' in headers))
+      ) {
+        headers = body as Record<string, string>;
+        body = headersOrBody;
+      }
+
+      if (!headers) return false;
+
+      const authHeader =
+        (headers['authorization'] ??
+        headers['Authorization'] ??
+        headers['signature'] ??
+        headers['Signature']) as string | undefined;
+
       if (!authHeader) return false;
 
       // Parse the Signature params from the Authorization header.
@@ -152,13 +178,24 @@ export class SatispayProvider extends BasePaymentProvider {
 
       // Reconstruct the signed message from the incoming headers
       const headerNames = signedHeaders.split(' ');
-      const bodyString = body ? JSON.stringify(body) : '';
-      const digest =
+      const headerDigest = headers['digest'] ?? headers['Digest'];
+      const bodyString =
+        body !== undefined && body !== null
+          ? (typeof body === 'string' ? body : JSON.stringify(body))
+          : '';
+      const computedDigest =
         'SHA-256=' + crypto.createHash('sha256').update(bodyString).digest('base64');
+      const digest = headerDigest ?? computedDigest;
 
       const parts: string[] = [];
       for (const name of headerNames) {
-        if (name === 'digest') {
+        if (name === '(request-target)') {
+          const target =
+            headers['(request-target)'] ??
+            (context?.method && context?.path ? `${context.method.toLowerCase()} ${context.path}` : undefined);
+          if (!target) return false;
+          parts.push(`(request-target): ${target}`);
+        } else if (name === 'digest') {
           parts.push(`digest: ${digest}`);
         } else {
           const value =
@@ -205,10 +242,11 @@ export class SatispayProvider extends BasePaymentProvider {
     try {
       const orderId = request.orderId ?? `ORD-${Date.now()}`;
       const baseUrl = this.config.serverUrl ?? '';
+      const callbackPath = this.config.callbackPath ?? '/checkout/satispay/webhook';
 
       // Satispay replaces {uuid} at runtime with the actual payment ID
       const callbackUrl =
-        `${baseUrl}/checkout/satispay/webhook?order_id=${orderId}&payment_id={uuid}`;
+        `${baseUrl}${callbackPath}?order_id=${encodeURIComponent(orderId)}&payment_id={uuid}`;
 
       const body = {
         flow: 'MATCH_CODE',
@@ -250,10 +288,17 @@ export class SatispayProvider extends BasePaymentProvider {
   async getPaymentDetails(paymentId: string): Promise<PaymentResult> {
     try {
       const payment = await this.request<Record<string, unknown>>('GET', `${this.apiUrl}/payments/${paymentId}`);
+      const amountUnit = payment['amount_unit'];
+      const amount =
+        amountUnit != null && !isNaN(Number(amountUnit)) ? Number(amountUnit) / 100 : undefined;
+      const currency = payment['currency'] as string | undefined;
+
       return {
         success: true,
         paymentId: payment['id'] as string,
         status: payment['status'] as string,
+        amount,
+        currency,
         raw: payment,
       };
     } catch (error) {
@@ -287,22 +332,37 @@ export class SatispayProvider extends BasePaymentProvider {
    * `config.webhookPublicKey` (when configured) before processing.
    * We then confirm the payment status via an authenticated API call.
    */
-  async handleWebhook(body: Record<string, unknown>, headers: Record<string, string>): Promise<WebhookResult> {
-    if (!this.verifyWebhookSignature(body, headers)) {
+  async handleWebhook(
+    body?: Record<string, unknown>,
+    headers: Record<string, string> = {},
+    query: Record<string, string> = {},
+    context?: { method?: string; path?: string },
+  ): Promise<WebhookResult> {
+    if (!this.verifyWebhookSignature(body, headers, context)) {
       return { success: false, error: 'Webhook signature verification failed' };
     }
 
+    const b = body ?? {};
     const paymentId: string | undefined =
-      (body['payment_id'] as string | undefined) ?? (body['id'] as string | undefined);
+      (b['payment_id'] as string | undefined) ??
+      (b['id'] as string | undefined) ??
+      query['payment_id'];
     if (!paymentId) {
-      return { success: false, error: 'Missing payment_id in webhook body' };
+      return { success: false, error: 'Missing payment_id in webhook body or query' };
     }
     try {
       const payment = await this.request<Record<string, unknown>>('GET', `${this.apiUrl}/payments/${paymentId}`);
+      const amountUnit = payment['amount_unit'];
+      const amount =
+        amountUnit != null && !isNaN(Number(amountUnit)) ? Number(amountUnit) / 100 : undefined;
+      const currency = payment['currency'] as string | undefined;
+
       return {
         success: payment['status'] === 'ACCEPTED',
         paymentId: payment['id'] as string,
         status: payment['status'] as string,
+        amount,
+        currency,
         raw: payment,
       };
     } catch (error) {
@@ -340,6 +400,8 @@ export class SatispayProvider extends BasePaymentProvider {
       success: details.success && details.status === 'ACCEPTED',
       paymentId: details.paymentId,
       status: details.status,
+      amount: details.amount,
+      currency: details.currency,
       raw: details.raw,
     };
   }

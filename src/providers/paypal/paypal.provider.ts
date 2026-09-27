@@ -96,12 +96,23 @@ export class PayPalProvider extends BasePaymentProvider {
       const { result: order } = await this.ordersController.captureOrder({
         id: paymentId,
         body: {},
+        prefer: 'return=representation',
       });
+
+      const pu = Array.isArray((order as any)?.purchaseUnits)
+        ? (order as any).purchaseUnits[0]
+        : undefined;
+      const money = pu?.payments?.captures?.[0]?.amount ?? pu?.amount;
+      const amount =
+        money?.value != null && !isNaN(Number(money.value)) ? Number(money.value) : undefined;
+      const currency = typeof money?.currencyCode === 'string' ? money.currencyCode : undefined;
 
       return {
         success: order.status === 'COMPLETED',
         paymentId: order.id as string,
         status: order.status as string,
+        amount,
+        currency,
         raw: order,
       };
     } catch (error) {
@@ -115,10 +126,20 @@ export class PayPalProvider extends BasePaymentProvider {
         id: paymentId,
       });
 
+      const pu = Array.isArray((order as any)?.purchaseUnits)
+        ? (order as any).purchaseUnits[0]
+        : undefined;
+      const money = pu?.payments?.captures?.[0]?.amount ?? pu?.amount;
+      const amount =
+        money?.value != null && !isNaN(Number(money.value)) ? Number(money.value) : undefined;
+      const currency = typeof money?.currencyCode === 'string' ? money.currencyCode : undefined;
+
       return {
         success: true,
         paymentId: order.id as string,
         status: order.status as string,
+        amount,
+        currency,
         raw: order,
       };
     } catch (error) {

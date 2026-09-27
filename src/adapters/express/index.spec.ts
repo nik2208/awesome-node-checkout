@@ -1,10 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import express, { Express, Request, Response, NextFunction } from 'express';
 import request from 'supertest';
-import { createCheckoutRouter } from './index';
+import * as crypto from 'crypto';
+import { createCheckoutRouter, isPathPublic } from './index';
 import { CheckoutConfigurator } from '../../checkout-configurator';
 import { CheckoutError } from '../../models/errors';
 import { PaymentRequest } from '../../models/payment-request.model';
+import { NexiProvider } from '../../providers/nexi/nexi.provider';
 
 describe('Express Adapter (createCheckoutRouter)', () => {
     let app: Express;
@@ -66,7 +68,28 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             .send({ eventId: 'evt-1' });
 
         expect(response.status).toBe(200);
-        expect(checkout.handleWebhook).toHaveBeenCalledWith('dummy', { eventId: 'evt-1' }, expect.any(Object));
+        expect(checkout.handleWebhook).toHaveBeenCalledWith(
+            'dummy',
+            { eventId: 'evt-1' },
+            expect.any(Object),
+            {},
+            expect.objectContaining({ method: 'POST', path: '/payments/dummy/webhook' }),
+        );
+    });
+
+    it('GET /:provider/webhook - should map to handleWebhook passing query parameters', async () => {
+        const response = await request(app)
+            .get('/payments/dummy/webhook?payment_id=X');
+
+        expect(response.status).toBe(200);
+        expect(checkout.handleWebhook).toHaveBeenCalledWith(
+            'dummy',
+            undefined,
+            expect.any(Object),
+            { payment_id: 'X' },
+            expect.objectContaining({ method: 'GET', path: '/payments/dummy/webhook?payment_id=X' }),
+        );
+        expect(checkout.getPaymentDetails).not.toHaveBeenCalled();
     });
 
     it('GET /:provider/redirect - should map to handleRedirect (using query string)', async () => {
@@ -85,7 +108,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
         expect(checkout.getPaymentDetails).toHaveBeenCalledWith('dummy', 'PAY-123');
     });
 
-    describe('Security & buildPaymentRequest (Issue #3)', () => {
+    describe('Security & buildPaymentRequest (Issues #3 and #12)', () => {
         it('should warn at mount time when buildPaymentRequest is not set', () => {
             const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
             createCheckoutRouter(checkout);
@@ -104,13 +127,15 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             warnSpy.mockRestore();
         });
 
-        it('should use buildPaymentRequest server-side values ignoring client body', async () => {
+        it('should pass req and ctx to buildPaymentRequest and use server-side values', async () => {
             const secureApp = express();
             secureApp.use(express.json());
 
             let receivedReq: Request | null = null;
-            const buildPaymentRequest = vi.fn((req: Request): PaymentRequest => {
+            let receivedCtx: any = null;
+            const buildPaymentRequest = vi.fn((req: Request, ctx: any): PaymentRequest => {
                 receivedReq = req;
+                receivedCtx = ctx;
                 return {
                     amount: 19.99,
                     currency: 'EUR',
@@ -129,6 +154,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             expect(response.status).toBe(201);
             expect(buildPaymentRequest).toHaveBeenCalledTimes(1);
             expect(receivedReq).not.toBeNull();
+            expect(receivedCtx).toMatchObject({ provider: 'dummy' });
             expect(checkout.createPayment).toHaveBeenCalledWith('dummy', {
                 amount: 19.99,
                 currency: 'EUR',
@@ -136,6 +162,27 @@ describe('Express Adapter (createCheckoutRouter)', () => {
                 returnUrl: 'http://return',
                 cancelUrl: 'http://cancel',
             });
+        });
+
+        it('should return 400 INVALID_PAYMENT_REQUEST when buildPaymentRequest returns null or invalid object', async () => {
+            const secureApp = express();
+            secureApp.use(express.json());
+
+            secureApp.use('/payments', createCheckoutRouter(checkout, {
+                buildPaymentRequest: (() => null as any),
+            }));
+
+            const response = await request(secureApp)
+                .post('/payments/dummy')
+                .send({});
+
+            expect(response.status).toBe(400);
+            expect(response.body).toEqual({
+                success: false,
+                code: 'INVALID_PAYMENT_REQUEST',
+                error: expect.stringContaining('Invalid payment request returned by buildPaymentRequest'),
+            });
+            expect(checkout.createPayment).not.toHaveBeenCalled();
         });
 
         it('should return error and NOT call provider when buildPaymentRequest throws CheckoutError', async () => {
@@ -205,6 +252,91 @@ describe('Express Adapter (createCheckoutRouter)', () => {
 
                 expect(checkout.createPayment).not.toHaveBeenCalled();
             });
+        });
+    });
+
+    describe('Browser Redirect Flows (Issue #12)', () => {
+        it('should respond with 302 to onSuccess URL on successful redirect callback', async () => {
+            const redirectApp = express();
+            redirectApp.use(express.json());
+
+            redirectApp.use('/payments', createCheckoutRouter(checkout, {
+                redirect: {
+                    onSuccess: (result, req) => `https://shop.test/success?paymentId=${result.paymentId}&ref=${req.query.ref}`,
+                    onFailure: (result) => `https://shop.test/fail?status=${result.status}`,
+                },
+            }));
+
+            const response = await request(redirectApp)
+                .get('/payments/dummy/redirect?ref=user1');
+
+            expect(response.status).toBe(302);
+            expect(response.headers.location).toBe('https://shop.test/success?paymentId=PAY-123&ref=user1');
+        });
+
+        it('should respond with 302 to onFailure URL on failed redirect callback', async () => {
+            vi.spyOn(checkout, 'handleRedirect').mockResolvedValue({
+                success: false,
+                status: 'FAILED',
+                error: 'User cancelled',
+            });
+
+            const redirectApp = express();
+            redirectApp.use(express.json());
+
+            redirectApp.use('/payments', createCheckoutRouter(checkout, {
+                redirect: {
+                    onSuccess: (result) => `https://shop.test/success?paymentId=${result.paymentId}`,
+                    onFailure: (result) => `https://shop.test/fail?status=${result.status}`,
+                },
+            }));
+
+            const response = await request(redirectApp)
+                .get('/payments/dummy/redirect');
+
+            expect(response.status).toBe(302);
+            expect(response.headers.location).toBe('https://shop.test/fail?status=FAILED');
+        });
+    });
+
+    describe('Details Route Configuration (Issue #12)', () => {
+        it('should return 404 when details.enabled is false', async () => {
+            const noDetailsApp = express();
+            noDetailsApp.use(express.json());
+            noDetailsApp.use('/payments', createCheckoutRouter(checkout, {
+                details: { enabled: false },
+            }));
+
+            const response = await request(noDetailsApp).get('/payments/dummy/PAY-123');
+            expect(response.status).toBe(404);
+            expect(response.body.error).toContain('disabled');
+            expect(checkout.getPaymentDetails).not.toHaveBeenCalled();
+        });
+
+        it('should execute details.middleware before getPaymentDetails', async () => {
+            const detailsApp = express();
+            detailsApp.use(express.json());
+
+            const authGuard = (req: Request, res: Response, next: NextFunction) => {
+                if (req.headers['x-admin'] !== 'true') {
+                    return res.status(403).json({ error: 'Admin only' });
+                }
+                next();
+            };
+
+            detailsApp.use('/payments', createCheckoutRouter(checkout, {
+                details: { middleware: [authGuard] },
+            }));
+
+            const blocked = await request(detailsApp).get('/payments/dummy/PAY-123');
+            expect(blocked.status).toBe(403);
+            expect(checkout.getPaymentDetails).not.toHaveBeenCalled();
+
+            const allowed = await request(detailsApp)
+                .get('/payments/dummy/PAY-123')
+                .set('x-admin', 'true');
+            expect(allowed.status).toBe(200);
+            expect(checkout.getPaymentDetails).toHaveBeenCalledWith('dummy', 'PAY-123');
         });
     });
 
@@ -396,43 +528,129 @@ describe('Express Adapter (createCheckoutRouter)', () => {
         });
     });
 
-    describe('Middleware Options', () => {
-        it('should apply custom middleware to protect routes', async () => {
-            const protectedApp = express();
-            protectedApp.use(express.json());
-            const blockMiddleware = vi.fn((req, res, next) => {
-                res.status(401).json({ error: 'Unauthorized' });
-            });
-            
-            protectedApp.use('/api', createCheckoutRouter(checkout, {
-                middleware: [blockMiddleware]
-            }));
+    describe('Public Paths & Segment Matching (Issue #13)', () => {
+        it('isPathPublic unit tests with segment-based matching', () => {
+            const publicPatterns = [':provider/webhook', ':provider/redirect'];
 
-            const response = await request(protectedApp).get('/api/dummy/PAY-1');
-            
-            expect(response.status).toBe(401);
-            expect(response.body.error).toBe('Unauthorized');
-            expect(checkout.getPaymentDetails).not.toHaveBeenCalled();
+            // Should match:
+            expect(isPathPublic('/x/webhook', publicPatterns)).toBe(true);
+            expect(isPathPublic('/x/redirect', publicPatterns)).toBe(true);
+            expect(isPathPublic('/paypal/webhook', publicPatterns)).toBe(true);
+
+            // Should NOT match (substring vectors):
+            expect(isPathPublic('/webhook/execute', publicPatterns)).toBe(false);
+            expect(isPathPublic('/redirect/execute', publicPatterns)).toBe(false);
+            expect(isPathPublic('/x/webhooks', publicPatterns)).toBe(false);
+            expect(isPathPublic('/x/redirect/extra', publicPatterns)).toBe(false);
+            expect(isPathPublic('/x/y', publicPatterns)).toBe(false);
+
+            // Patterns without :provider match exact segments:
+            expect(isPathPublic('/health', ['health'])).toBe(true);
+            expect(isPathPublic('/health/check', ['health'])).toBe(false);
+            expect(isPathPublic('/my/health', ['health'])).toBe(false);
         });
 
-        it('should skip middleware if publicPaths matches', async () => {
-            const dynamicApp = express();
-            dynamicApp.use(express.json());
-            const blockMiddleware = vi.fn((req, res, next) => {
-                res.status(401).json({ error: 'Unauthorized' });
-            });
-            
-            dynamicApp.use('/api', createCheckoutRouter(checkout, {
-                middleware: [blockMiddleware],
-                publicPaths: ['/webhook']
+        it('applies middleware and verifies publicPaths acceptance criteria table', async () => {
+            const secureApp = express();
+            secureApp.use(express.json());
+
+            const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
+                res.status(401).json({ error: 'Auth required' });
+            };
+
+            secureApp.use('/checkout', createCheckoutRouter(checkout, {
+                middleware: [authMiddleware],
+                publicPaths: [':provider/webhook', ':provider/redirect'],
+                execute: {
+                    onBeforeExecute: async () => {},
+                },
             }));
 
-            const blocked = await request(dynamicApp).get('/api/dummy/PAY-1');
-            expect(blocked.status).toBe(401);
+            // Public paths: skip middleware (200)
+            const resPostWebhook = await request(secureApp).post('/checkout/x/webhook').send({});
+            expect(resPostWebhook.status).toBe(200);
 
-            const allowed = await request(dynamicApp).post('/api/dummy/webhook').send({});
-            expect(allowed.status).toBe(200);
-            expect(checkout.handleWebhook).toHaveBeenCalled();
+            const resGetRedirect = await request(secureApp).get('/checkout/x/redirect');
+            expect(resGetRedirect.status).toBe(200);
+
+            // Protected paths: must run middleware (401)
+            const resWebhookExec = await request(secureApp).post('/checkout/webhook/execute').send({});
+            expect(resWebhookExec.status).toBe(401);
+
+            const resRedirectExec = await request(secureApp).post('/checkout/redirect/execute').send({});
+            expect(resRedirectExec.status).toBe(401);
+
+            const resWebhooks = await request(secureApp).post('/checkout/x/webhooks').send({});
+            expect(resWebhooks.status).toBe(401);
+
+            const resRedirectExtra = await request(secureApp).get('/checkout/x/redirect/extra');
+            expect(resRedirectExtra.status).toBe(401);
+
+            const resXY = await request(secureApp).get('/checkout/x/y');
+            expect(resXY.status).toBe(401);
+        });
+    });
+
+    describe('Unmocked NexiProvider in Express Adapter (Issues #6 and #8)', () => {
+        const nexiConfig = {
+            merchantId: 'TEST_MERCHANT',
+            macKey: 'super-secret-mac-key',
+            environment: 'sandbox' as const,
+        };
+
+        function sha1(raw: string): string {
+            return crypto.createHash('sha1').update(raw).digest('hex');
+        }
+
+        it('GET /payments/nexi/redirect?codTrans=ORD-42&esito=OK returns 400 with FAILED status when mac is absent (Issue #6)', async () => {
+            const realCheckout = new CheckoutConfigurator({ emitEvents: false });
+            realCheckout.registerProvider(new NexiProvider(nexiConfig));
+
+            const nexiApp = express();
+            nexiApp.use(express.json());
+            nexiApp.use('/payments', createCheckoutRouter(realCheckout));
+
+            const res = await request(nexiApp).get('/payments/nexi/redirect?codTrans=ORD-42&esito=OK');
+            expect(res.status).toBe(400);
+            expect(res.body.status).toBe('FAILED');
+            expect(res.body.error).toBe('MAC missing');
+        });
+
+        it('POST /payments/nexi/webhook with urlencoded parser accepts valid MAC and rejects missing MAC (Issue #8)', async () => {
+            const realCheckout = new CheckoutConfigurator({ emitEvents: false });
+            realCheckout.registerProvider(new NexiProvider(nexiConfig));
+
+            const nexiApp = express();
+            nexiApp.use(express.urlencoded({ extended: false }));
+            nexiApp.use('/payments', createCheckoutRouter(realCheckout));
+
+            const codTrans = 'ORD-001';
+            const esito = 'OK';
+            const importo = '1999';
+            const divisa = 'EUR';
+            const dataStr = '20260927';
+            const orario = '120000';
+            const codAut = 'AUTH123';
+            const mac = sha1(`codTrans=${codTrans}esito=${esito}importo=${importo}divisa=${divisa}data=${dataStr}orario=${orario}codAut=${codAut}${nexiConfig.macKey}`);
+
+            // Valid notification
+            const resOk = await request(nexiApp)
+                .post('/payments/nexi/webhook')
+                .type('form')
+                .send({ codTrans, esito, importo, divisa, data: dataStr, orario, codAut, mac });
+
+            expect(resOk.status).toBe(200);
+            expect(resOk.body.status).toBe('COMPLETED');
+            expect(resOk.body.amount).toBe(19.99);
+
+            // Missing MAC
+            const resNoMac = await request(nexiApp)
+                .post('/payments/nexi/webhook')
+                .type('form')
+                .send({ codTrans, esito, importo, divisa });
+
+            expect(resNoMac.status).toBe(400);
+            expect(resNoMac.body.error).toBe('MAC verification failed');
         });
     });
 });

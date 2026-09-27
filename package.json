@@ -1,13 +1,19 @@
 {
   "name": "awesome-node-checkout",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Framework-agnostic payment checkout library for Node.js",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "commonjs",
   "exports": {
-    ".": "./dist/index.js",
-    "./express": "./dist/adapters/express/index.js"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./express": {
+      "types": "./dist/adapters/express/index.d.ts",
+      "default": "./dist/adapters/express/index.js"
+    }
   },
   "scripts": {
     "build": "tsc",

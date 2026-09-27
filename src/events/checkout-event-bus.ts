@@ -12,6 +12,7 @@ export interface CheckoutEventPayload {
   status?: string;
   error?: string;
   data?: any;
+  raw?: unknown;
   timestamp: Date;
 }
 

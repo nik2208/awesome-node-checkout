@@ -28,6 +28,7 @@ import { CheckoutEventBus, CheckoutEventName, CheckoutEventPayload } from './eve
  */
 export class CheckoutConfigurator {
   private readonly providers: Map<string, IPaymentProvider> = new Map();
+  private readonly paymentOrders: Map<string, string> = new Map();
 
   /** Event bus — subscribe to payment lifecycle events */
   readonly events: CheckoutEventBus = new CheckoutEventBus();
@@ -86,12 +87,16 @@ export class CheckoutConfigurator {
   async createPayment(providerName: string, request: PaymentRequest): Promise<PaymentResult> {
     const provider = this.getProvider(providerName);
     const result = await provider.createPayment(request);
+    if (result.paymentId && request.orderId) {
+      this.paymentOrders.set(result.paymentId, request.orderId);
+    }
     await this.emit(result.success ? 'payment.created' : 'payment.failed', {
       provider: providerName,
       paymentId: result.paymentId,
       orderId: request.orderId,
       status: result.status,
       error: result.error,
+      raw: result.raw,
     });
     return result;
   }
@@ -104,11 +109,14 @@ export class CheckoutConfigurator {
   ): Promise<PaymentResult> {
     const provider = this.getProvider(providerName);
     const result = await provider.executePayment(paymentId, data);
+    const orderId = this.paymentOrders.get(paymentId);
     await this.emit(result.success ? 'payment.completed' : 'payment.failed', {
       provider: providerName,
       paymentId,
+      orderId,
       status: result.status,
       error: result.error,
+      raw: result.raw,
     });
     return result;
   }
@@ -127,11 +135,14 @@ export class CheckoutConfigurator {
   ): Promise<PaymentResult> {
     const provider = this.getProvider(providerName);
     const result = await provider.refundPayment(paymentId, amount);
+    const orderId = this.paymentOrders.get(paymentId);
     await this.emit('payment.refunded', {
       provider: providerName,
       paymentId,
+      orderId,
       status: result.status,
       error: result.error,
+      raw: result.raw,
     });
     return result;
   }
@@ -142,8 +153,10 @@ export class CheckoutConfigurator {
    */
   async handleWebhook(
     providerName: string,
-    body: Record<string, unknown>,
-    headers: Record<string, string>,
+    body?: Record<string, unknown>,
+    headers: Record<string, string> = {},
+    query?: Record<string, string>,
+    context?: { method?: string; path?: string },
   ): Promise<WebhookResult> {
     const provider = this.getProvider(providerName);
     if (!provider.handleWebhook) {
@@ -153,13 +166,24 @@ export class CheckoutConfigurator {
         providerName,
       );
     }
-    const result = await provider.handleWebhook(body, headers);
+    const result = await provider.handleWebhook(body, headers, query, context);
+    const rawAny = result.raw as any;
+    const orderId =
+      rawAny?.orderId ??
+      rawAny?.order_id ??
+      rawAny?.external_code ??
+      rawAny?.codTrans ??
+      query?.order_id ??
+      (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined);
+
     await this.emit('webhook.received', {
       provider: providerName,
       paymentId: result.paymentId,
+      orderId,
       status: result.status,
       error: result.error,
-      data: body,
+      data: body ?? query,
+      raw: result.raw,
     });
     return result;
   }
@@ -181,11 +205,18 @@ export class CheckoutConfigurator {
       );
     }
     const result = await provider.handleRedirect(query);
+    const orderId =
+      (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined) ??
+      query?.order_id ??
+      query?.codTrans;
+
     await this.emit(result.success ? 'payment.completed' : 'payment.failed', {
       provider: providerName,
       paymentId: result.paymentId,
+      orderId,
       status: result.status,
       error: result.error,
+      raw: result.raw,
     });
     return result;
   }

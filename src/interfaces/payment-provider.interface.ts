@@ -28,10 +28,16 @@ export interface IPaymentProvider {
   refundPayment(paymentId: string, amount?: number): Promise<PaymentResult>;
 
   /**
-   * Handle an incoming webhook notification from the provider.
-   * Optional — implement only for providers that use the `webhook` flow.
+   * Handle an incoming webhook or server-to-server outcome notification from the provider.
+   * Optional — implement for providers that use the `webhook` flow or support
+   * server-to-server notifications.
    */
-  handleWebhook?(body: Record<string, unknown>, headers: Record<string, string>): Promise<WebhookResult>;
+  handleWebhook?(
+    body?: Record<string, unknown>,
+    headers?: Record<string, string>,
+    query?: Record<string, string>,
+    context?: { method?: string; path?: string },
+  ): Promise<WebhookResult>;
 
   /**
    * Handle the redirect callback from the provider (query params from returnUrl).

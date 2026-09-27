@@ -3,7 +3,50 @@ import { PayPalProvider } from './paypal.provider';
 import * as PayPalSDK from '@paypal/paypal-server-sdk';
 import { PaymentRequest } from '../../models/payment-request.model';
 
-// Mock del nuovo SDK ufficiale di PayPal Server v2
+// Mock of PayPal Server SDK v2
+const mockCaptureOrder = vi.fn().mockResolvedValue({
+    result: {
+        id: 'PAYPAL-ORD-123',
+        status: 'COMPLETED',
+        purchaseUnits: [{
+            payments: {
+                captures: [{
+                    id: 'CAPTURE-123',
+                    amount: { currencyCode: 'EUR', value: '50.00' }
+                }]
+            }
+        }]
+    }
+});
+
+const mockGetOrder = vi.fn().mockResolvedValue({
+    result: {
+        id: 'PAYPAL-ORD-123',
+        status: 'COMPLETED',
+        purchaseUnits: [{
+            amount: { currencyCode: 'EUR', value: '50.00' },
+            payments: { captures: [{ id: 'CAPTURE-123' }] }
+        }]
+    }
+});
+
+const mockCreateOrder = vi.fn().mockResolvedValue({
+    result: {
+        id: 'PAYPAL-ORD-123',
+        status: 'CREATED',
+        links: [
+            { rel: 'approve', href: 'https://sandbox.paypal.com/checkout?token=PAYPAL-ORD-123' }
+        ]
+    }
+});
+
+const mockRefundCapturedPayment = vi.fn().mockResolvedValue({
+    result: {
+        id: 'REFUND-123',
+        status: 'COMPLETED'
+    }
+});
+
 vi.mock('@paypal/paypal-server-sdk', () => {
     return {
         Environment: {
@@ -13,39 +56,12 @@ vi.mock('@paypal/paypal-server-sdk', () => {
         LogLevel: { Error: 'error' },
         Client: class { constructor() {} },
         OrdersController: class {
-            createOrder = vi.fn().mockResolvedValue({
-                result: {
-                    id: 'PAYPAL-ORD-123',
-                    status: 'CREATED',
-                    links: [
-                        { rel: 'approve', href: 'https://sandbox.paypal.com/checkout?token=PAYPAL-ORD-123' }
-                    ]
-                }
-            });
-            captureOrder = vi.fn().mockResolvedValue({
-                result: {
-                    id: 'PAYPAL-ORD-123',
-                    status: 'COMPLETED'
-                }
-            });
-            getOrder = vi.fn().mockResolvedValue({
-                result: {
-                    id: 'PAYPAL-ORD-123',
-                    status: 'COMPLETED',
-                    purchaseUnits: [{
-                        amount: { currencyCode: 'EUR', value: '50.00' },
-                        payments: { captures: [{ id: 'CAPTURE-123' }] }
-                    }]
-                }
-            });
+            createOrder = mockCreateOrder;
+            captureOrder = mockCaptureOrder;
+            getOrder = mockGetOrder;
         },
         PaymentsController: class {
-            refundCapturedPayment = vi.fn().mockResolvedValue({
-                result: {
-                    id: 'REFUND-123',
-                    status: 'COMPLETED'
-                }
-            });
+            refundCapturedPayment = mockRefundCapturedPayment;
         }
     };
 });
@@ -63,7 +79,6 @@ describe('PayPalProvider', () => {
     });
 
     it('should initialize with Sandbox environment', () => {
-        // expect(PayPalSDK.Environment.Sandbox).toHaveBeenCalled(); is invalid with class mock
         expect(provider).toBeInstanceOf(PayPalProvider);
     });
 
@@ -84,24 +99,55 @@ describe('PayPalProvider', () => {
         expect(result.approvalUrl).toBe('https://sandbox.paypal.com/checkout?token=PAYPAL-ORD-123');
     });
 
-    it('should successfully execute/capture a payment', async () => {
+    it('should successfully execute/capture a payment with prefer: return=representation and return amount/currency', async () => {
         const result = await provider.executePayment('PAYPAL-ORD-123');
 
         expect(result.success).toBe(true);
         expect(result.paymentId).toBe('PAYPAL-ORD-123');
         expect(result.status).toBe('COMPLETED');
+        expect(result.amount).toBe(50);
+        expect(result.currency).toBe('EUR');
+
+        expect(mockCaptureOrder).toHaveBeenCalledWith({
+            id: 'PAYPAL-ORD-123',
+            body: {},
+            prefer: 'return=representation',
+        });
+    });
+
+    it('should return amount and currency in getPaymentDetails via purchase-unit fallback', async () => {
+        const result = await provider.getPaymentDetails('PAYPAL-ORD-123');
+
+        expect(result.success).toBe(true);
+        expect(result.paymentId).toBe('PAYPAL-ORD-123');
+        expect(result.status).toBe('COMPLETED');
+        expect(result.amount).toBe(50);
+        expect(result.currency).toBe('EUR');
+    });
+
+    it('should return undefined amount when order does not report any amount', async () => {
+        (provider as any).ordersController = {
+            getOrder: vi.fn().mockResolvedValue({
+                result: {
+                    id: 'PAYPAL-ORD-NO-AMOUNT',
+                    status: 'COMPLETED',
+                    purchaseUnits: [{}]
+                }
+            })
+        };
+
+        const result = await provider.getPaymentDetails('PAYPAL-ORD-NO-AMOUNT');
+        expect(result.success).toBe(true);
+        expect(result.amount).toBeUndefined();
     });
 
     it('should gracefully handle order creation API failures', async () => {
-        // Sovrascriviamo temporaneamente il mock del controller per simulare un errore API
         const errorProvider = new PayPalProvider({
             clientId: 'mock-client-id',
             clientSecret: 'mock-client-secret',
             environment: 'sandbox'
         });
 
-        // We can intercept the ordersController instance since it's instantiated inside
-        // To do this effectively in JS/TS without messy spy injection:
         (errorProvider as any).ordersController = {
             createOrder: vi.fn().mockRejectedValue(new Error('Network error Paypal API'))
         };

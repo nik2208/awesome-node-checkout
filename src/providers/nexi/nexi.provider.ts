@@ -1,7 +1,7 @@
 import * as crypto from 'crypto';
 import { BasePaymentProvider } from '../../abstract/base-payment-provider.abstract';
 import { PaymentRequest } from '../../models/payment-request.model';
-import { PaymentResult } from '../../models/payment-result.model';
+import { PaymentResult, WebhookResult } from '../../models/payment-result.model';
 
 export interface NexiProviderConfig {
   merchantId: string;
@@ -40,18 +40,26 @@ export class NexiProvider extends BasePaymentProvider {
    *
    * SHA-1 is used here because Nexi XPay mandates it for MAC computation.
    */
-  private generateMac(codTrans: string, divisa: string, importoCents: number): string {
-    const raw = `codTrans=${codTrans}divisa=${divisa}importo=${importoCents}${this.config.macKey}`;
+  private sha1(raw: string): string {
     return crypto.createHash('sha1').update(raw).digest('hex');
   }
 
   /**
-   * Computes the SHA-1 MAC for the status (getPaymentDetails) API call.
-   * Format: `alias={alias}codTrans={codTrans}timestamp={timestamp}{macKey}`
+   * Computes the SHA-1 MAC required by Nexi to authenticate the payment request.
+   * Format: `codTrans={val}divisa={val}importo={val}{macKey}`
+   *
+   * SHA-1 is used here because Nexi XPay mandates it for MAC computation.
    */
-  private generateStatusMac(alias: string, codTrans: string, timestamp: string): string {
-    const raw = `alias=${alias}codTrans=${codTrans}timestamp=${timestamp}${this.config.macKey}`;
-    return crypto.createHash('sha1').update(raw).digest('hex');
+  private generateMac(codTrans: string, divisa: string, importoCents: number): string {
+    return this.sha1(`codTrans=${codTrans}divisa=${divisa}importo=${importoCents}${this.config.macKey}`);
+  }
+
+  /**
+   * Computes the SHA-1 MAC for the status (bo/situazioneOrdine) API call.
+   * Format: `apiKey={alias}codiceTransazione={codiceTransazione}timeStamp={timeStamp}{macKey}`
+   */
+  private generateStatusMac(alias: string, codiceTransazione: string, timeStamp: string): string {
+    return this.sha1(`apiKey=${alias}codiceTransazione=${codiceTransazione}timeStamp=${timeStamp}${this.config.macKey}`);
   }
 
   /**
@@ -64,24 +72,49 @@ export class NexiProvider extends BasePaymentProvider {
     importo: string,
     timestamp: string,
   ): string {
-    const raw = `alias=${alias}codTrans=${codTrans}importo=${importo}timestamp=${timestamp}${this.config.macKey}`;
-    return crypto.createHash('sha1').update(raw).digest('hex');
+    return this.sha1(`alias=${alias}codTrans=${codTrans}importo=${importo}timestamp=${timestamp}${this.config.macKey}`);
   }
 
   /**
-   * Verifies the SHA-1 MAC included in a Nexi POST-back response.
-   * Format: `codTrans={val}esito={val}importo={val}divisa={val}{macKey}`
+   * Verifies the SHA-1 outcome MAC included in a Nexi POST-back response or server notification.
+   * Format: `codTrans={codTrans}esito={esito}importo={importo}divisa={divisa}data={data}orario={orario}codAut={codAut}{macKey}`
    */
   private verifyResponseMac(
     codTrans: string,
     esito: string,
     importo: string,
     divisa: string,
+    dataStr: string,
+    orario: string,
+    codAut: string,
     mac: string,
   ): boolean {
-    const raw = `codTrans=${codTrans}esito=${esito}importo=${importo}divisa=${divisa}${this.config.macKey}`;
-    const expected = crypto.createHash('sha1').update(raw).digest('hex');
-    return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(mac, 'hex'));
+    const raw = `codTrans=${codTrans}esito=${esito}importo=${importo}divisa=${divisa}` +
+      `data=${dataStr}orario=${orario}codAut=${codAut}${this.config.macKey}`;
+    const expected = this.sha1(raw);
+    const expBuf = Buffer.from(expected, 'hex');
+    const macBuf = Buffer.from(mac, 'hex');
+    if (expBuf.length !== macBuf.length || expBuf.length === 0) {
+      return false;
+    }
+    return crypto.timingSafeEqual(expBuf, macBuf);
+  }
+
+  private safeVerifyResponseMac(
+    codTrans: string,
+    esito: string,
+    importo: string,
+    divisa: string,
+    dataStr: string,
+    orario: string,
+    codAut: string,
+    mac: string,
+  ): boolean {
+    try {
+      return this.verifyResponseMac(codTrans, esito, importo, divisa, dataStr, orario, codAut, mac);
+    } catch {
+      return false;
+    }
   }
 
   async createPayment(request: PaymentRequest): Promise<PaymentResult> {
@@ -99,6 +132,10 @@ export class NexiProvider extends BasePaymentProvider {
         url_back: request.cancelUrl,
         mac,
       };
+
+      if (request.notifyUrl) {
+        params.urlpost = request.notifyUrl;
+      }
 
       if (this.config.group) {
         params.gruppo = this.config.group;
@@ -120,7 +157,7 @@ export class NexiProvider extends BasePaymentProvider {
   /**
    * Validates the POST-back data from Nexi.
    * `data` is the query/body object sent by Nexi to the returnUrl.
-   * The MAC is verified before the result is considered authoritative.
+   * The outcome MAC is mandatory and verified over all 7 fields before the result is considered authoritative.
    */
   async executePayment(paymentId: string, data?: Record<string, string>): Promise<PaymentResult> {
     try {
@@ -128,29 +165,38 @@ export class NexiProvider extends BasePaymentProvider {
       const codTrans: string = data?.codTrans ?? paymentId;
       const importo: string = data?.importo ?? '';
       const divisa: string = data?.divisa ?? '';
+      const dataStr: string = (data as any)?.data ?? '';
+      const orario: string = (data as any)?.orario ?? '';
+      const codAut: string = (data as any)?.codAut ?? '';
       const mac: string = data?.mac ?? '';
 
-      if (mac) {
-        let macValid: boolean;
-        try {
-          macValid = this.verifyResponseMac(codTrans, esito, importo, divisa, mac);
-        } catch {
-          macValid = false;
-        }
-        if (!macValid) {
-          return {
-            success: false,
-            paymentId: codTrans,
-            status: 'FAILED',
-            error: 'MAC verification failed: response may have been tampered with',
-          };
-        }
+      if (!mac) {
+        return {
+          success: false,
+          paymentId: codTrans,
+          status: 'FAILED',
+          error: 'MAC missing',
+        };
       }
+
+      if (!this.safeVerifyResponseMac(codTrans, esito, importo, divisa, dataStr, orario, codAut, mac)) {
+        return {
+          success: false,
+          paymentId: codTrans,
+          status: 'FAILED',
+          error: 'MAC verification failed: response may have been tampered with',
+        };
+      }
+
+      const amount = importo !== '' && !isNaN(Number(importo)) ? Number(importo) / 100 : undefined;
+      const currency = divisa === '978' ? 'EUR' : (divisa || undefined);
 
       return {
         success: esito === 'OK',
         paymentId: codTrans,
         status: esito === 'OK' ? 'COMPLETED' : 'FAILED',
+        amount,
+        currency,
         raw: data,
       };
     } catch (error) {
@@ -158,28 +204,126 @@ export class NexiProvider extends BasePaymentProvider {
     }
   }
 
+  /**
+   * Handles the incoming server-to-server outcome notification (urlpost) from Nexi.
+   * The outcome MAC is mandatory and verified over all 7 fields.
+   */
+  async handleWebhook(
+    body?: Record<string, unknown>,
+    _headers: Record<string, string> = {},
+  ): Promise<WebhookResult> {
+    try {
+      if (!body) {
+        return { success: false, error: 'MAC verification failed' };
+      }
+      const f = (k: string) => String(body?.[k] ?? '');
+      const codTrans = f('codTrans');
+      const esito = f('esito');
+      const importo = f('importo');
+      const divisa = f('divisa');
+      const dataStr = f('data');
+      const orario = f('orario');
+      const codAut = f('codAut');
+      const mac = f('mac');
+
+      if (!mac || !this.safeVerifyResponseMac(codTrans, esito, importo, divisa, dataStr, orario, codAut, mac)) {
+        return {
+          success: false,
+          paymentId: codTrans || undefined,
+          error: 'MAC verification failed',
+        };
+      }
+
+      const amount = importo !== '' && !isNaN(Number(importo)) ? Number(importo) / 100 : undefined;
+      const currency = divisa === '978' ? 'EUR' : (divisa || undefined);
+
+      return {
+        success: esito === 'OK',
+        paymentId: codTrans,
+        status: esito === 'OK' ? 'COMPLETED' : 'FAILED',
+        amount,
+        currency,
+        raw: body,
+      };
+    } catch (error) {
+      return { success: false, error: 'MAC verification failed' };
+    }
+  }
+
   async getPaymentDetails(paymentId: string): Promise<PaymentResult> {
     try {
-      const timestamp = new Date().toISOString();
-      const mac = this.generateStatusMac(this.config.merchantId, paymentId, timestamp);
+      const timeStamp = String(Date.now());
+      const mac = this.generateStatusMac(this.config.merchantId, paymentId, timeStamp);
 
-      const params = {
-        alias: this.config.merchantId,
-        codTrans: paymentId,
-        timestamp,
+      const requestBody = {
+        apiKey: this.config.merchantId,
+        codiceTransazione: paymentId,
+        timeStamp,
         mac,
       };
 
-      const response = await fetch(`${this.apiUrl}/ecomm/api/vas/igfs/status/plain`, {
+      const response = await fetch(`${this.apiUrl}/ecomm/api/bo/situazioneOrdine`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams(params),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
       });
 
       if (!response.ok) throw new Error(`Nexi API error: ${response.statusText}`);
       const result = await response.json() as Record<string, unknown>;
 
-      return { success: true, paymentId, status: result['status'] as string, raw: result };
+      const esito = String(result['esito'] ?? '');
+      if (esito !== 'OK') {
+        const errMsg = (result['errore'] as any)?.messaggio ?? 'Payment details request failed';
+        return { success: false, paymentId, error: errMsg, raw: result };
+      }
+
+      // Verify response MAC
+      const idOperazione = String(result['idOperazione'] ?? '');
+      const respTimeStamp = String(result['timeStamp'] ?? '');
+      const expectedMac = this.sha1(`esito=${esito}idOperazione=${idOperazione}timeStamp=${respTimeStamp}${this.config.macKey}`);
+      const respMac = String(result['mac'] ?? '');
+
+      const expBuf = Buffer.from(expectedMac, 'hex');
+      const macBuf = Buffer.from(respMac, 'hex');
+      let macValid = false;
+      try {
+        macValid = expBuf.length === macBuf.length && expBuf.length > 0 && crypto.timingSafeEqual(expBuf, macBuf);
+      } catch {
+        macValid = false;
+      }
+
+      if (!macValid) {
+        return {
+          success: false,
+          paymentId,
+          error: 'MAC verification failed: response may have been tampered with',
+          raw: result,
+        };
+      }
+
+      const report = Array.isArray(result['report']) ? result['report'] : [];
+      const item = report.find((r: any) => r?.codiceTransazione === paymentId) ?? report[0];
+      if (!item) {
+        return {
+          success: false,
+          paymentId,
+          error: 'Report not found in Nexi response',
+          raw: result,
+        };
+      }
+
+      const stato = item.stato as string;
+      const amount = item.importo != null && !isNaN(Number(item.importo)) ? Number(item.importo) / 100 : undefined;
+      const currency = item.divisa === '978' ? 'EUR' : (item.divisa ? String(item.divisa) : undefined);
+
+      return {
+        success: true,
+        paymentId,
+        status: stato,
+        amount,
+        currency,
+        raw: result,
+      };
     } catch (error) {
       return this.errorResult(error, 'Failed to get Nexi payment details');
     }
@@ -221,8 +365,8 @@ export class NexiProvider extends BasePaymentProvider {
 
   /**
    * Handles the POST-back from Nexi to the returnUrl.
-   * Nexi sends `esito`, `codTrans`, `importo`, `divisa`, `mac`, etc. as query/body params.
-   * The MAC is verified to ensure the response was not spoofed.
+   * Nexi sends `esito`, `codTrans`, `importo`, `divisa`, `mac`, `data`, `orario`, `codAut` etc.
+   * The outcome MAC is mandatory and verified over all 7 fields to ensure authenticity.
    */
   async handleRedirect(query: Record<string, string>): Promise<PaymentResult> {
     return this.executePayment(query['codTrans'] ?? '', query);

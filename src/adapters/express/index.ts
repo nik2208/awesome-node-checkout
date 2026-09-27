@@ -1,6 +1,7 @@
 import { Router, Request, Response, RequestHandler } from 'express';
 import { CheckoutConfigurator } from '../../checkout-configurator';
 import { CheckoutError } from '../../models/errors';
+import { PaymentRequest } from '../../models/payment-request.model';
 
 export interface ExpressCheckoutOptions {
   /**
@@ -14,6 +15,27 @@ export interface ExpressCheckoutOptions {
    * Matched against the path suffix after the mount point.
    */
   publicPaths?: string[];
+
+  /**
+   * Builds the PaymentRequest on the server (amount from your own order), ignoring the client body.
+   */
+  buildPaymentRequest?: (req: Request) => PaymentRequest | Promise<PaymentRequest>;
+
+  /**
+   * Configuration for POST /:provider/refund.
+   * If omitted, the refund route is NOT mounted (returns 404).
+   */
+  refund?: {
+    middleware?: RequestHandler[];
+  };
+
+  /**
+   * Configuration for POST /:provider/execute.
+   */
+  execute?: {
+    middleware?: RequestHandler[];
+    onBeforeExecute?: (req: Request, paymentId: string) => void | Promise<void>;
+  };
 }
 
 /**
@@ -25,14 +47,25 @@ export interface ExpressCheckoutOptions {
  * POST   /:provider/execute      → executePayment
  * GET    /:provider/redirect     → handleRedirect  (must come before /:provider/:id)
  * GET    /:provider/:id          → getPaymentDetails
- * POST   /:provider/refund       → refundPayment
+ * POST   /:provider/refund       → refundPayment (only if options.refund is configured)
  * POST   /:provider/webhook      → handleWebhook
  * ```
  *
  * Usage:
  * ```typescript
  * import { createCheckoutRouter } from 'awesome-node-checkout/express';
- * app.use('/checkout', createCheckoutRouter(checkout));
+ * app.use('/checkout', createCheckoutRouter(checkout, {
+ *   buildPaymentRequest: async (req) => {
+ *     const order = await getOrder(req.body.orderId);
+ *     return {
+ *       amount: order.total,
+ *       currency: 'EUR',
+ *       orderId: order.id,
+ *       returnUrl: 'https://example.com/success',
+ *       cancelUrl: 'https://example.com/cancel',
+ *     };
+ *   },
+ * }));
  * ```
  */
 export function createCheckoutRouter(
@@ -40,6 +73,12 @@ export function createCheckoutRouter(
   options: ExpressCheckoutOptions = {},
 ): Router {
   const router = Router();
+
+  if (!options.buildPaymentRequest) {
+    console.warn(
+      '[awesome-node-checkout] createCheckoutRouter: the client body decides the amount; set buildPaymentRequest',
+    );
+  }
 
   // Apply shared middleware (skipping public paths)
   if (options.middleware?.length) {
@@ -63,7 +102,28 @@ export function createCheckoutRouter(
   // ---- POST /:provider — create payment ------------------------------------
   router.post('/:provider', async (req: Request, res: Response) => {
     try {
-      const result = await checkout.createPayment(String(req.params.provider), req.body);
+      let paymentRequest: PaymentRequest;
+      if (options.buildPaymentRequest) {
+        paymentRequest = await options.buildPaymentRequest(req);
+      } else {
+        const body = req.body;
+        const amount = body?.amount;
+        const currency = body?.currency;
+        if (
+          typeof amount !== 'number' ||
+          !Number.isFinite(amount) ||
+          amount <= 0 ||
+          typeof currency !== 'string' ||
+          currency.trim() === ''
+        ) {
+          return res.status(400).json({
+            success: false,
+            error: 'Invalid payment request: amount must be a positive number and currency is required',
+          });
+        }
+        paymentRequest = body;
+      }
+      const result = await checkout.createPayment(String(req.params.provider), paymentRequest);
       res.status(result.success ? 201 : 400).json(result);
     } catch (err) {
       sendError(res, err);
@@ -71,9 +131,16 @@ export function createCheckoutRouter(
   });
 
   // ---- POST /:provider/execute — execute payment ---------------------------
-  router.post('/:provider/execute', async (req: Request, res: Response) => {
+  const executeHandlers: RequestHandler[] = [];
+  if (options.execute?.middleware?.length) {
+    executeHandlers.push(...options.execute.middleware);
+  }
+  router.post('/:provider/execute', ...executeHandlers, async (req: Request, res: Response) => {
     try {
       const { paymentId, data } = req.body as { paymentId: string; data?: any };
+      if (options.execute?.onBeforeExecute) {
+        await options.execute.onBeforeExecute(req, paymentId);
+      }
       const result = await checkout.executePayment(String(req.params.provider), paymentId, data);
       res.status(result.success ? 200 : 400).json(result);
     } catch (err) {
@@ -81,16 +148,22 @@ export function createCheckoutRouter(
     }
   });
 
-  // ---- POST /:provider/refund — refund payment -----------------------------
-  router.post('/:provider/refund', async (req: Request, res: Response) => {
-    try {
-      const { paymentId, amount } = req.body as { paymentId: string; amount?: number };
-      const result = await checkout.refundPayment(String(req.params.provider), paymentId, amount);
-      res.status(result.success ? 200 : 400).json(result);
-    } catch (err) {
-      sendError(res, err);
+  // ---- POST /:provider/refund — refund payment (opt-in) --------------------
+  if (options.refund) {
+    const refundHandlers: RequestHandler[] = [];
+    if (options.refund.middleware?.length) {
+      refundHandlers.push(...options.refund.middleware);
     }
-  });
+    router.post('/:provider/refund', ...refundHandlers, async (req: Request, res: Response) => {
+      try {
+        const { paymentId, amount } = req.body as { paymentId: string; amount?: number };
+        const result = await checkout.refundPayment(String(req.params.provider), paymentId, amount);
+        res.status(result.success ? 200 : 400).json(result);
+      } catch (err) {
+        sendError(res, err);
+      }
+    });
+  }
 
   // ---- POST /:provider/webhook — handle webhook ----------------------------
   router.post('/:provider/webhook', async (req: Request, res: Response) => {
@@ -145,7 +218,7 @@ function sendError(res: Response, err: unknown): void {
       WEBHOOK_NOT_SUPPORTED: 422,
       REDIRECT_NOT_SUPPORTED: 422,
     };
-    const status = statusMap[err.code] ?? 500;
+    const status = statusMap[err.code] ?? 400;
     res.status(status).json({ success: false, error: err.message, code: err.code });
   } else {
     const message = err instanceof Error ? err.message : 'Internal server error';

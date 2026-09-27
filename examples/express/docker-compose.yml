@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  payment-gateway-express:
+    build: .
+    image: payment-gateway-express:${CURRENT_VERSION:-latest}
+    container_name: payment-gateway-express-${CI_ENVIRONMENT_NAME:-local}
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=${CI_ENVIRONMENT_NAME:-production}
+      - SERVER_URL=${SERVER_URL}
+      - PAYPAL_CLIENT_ID=${PAYPAL_CLIENT_ID}
+      - PAYPAL_CLIENT_SECRET=${PAYPAL_CLIENT_SECRET}
+      - SATISPAY_KEY_ID=${SATISPAY_KEY_ID}
+      - SATISPAY_PRIVATE_KEY=${SATISPAY_PRIVATE_KEY}

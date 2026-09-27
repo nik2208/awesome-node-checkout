@@ -1,0 +1,50 @@
+{{#> layout}}
+<div class="row justify-content-center">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-body text-center">
+                {{#if (eq status 'success')}}
+                <div class="text-success mb-4">
+                    <i class="bi bi-check-circle" style="font-size: 4rem;"></i>
+                </div>
+                {{else}}
+                <div class="text-warning mb-4">
+                    <i class="bi bi-x-circle" style="font-size: 4rem;"></i>
+                </div>
+                {{/if}}
+
+                <h2>{{title}}</h2>
+                <p class="lead">{{message}}</p>
+
+                {{#if paymentDetails}}
+                <div class="card mt-4">
+                    <div class="card-header">
+                        <h3 class="h5 mb-0">Payment Details ({{paymentDetails.provider}})</h3>
+                    </div>
+                    <div class="card-body">
+                        <dl class="row">
+                            <dt class="col-sm-4">Payment ID:</dt>
+                            <dd class="col-sm-8">{{paymentDetails.paymentId}}</dd>
+
+                            <dt class="col-sm-4">Status:</dt>
+                            <dd class="col-sm-8">{{paymentDetails.status}}</dd>
+
+                            {{#if (eq paymentDetails.provider 'nexi')}}
+                            <dt class="col-sm-4">Authorization Code:</dt>
+                            <dd class="col-sm-8">{{paymentDetails.transactionDetails.codAut}}</dd>
+                            <dt class="col-sm-4">Transaction Code:</dt>
+                            <dd class="col-sm-8">{{paymentDetails.transactionDetails.codTrans}}</dd>
+                            {{/if}}
+                        </dl>
+                    </div>
+                </div>
+                {{/if}}
+
+                <div class="mt-4">
+                    <a href="/web" class="btn btn-primary">Try Another Payment</a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{{/layout}}

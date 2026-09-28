@@ -8,6 +8,7 @@ import {
 import { BasePaymentProvider } from '../../abstract/base-payment-provider.abstract';
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult } from '../../models/payment-result.model';
+import { parseAmount } from '../../utils/parsing.util';
 
 export interface PayPalProviderConfig {
   clientId: string;
@@ -102,15 +103,17 @@ export class PayPalProvider extends BasePaymentProvider {
       const pu = Array.isArray((order as any)?.purchaseUnits)
         ? (order as any).purchaseUnits[0]
         : undefined;
-      const money = pu?.payments?.captures?.[0]?.amount ?? pu?.amount;
-      const amount =
-        money?.value != null && !isNaN(Number(money.value)) ? Number(money.value) : undefined;
-      const currency = typeof money?.currencyCode === 'string' ? money.currencyCode : undefined;
+      const capture = pu?.payments?.captures?.[0];
+      const captureStatus = typeof capture?.status === 'string' ? capture.status : undefined;
+      const isCaptureCompleted = captureStatus === 'COMPLETED';
+      const amount = parseAmount(capture?.amount?.value);
+      const currency = typeof capture?.amount?.currencyCode === 'string' ? capture.amount.currencyCode : undefined;
+      const status = captureStatus ?? (order.status as string);
 
       return {
-        success: order.status === 'COMPLETED',
+        success: isCaptureCompleted,
         paymentId: order.id as string,
-        status: order.status as string,
+        status,
         amount,
         currency,
         raw: order,
@@ -129,15 +132,17 @@ export class PayPalProvider extends BasePaymentProvider {
       const pu = Array.isArray((order as any)?.purchaseUnits)
         ? (order as any).purchaseUnits[0]
         : undefined;
-      const money = pu?.payments?.captures?.[0]?.amount ?? pu?.amount;
-      const amount =
-        money?.value != null && !isNaN(Number(money.value)) ? Number(money.value) : undefined;
-      const currency = typeof money?.currencyCode === 'string' ? money.currencyCode : undefined;
+      const capture = pu?.payments?.captures?.[0];
+      const captureStatus = typeof capture?.status === 'string' ? capture.status : undefined;
+      const isCaptureCompleted = captureStatus === 'COMPLETED';
+      const amount = parseAmount(capture?.amount?.value);
+      const currency = typeof capture?.amount?.currencyCode === 'string' ? capture.amount.currencyCode : undefined;
+      const status = captureStatus ?? (order.status as string);
 
       return {
-        success: true,
+        success: isCaptureCompleted,
         paymentId: order.id as string,
-        status: order.status as string,
+        status,
         amount,
         currency,
         raw: order,

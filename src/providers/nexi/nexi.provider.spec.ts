@@ -274,6 +274,31 @@ describe('NexiProvider', () => {
     expect(resTamperedAuth.error).toMatch(/MAC verification failed/);
   });
 
+  it('should reject non-hex or invalid length MAC', async () => {
+    const codTrans = 'ORD-001';
+    const esito = 'OK';
+    const importo = '1999';
+    const divisa = 'EUR';
+    const dataStr = '20260927';
+    const orario = '120000';
+    const codAut = 'AUTH123';
+
+    // 42 characters or invalid hex characters
+    const resInvalidLen = await provider.handleRedirect({
+      codTrans, esito, importo, divisa, data: dataStr, orario, codAut,
+      mac: 'a'.repeat(42),
+    });
+    expect(resInvalidLen.success).toBe(false);
+    expect(resInvalidLen.error).toMatch(/MAC verification failed/);
+
+    const resNonHex = await provider.handleRedirect({
+      codTrans, esito, importo, divisa, data: dataStr, orario, codAut,
+      mac: 'z'.repeat(40),
+    });
+    expect(resNonHex.success).toBe(false);
+    expect(resNonHex.error).toMatch(/MAC verification failed/);
+  });
+
   it('should leave amount undefined when importo is empty or missing', async () => {
     const codTrans = 'ORD-001';
     const esito = 'OK';
@@ -519,6 +544,79 @@ describe('NexiProvider', () => {
     const result = await provider.getPaymentDetails('ORD-001');
     expect(result.success).toBe(false);
     expect(result.error).toContain('Report not found');
+  });
+
+  it('should return failure when report does not contain the requested transaction (no report[0] fallback)', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1700000000000);
+    const respMac = sha1(`esito=OKidOperazione=OP-1timeStamp=1700000000001${config.macKey}`);
+
+    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        esito: 'OK',
+        idOperazione: 'OP-1',
+        timeStamp: '1700000000001',
+        mac: respMac,
+        report: [{
+          codiceTransazione: 'ORD-OTHER',
+          stato: 'Contabilizzato',
+          importo: '1000',
+          divisa: 'EUR',
+        }],
+      }),
+    });
+
+    const result = await provider.getPaymentDetails('ORD-MY-ORDER');
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Report not found');
+  });
+
+  it('should map numeric currency codes and handle unknown codes and empty amount in getPaymentDetails', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1700000000000);
+    const respMac = sha1(`esito=OKidOperazione=OP-1timeStamp=1700000000001${config.macKey}`);
+
+    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        esito: 'OK',
+        idOperazione: 'OP-1',
+        timeStamp: '1700000000001',
+        mac: respMac,
+        report: [{
+          codiceTransazione: 'ORD-USD',
+          stato: 'Contabilizzato',
+          importo: '1500',
+          divisa: '840', // USD
+        }],
+      }),
+    });
+
+    const resUsd = await provider.getPaymentDetails('ORD-USD');
+    expect(resUsd.success).toBe(true);
+    expect(resUsd.currency).toBe('USD');
+    expect(resUsd.amount).toBe(15);
+
+    // Unknown currency and empty amount
+    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        esito: 'OK',
+        idOperazione: 'OP-1',
+        timeStamp: '1700000000001',
+        mac: respMac,
+        report: [{
+          codiceTransazione: 'ORD-UNKNOWN',
+          stato: 'Contabilizzato',
+          importo: '',
+          divisa: '9999',
+        }],
+      }),
+    });
+
+    const resUnknown = await provider.getPaymentDetails('ORD-UNKNOWN');
+    expect(resUnknown.success).toBe(true);
+    expect(resUnknown.currency).toBeUndefined();
+    expect(resUnknown.amount).toBeUndefined();
   });
 
   it('should handle API HTTP errors gracefully in getPaymentDetails', async () => {

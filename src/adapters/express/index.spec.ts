@@ -77,6 +77,24 @@ describe('Express Adapter (createCheckoutRouter)', () => {
         );
     });
 
+    it('POST /:provider/webhook - should strip raw from the HTTP response JSON', async () => {
+        vi.spyOn(checkout, 'handleWebhook').mockResolvedValue({
+            success: true,
+            paymentId: 'PAY-123',
+            status: 'COMPLETED',
+            raw: { sensitiveInternalData: 'secret-123' },
+        });
+
+        const response = await request(app)
+            .post('/payments/dummy/webhook')
+            .send({ eventId: 'evt-1' });
+
+        expect(response.status).toBe(200);
+        expect(response.body.paymentId).toBe('PAY-123');
+        expect(response.body.status).toBe('COMPLETED');
+        expect(response.body.raw).toBeUndefined();
+    });
+
     it('GET /:provider/webhook - should map to handleWebhook passing query parameters', async () => {
         const response = await request(app)
             .get('/payments/dummy/webhook?payment_id=X');
@@ -182,6 +200,26 @@ describe('Express Adapter (createCheckoutRouter)', () => {
                 code: 'INVALID_PAYMENT_REQUEST',
                 error: expect.stringContaining('Invalid payment request returned by buildPaymentRequest'),
             });
+            expect(checkout.createPayment).not.toHaveBeenCalled();
+        });
+
+        it('should allow buildPaymentRequest to send response directly via ctx.res without triggering 400 or double response', async () => {
+            const secureApp = express();
+            secureApp.use(express.json());
+
+            secureApp.use('/payments', createCheckoutRouter(checkout, {
+                buildPaymentRequest: ((req: Request, ctx: any) => {
+                    ctx.res.status(403).json({ error: 'Direct response from hook' });
+                    return null as any;
+                }),
+            }));
+
+            const response = await request(secureApp)
+                .post('/payments/dummy')
+                .send({});
+
+            expect(response.status).toBe(403);
+            expect(response.body).toEqual({ error: 'Direct response from hook' });
             expect(checkout.createPayment).not.toHaveBeenCalled();
         });
 
@@ -548,6 +586,13 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             expect(isPathPublic('/health', ['health'])).toBe(true);
             expect(isPathPublic('/health/check', ['health'])).toBe(false);
             expect(isPathPublic('/my/health', ['health'])).toBe(false);
+
+            // Segment array format:
+            const segmentPatterns: any = [[':provider', 'webhook'], [':provider', 'redirect']];
+            expect(isPathPublic('/x/webhook', segmentPatterns)).toBe(true);
+            expect(isPathPublic('/x/redirect', segmentPatterns)).toBe(true);
+            expect(isPathPublic('/x/webhooks', segmentPatterns)).toBe(false);
+            expect(isPathPublic('/x/other', segmentPatterns)).toBe(false);
         });
 
         it('applies middleware and verifies publicPaths acceptance criteria table', async () => {

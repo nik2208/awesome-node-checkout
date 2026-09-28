@@ -41,7 +41,8 @@ checkout
     keyId: process.env.SATISPAY_KEY_ID!,
     privateKey: fs.readFileSync('private.pem', 'utf8'),
     environment: 'sandbox',
-    serverUrl: 'https://myapp.com',
+    serverUrl: 'https://myapp.com', // Base URL for callbacks: serverUrl + callbackPath
+    callbackPath: '/checkout/satispay/webhook', // Optional: defaults to /checkout/satispay/webhook
   }));
 
 // Use directly — no HTTP framework needed
@@ -66,7 +67,12 @@ import express from 'express';
 import { createCheckoutRouter } from 'awesome-node-checkout/express';
 
 const app = express();
-app.use(express.json());
+// Capture rawBody for webhook signature & digest verification (e.g. Satispay)
+app.use(express.json({
+  verify: (req, _res, buf) => {
+    (req as any).rawBody = buf;
+  },
+}));
 // If using Nexi server notifications (urlpost), urlencoded parser is required:
 app.use(express.urlencoded({ extended: false }));
 
@@ -106,10 +112,10 @@ app.use(
         // Verify payment belongs to current session or user
       },
     },
-    // Public paths matching segments safely without substring bypasses
+    // Public paths matching segments safely without substring bypasses (accepts strings or segment arrays)
     publicPaths: [
-      [':provider', 'webhook'],
-      [':provider', 'redirect'],
+      ':provider/webhook',
+      ':provider/redirect',
     ],
   }),
 );
@@ -129,12 +135,20 @@ fastify.post('/checkout/:provider', async (req, reply) => {
   reply.status(result.success ? 201 : 400).send(result);
 });
 
-fastify.post('/checkout/:provider/webhook', async (req, reply) => {
-  const result = await checkout.handleWebhook(req.params.provider, req.body, req.headers, req.query, {
-    method: req.method,
-    path: req.url,
-  });
-  reply.send(result);
+// Handle both POST and GET webhooks (e.g. Satispay GET callback vs Nexi/Satispay POST notification)
+fastify.route({
+  method: ['GET', 'POST'],
+  url: '/checkout/:provider/webhook',
+  handler: async (req, reply) => {
+    const result = await checkout.handleWebhook(req.params.provider, req.body, req.headers, req.query, {
+      method: req.method,
+      path: req.url,
+      rawBody: (req as any).rawBody,
+    });
+    // Strip internal raw data before responding
+    const { raw, ...safeResult } = result;
+    reply.status(result.success ? 200 : 400).send(safeResult);
+  },
 });
 ```
 
@@ -167,18 +181,20 @@ Relying solely on front-end browser redirects (`GET /:provider/redirect`) to ful
 - **Amount Mismatch**: Always verify that the captured payment amount matches your order ledger before fulfilling goods or services.
 
 To ensure safe fulfillment:
-1. **Verify Amount & Currency**: `PaymentResult` and `WebhookResult` return `amount` and `currency` extracted directly from the provider.
+1. **Verify Amount & Currency**: `PaymentResult` and `WebhookResult` return `amount` and `currency` extracted directly from the provider. Compare amounts in minor units (cents) or with rounding to prevent floating-point discrepancies:
    ```typescript
    const result = await checkout.handleRedirect(provider, req.query);
    if (result.success && result.status === 'COMPLETED') {
-     if (result.amount !== order.totalAmount || result.currency !== order.currency) {
+     const orderCents = Math.round(order.totalAmount * 100);
+     const resultCents = Math.round((result.amount ?? 0) * 100);
+     if (resultCents !== orderCents || result.currency !== order.currency) {
        throw new Error('Authorized amount does not match order total');
      }
    }
    ```
 2. **Use Server Notifications / Webhooks**:
    - For **Nexi**: Pass `notifyUrl` in `PaymentRequest` (e.g. `https://myapp.com/checkout/nexi/webhook`). Nexi sends a server-to-server POST notification (`urlpost`) with the 7-field outcome MAC. Ensure your app includes `app.use(express.urlencoded({ extended: false }))`.
-   - For **Satispay**: Use `callbackPath` or webhook callbacks; signatures are verified against Satispay's RSA public key with `(request-target)` HTTP signature support.
+   - For **Satispay**: Set `serverUrl` (and optionally `callbackPath`, default `/checkout/satispay/webhook`). POST notifications verify RSA-SHA256 HTTP signatures against Satispay's RSA public key with `(request-target)` and SHA-256 `Digest` binding to `rawBody`. GET callbacks (`?payment_id=...`) are verified by server-side query to Satispay's API with merchant RSA authentication.
 3. **Idempotency**: Because both the redirect callback and the webhook notification may arrive for the same order, ensure your fulfillment handler is idempotent.
 
 ---

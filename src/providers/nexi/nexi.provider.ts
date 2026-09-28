@@ -2,6 +2,7 @@ import * as crypto from 'crypto';
 import { BasePaymentProvider } from '../../abstract/base-payment-provider.abstract';
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult, WebhookResult } from '../../models/payment-result.model';
+import { parseAmountFromCents, parseNexiCurrency } from '../../utils/parsing.util';
 
 export interface NexiProviderConfig {
   merchantId: string;
@@ -76,6 +77,14 @@ export class NexiProvider extends BasePaymentProvider {
   }
 
   /**
+  /**
+   * Validates that the MAC is a string of exactly 40 hexadecimal characters.
+   */
+  private isValidHexMac(mac: unknown): mac is string {
+    return typeof mac === 'string' && /^[0-9a-fA-F]{40}$/.test(mac);
+  }
+
+  /**
    * Verifies the SHA-1 outcome MAC included in a Nexi POST-back response or server notification.
    * Format: `codTrans={codTrans}esito={esito}importo={importo}divisa={divisa}data={data}orario={orario}codAut={codAut}{macKey}`
    */
@@ -89,6 +98,9 @@ export class NexiProvider extends BasePaymentProvider {
     codAut: string,
     mac: string,
   ): boolean {
+    if (!this.isValidHexMac(mac)) {
+      return false;
+    }
     const raw = `codTrans=${codTrans}esito=${esito}importo=${importo}divisa=${divisa}` +
       `data=${dataStr}orario=${orario}codAut=${codAut}${this.config.macKey}`;
     const expected = this.sha1(raw);
@@ -168,7 +180,7 @@ export class NexiProvider extends BasePaymentProvider {
       const dataStr: string = (data as any)?.data ?? '';
       const orario: string = (data as any)?.orario ?? '';
       const codAut: string = (data as any)?.codAut ?? '';
-      const mac: string = data?.mac ?? '';
+      const mac = data?.mac;
 
       if (!mac) {
         return {
@@ -179,7 +191,7 @@ export class NexiProvider extends BasePaymentProvider {
         };
       }
 
-      if (!this.safeVerifyResponseMac(codTrans, esito, importo, divisa, dataStr, orario, codAut, mac)) {
+      if (!this.isValidHexMac(mac) || !this.safeVerifyResponseMac(codTrans, esito, importo, divisa, dataStr, orario, codAut, mac)) {
         return {
           success: false,
           paymentId: codTrans,
@@ -188,8 +200,8 @@ export class NexiProvider extends BasePaymentProvider {
         };
       }
 
-      const amount = importo !== '' && !isNaN(Number(importo)) ? Number(importo) / 100 : undefined;
-      const currency = divisa === '978' ? 'EUR' : (divisa || undefined);
+      const amount = parseAmountFromCents(importo);
+      const currency = parseNexiCurrency(divisa);
 
       return {
         success: esito === 'OK',
@@ -224,9 +236,9 @@ export class NexiProvider extends BasePaymentProvider {
       const dataStr = f('data');
       const orario = f('orario');
       const codAut = f('codAut');
-      const mac = f('mac');
+      const mac = body?.['mac'];
 
-      if (!mac || !this.safeVerifyResponseMac(codTrans, esito, importo, divisa, dataStr, orario, codAut, mac)) {
+      if (!this.isValidHexMac(mac) || !this.safeVerifyResponseMac(codTrans, esito, importo, divisa, dataStr, orario, codAut, mac)) {
         return {
           success: false,
           paymentId: codTrans || undefined,
@@ -234,8 +246,8 @@ export class NexiProvider extends BasePaymentProvider {
         };
       }
 
-      const amount = importo !== '' && !isNaN(Number(importo)) ? Number(importo) / 100 : undefined;
-      const currency = divisa === '978' ? 'EUR' : (divisa || undefined);
+      const amount = parseAmountFromCents(importo);
+      const currency = parseNexiCurrency(divisa);
 
       return {
         success: esito === 'OK',
@@ -281,7 +293,16 @@ export class NexiProvider extends BasePaymentProvider {
       const idOperazione = String(result['idOperazione'] ?? '');
       const respTimeStamp = String(result['timeStamp'] ?? '');
       const expectedMac = this.sha1(`esito=${esito}idOperazione=${idOperazione}timeStamp=${respTimeStamp}${this.config.macKey}`);
-      const respMac = String(result['mac'] ?? '');
+      const respMac = result['mac'];
+
+      if (!this.isValidHexMac(respMac)) {
+        return {
+          success: false,
+          paymentId,
+          error: 'MAC verification failed: response may have been tampered with',
+          raw: result,
+        };
+      }
 
       const expBuf = Buffer.from(expectedMac, 'hex');
       const macBuf = Buffer.from(respMac, 'hex');
@@ -302,19 +323,19 @@ export class NexiProvider extends BasePaymentProvider {
       }
 
       const report = Array.isArray(result['report']) ? result['report'] : [];
-      const item = report.find((r: any) => r?.codiceTransazione === paymentId) ?? report[0];
+      const item = report.find((r: any) => r?.codiceTransazione === paymentId);
       if (!item) {
         return {
           success: false,
           paymentId,
-          error: 'Report not found in Nexi response',
+          error: 'Report not found',
           raw: result,
         };
       }
 
       const stato = item.stato as string;
-      const amount = item.importo != null && !isNaN(Number(item.importo)) ? Number(item.importo) / 100 : undefined;
-      const currency = item.divisa === '978' ? 'EUR' : (item.divisa ? String(item.divisa) : undefined);
+      const amount = parseAmountFromCents(item.importo);
+      const currency = parseNexiCurrency(item.divisa);
 
       return {
         success: true,

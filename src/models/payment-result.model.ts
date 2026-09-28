@@ -17,6 +17,9 @@ export interface PaymentResult {
   /** ISO 4217 alpha code reported by the provider (e.g. 'EUR') */
   currency?: string;
 
+  /** Order identifier associated with the payment if tracked */
+  orderId?: string;
+
   /** Error message if success is false */
   error?: string;
 
@@ -28,6 +31,7 @@ export interface PaymentResult {
 export interface WebhookResult {
   success: boolean;
   paymentId?: string;
+  orderId?: string;
   status?: string;
 
   /** Amount reported by the provider, major units (same unit as PaymentRequest.amount) */

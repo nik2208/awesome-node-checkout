@@ -19,16 +19,19 @@ export interface ExpressCheckoutOptions {
   /**
    * Route patterns that bypass `middleware` (e.g. [':provider/webhook', ':provider/redirect']).
    * Matched by path segments after the mount point (:provider matches any single segment).
+   * Supports both path strings (':provider/webhook') and segment arrays ([':provider', 'webhook']).
    */
-  publicPaths?: string[];
+  publicPaths?: (string | string[])[];
 
   /**
    * Builds the PaymentRequest on the server (amount from your own order), ignoring the client body.
+   * If the hook sends an HTTP response directly (e.g. via `ctx.res.status(403)...`),
+   * returning `null` or `undefined` halts further adapter processing without error.
    */
   buildPaymentRequest?: (
     req: Request,
     ctx: PaymentRequestContext,
-  ) => PaymentRequest | Promise<PaymentRequest>;
+  ) => PaymentRequest | null | undefined | Promise<PaymentRequest | null | undefined>;
 
   /**
    * When configured, GET /:provider/redirect responds with a 302 redirect
@@ -68,16 +71,19 @@ export interface ExpressCheckoutOptions {
 /**
  * Matches a request path against public path patterns by segments.
  * ':provider' matches any single non-empty segment.
+ * Accepts patterns formatted as string ('/:provider/webhook') or segment arrays ([':provider', 'webhook']).
  */
-export function isPathPublic(reqPath: string, publicPaths: string[]): boolean {
+export function isPathPublic(reqPath: string, publicPaths: (string | string[])[]): boolean {
   const reqSegments = reqPath.split('/').filter(Boolean);
   return publicPaths.some((pattern) => {
-    const patternSegments = pattern.split('/').filter(Boolean);
+    const patternSegments = Array.isArray(pattern)
+      ? pattern
+      : pattern.split('/').filter(Boolean);
     if (reqSegments.length !== patternSegments.length) {
       return false;
     }
     return patternSegments.every((patSeg, i) => {
-      if (patSeg === ':provider') {
+      if (patSeg === ':provider' || patSeg.startsWith(':')) {
         return reqSegments[i].length > 0;
       }
       return patSeg === reqSegments[i];
@@ -149,23 +155,27 @@ export function createCheckoutRouter(
       const provider = String(req.params.provider);
       let paymentRequest: PaymentRequest;
       if (options.buildPaymentRequest) {
-        paymentRequest = await options.buildPaymentRequest(req, {
+        const customReq = await options.buildPaymentRequest(req, {
           provider,
           res,
         });
 
+        if (res.headersSent) {
+          return;
+        }
+
         if (
-          !paymentRequest ||
-          typeof paymentRequest !== 'object' ||
-          typeof paymentRequest.amount !== 'number' ||
-          !Number.isFinite(paymentRequest.amount) ||
-          paymentRequest.amount <= 0 ||
-          typeof paymentRequest.currency !== 'string' ||
-          paymentRequest.currency.trim() === '' ||
-          typeof paymentRequest.returnUrl !== 'string' ||
-          paymentRequest.returnUrl.trim() === '' ||
-          typeof paymentRequest.cancelUrl !== 'string' ||
-          paymentRequest.cancelUrl.trim() === ''
+          !customReq ||
+          typeof customReq !== 'object' ||
+          typeof customReq.amount !== 'number' ||
+          !Number.isFinite(customReq.amount) ||
+          customReq.amount <= 0 ||
+          typeof customReq.currency !== 'string' ||
+          customReq.currency.trim() === '' ||
+          typeof customReq.returnUrl !== 'string' ||
+          customReq.returnUrl.trim() === '' ||
+          typeof customReq.cancelUrl !== 'string' ||
+          customReq.cancelUrl.trim() === ''
         ) {
           return res.status(400).json({
             success: false,
@@ -174,6 +184,7 @@ export function createCheckoutRouter(
               'Invalid payment request returned by buildPaymentRequest: amount must be a positive number, currency, returnUrl, and cancelUrl are required strings',
           });
         }
+        paymentRequest = customReq;
       } else {
         const body = req.body;
         const amount = body?.amount;
@@ -242,9 +253,15 @@ export function createCheckoutRouter(
         req.body,
         req.headers as Record<string, string>,
         req.query as Record<string, string>,
-        { method: req.method, path: req.originalUrl || req.url },
+        {
+          method: req.method,
+          path: req.originalUrl || req.url,
+          rawBody: (req as any).rawBody ?? (Buffer.isBuffer(req.body) ? req.body : undefined),
+        },
       );
-      res.status(result.success ? 200 : 400).json(result);
+      // Sanitize: do not echo raw provider payload in webhook response
+      const { raw, ...safeResult } = result;
+      res.status(result.success ? 200 : 400).json(safeResult);
     } catch (err) {
       sendError(res, err);
     }
@@ -299,6 +316,7 @@ export function createCheckoutRouter(
 // ---------------------------------------------------------------------------
 
 function sendError(res: Response, err: unknown): void {
+  if (res.headersSent) return;
   if (err instanceof CheckoutError) {
     const statusMap: Record<string, number> = {
       PROVIDER_NOT_FOUND: 404,

@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-09-28
+
+### Security
+- **Satispay**: Disallowed request body acting as headers during webhook signature verification. Resolves #16.
+- **Satispay**: Enforced timestamp freshness window (`signatureMaxAgeMs`, default 5 minutes) on webhook signatures to prevent replay attacks. Resolves #16.
+- **Satispay**: Strictly bound `Digest` header validation to the raw request body (`context.rawBody` or stringified body) verifying `SHA-256=<base64>`. Resolves #16.
+- **Satispay**: Enforced `(request-target)` to be derived solely from trusted `context.method` and `context.path`. Resolves #16.
+- **Satispay**: URL-encoded `payment_id` across API endpoints and strictly validated payment ID format (`/^[A-Za-z0-9_-]{1,64}$/`) rejecting directory traversal patterns. Resolves #16.
+- **Nexi**: Enforced strict 40-character hexadecimal format validation on outcome MAC strings to prevent `RangeError` during timing-safe comparisons. Resolves #17.
+- **Express Adapter**: Prevented sensitive internal provider payload data from being echoed in HTTP webhook JSON responses (strips `raw`). Resolves #17.
+
+### Fixed
+- **PayPal**: Payment `success` is now strictly derived from capture status (`capture.status === 'COMPLETED'`) in `executePayment` and `getPaymentDetails`. Payments with non-completed or missing captures evaluate to `success: false`. Resolves #17.
+- **Nexi**: Removed `report[0]` fallback in `getPaymentDetails` when the requested transaction order ID is not present in the BackOffice report, returning `{ success: false, error: 'Report not found' }`. Resolves #17.
+- **Nexi**: Mapped ISO-4217 numeric currency codes (e.g. `'978'` -> `'EUR'`, `'840'` -> `'USD'`) to uppercase alpha-3 codes, returning `undefined` for unrecognized numeric codes. Resolves #17.
+- **Core**: Empty or whitespace-only amount strings are parsed to `undefined` rather than coercing to `0`. Resolves #17.
+- **Core**: Bounded `paymentOrders` map capacity to 10,000 entries with FIFO eviction to prevent memory leaks in long-running processes. Resolves #17.
+- **Express Adapter**: Handled `res.headersSent` when `buildPaymentRequest` sends a response directly via `ctx.res` and returns `null`, preventing `ERR_HTTP_HEADERS_SENT` / double response errors. Resolves #17.
+- **Documentation**: Corrected `publicPaths` examples, clarified Satispay callback URL configuration, raw body middleware, and GET callback authentication. Resolves #17.
+
+### Added
+- **Core**: Added optional `orderId` to `PaymentResult` and `WebhookResult`. Resolves #17.
+- **Core**: Added `rawBody` support to `context` parameter in `IPaymentProvider.handleWebhook`. Resolves #16.
+
 ## [1.2.0] - 2026-09-27
 
 ### Security

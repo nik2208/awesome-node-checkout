@@ -180,4 +180,20 @@ describe('CheckoutConfigurator', () => {
             raw: { id: 'test-id', order_id: 'ORD-REDIR' },
         });
     });
+
+    it('should evict oldest entry when paymentOrders exceeds max capacity (bounded map)', () => {
+        // Pre-fill to 10,000 capacity
+        for (let i = 0; i < 10000; i++) {
+            (configurator as any).setPaymentOrder(`pay-${i}`, `ord-${i}`);
+        }
+        expect((configurator as any).paymentOrders.size).toBe(10000);
+        expect((configurator as any).paymentOrders.has('pay-0')).toBe(true);
+
+        // Add one more entry
+        (configurator as any).setPaymentOrder('pay-10000', 'ord-10000');
+        expect((configurator as any).paymentOrders.size).toBe(10000);
+        expect((configurator as any).paymentOrders.has('pay-0')).toBe(false);
+        expect((configurator as any).paymentOrders.has('pay-10000')).toBe(true);
+    });
 });
+

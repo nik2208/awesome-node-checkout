@@ -28,12 +28,24 @@ import { CheckoutEventBus, CheckoutEventName, CheckoutEventPayload } from './eve
  */
 export class CheckoutConfigurator {
   private readonly providers: Map<string, IPaymentProvider> = new Map();
+  private readonly maxPaymentOrders = 10000;
   private readonly paymentOrders: Map<string, string> = new Map();
 
   /** Event bus — subscribe to payment lifecycle events */
   readonly events: CheckoutEventBus = new CheckoutEventBus();
 
   constructor(private readonly config: CheckoutConfig = {}) {}
+
+  /** Stores a paymentId -> orderId mapping with bounded capacity to prevent memory leaks */
+  private setPaymentOrder(paymentId: string, orderId: string): void {
+    if (this.paymentOrders.size >= this.maxPaymentOrders) {
+      const firstKey = this.paymentOrders.keys().next().value;
+      if (firstKey) {
+        this.paymentOrders.delete(firstKey);
+      }
+    }
+    this.paymentOrders.set(paymentId, orderId);
+  }
 
   /** Emits an event only when `config.emitEvents` is not explicitly `false`. */
   private async emit(
@@ -88,7 +100,8 @@ export class CheckoutConfigurator {
     const provider = this.getProvider(providerName);
     const result = await provider.createPayment(request);
     if (result.paymentId && request.orderId) {
-      this.paymentOrders.set(result.paymentId, request.orderId);
+      this.setPaymentOrder(result.paymentId, request.orderId);
+      result.orderId = request.orderId;
     }
     await this.emit(result.success ? 'payment.created' : 'payment.failed', {
       provider: providerName,
@@ -110,6 +123,9 @@ export class CheckoutConfigurator {
     const provider = this.getProvider(providerName);
     const result = await provider.executePayment(paymentId, data);
     const orderId = this.paymentOrders.get(paymentId);
+    if (orderId && !result.orderId) {
+      result.orderId = orderId;
+    }
     await this.emit(result.success ? 'payment.completed' : 'payment.failed', {
       provider: providerName,
       paymentId,
@@ -136,6 +152,9 @@ export class CheckoutConfigurator {
     const provider = this.getProvider(providerName);
     const result = await provider.refundPayment(paymentId, amount);
     const orderId = this.paymentOrders.get(paymentId);
+    if (orderId && !result.orderId) {
+      result.orderId = orderId;
+    }
     await this.emit('payment.refunded', {
       provider: providerName,
       paymentId,
@@ -156,7 +175,7 @@ export class CheckoutConfigurator {
     body?: Record<string, unknown>,
     headers: Record<string, string> = {},
     query?: Record<string, string>,
-    context?: { method?: string; path?: string },
+    context?: { method?: string; path?: string; rawBody?: Buffer | string },
   ): Promise<WebhookResult> {
     const provider = this.getProvider(providerName);
     if (!provider.handleWebhook) {
@@ -175,6 +194,10 @@ export class CheckoutConfigurator {
       rawAny?.codTrans ??
       query?.order_id ??
       (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined);
+
+    if (orderId && !result.orderId) {
+      result.orderId = orderId;
+    }
 
     await this.emit('webhook.received', {
       provider: providerName,
@@ -209,6 +232,10 @@ export class CheckoutConfigurator {
       (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined) ??
       query?.order_id ??
       query?.codTrans;
+
+    if (orderId && !result.orderId) {
+      result.orderId = orderId;
+    }
 
     await this.emit(result.success ? 'payment.completed' : 'payment.failed', {
       provider: providerName,

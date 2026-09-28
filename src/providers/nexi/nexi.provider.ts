@@ -202,14 +202,23 @@ export class NexiProvider extends BasePaymentProvider {
 
       const amount = parseAmountFromCents(importo);
       const currency = parseNexiCurrency(divisa);
+      const isPaid = esito === 'OK' && amount !== undefined;
 
       return {
-        success: esito === 'OK',
+        success: isPaid,
         paymentId: codTrans,
         status: esito === 'OK' ? 'COMPLETED' : 'FAILED',
         amount,
         currency,
         raw: data,
+        ...(isPaid
+          ? {}
+          : {
+              error:
+                esito === 'OK' && amount === undefined
+                  ? 'Payment amount is missing or invalid'
+                  : `Payment failed with outcome ${esito}`,
+            }),
       };
     } catch (error) {
       return this.errorResult(error, 'Failed to execute Nexi payment');
@@ -248,14 +257,23 @@ export class NexiProvider extends BasePaymentProvider {
 
       const amount = parseAmountFromCents(importo);
       const currency = parseNexiCurrency(divisa);
+      const isPaid = esito === 'OK' && amount !== undefined;
 
       return {
-        success: esito === 'OK',
+        success: isPaid,
         paymentId: codTrans,
         status: esito === 'OK' ? 'COMPLETED' : 'FAILED',
         amount,
         currency,
         raw: body,
+        ...(isPaid
+          ? {}
+          : {
+              error:
+                esito === 'OK' && amount === undefined
+                  ? 'Payment amount is missing or invalid'
+                  : `Payment failed with outcome ${esito}`,
+            }),
       };
     } catch (error) {
       return { success: false, error: 'MAC verification failed' };
@@ -337,13 +355,26 @@ export class NexiProvider extends BasePaymentProvider {
       const amount = parseAmountFromCents(item.importo);
       const currency = parseNexiCurrency(item.divisa);
 
+      const NEXI_PAID_STATUSES = new Set(['autorizzato', 'contabilizzato', 'catturato']);
+      const statoStr = typeof stato === 'string' ? stato.toLowerCase() : '';
+      const isPaidStatus = NEXI_PAID_STATUSES.has(statoStr);
+      const isSuccess = isPaidStatus && amount !== undefined;
+
       return {
-        success: true,
+        success: isSuccess,
         paymentId,
         status: stato,
         amount,
         currency,
         raw: result,
+        ...(isSuccess
+          ? {}
+          : {
+              error:
+                isPaidStatus && amount === undefined
+                  ? 'Payment amount is missing or invalid'
+                  : `Payment status is ${stato ?? 'unknown'}`,
+            }),
       };
     } catch (error) {
       return this.errorResult(error, 'Failed to get Nexi payment details');

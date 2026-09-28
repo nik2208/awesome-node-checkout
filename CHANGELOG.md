@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-09-28
+
+### Security
+- **Satispay**: Enforced minimum signed headers requirement in HTTP Signature verification: rejects any signature whose `headers` parameter omits `(request-target)`, `date`, or (when a request body is present) `digest`. Resolves #19.
+- **Satispay**: Strictly enforced presence and freshness of the `Date` HTTP header; requests without a `Date` header are immediately rejected. Resolves #19.
+- **Satispay**: Redacted provider API response bodies from user-facing error messages to prevent internal details or secrets from leaking to callers. Resolves #19.
+- **Express Adapter**: Stripped `raw` provider payloads from all HTTP JSON route responses (`POST /:provider`, `POST /:provider/execute`, `POST /:provider/refund`, `GET /:provider/redirect`, `GET /:provider/:id`, `GET/POST /:provider/webhook`) to protect sensitive payer details. Resolves #19.
+- **Core**: Hardened `parseAmount` and `parseAmountFromCents` to use strict decimal and integer regexes, rejecting hex (`0x10`), octal (`0o77`), binary (`0b10`), and scientific notation (`1e3`). Resolves #19.
+
+### Fixed
+- **Satispay**: Documented and implemented dedicated handling for GET callbacks (`?payment_id=...`): accepted as unsigned notification triggers for server-to-server API re-read authenticated with merchant private key; untrusted query parameters are ignored while POST webhooks strictly enforce HTTP Signature verification. Resolves #19.
+- **Core**: Enforced that `success` is never `true` when `amount` is undefined or missing across all providers (PayPal, Satispay, Nexi). Confirmed payments without an amount now return `success: false` with `'Payment amount is missing or invalid'`. Resolves #19.
+- **PayPal**: Exposed `captureStatus` separately in `PaymentResult` and `WebhookResult`. When an order has no capture, `status` is set to `'NO_CAPTURE'`, `captureStatus` is `undefined`, and `success` is `false`. Resolves #19.
+- **Nexi**: Aligned `getPaymentDetails` to require paid/settled status (`'Contabilizzato'`, `'Autorizzato'`, `'Catturato'`) and valid amount for `success: true`. Resolves #19.
+- **Documentation**: Documented `webhookPublicKey` requirement in production, raw body capture in Express, router mount prefix requirements, and fixed minor-unit status checking example. Resolves #19.
+
 ## [1.2.1] - 2026-09-28
 
 ### Security

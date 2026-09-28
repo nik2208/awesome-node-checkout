@@ -1,21 +1,38 @@
 /**
  * Safely parses an amount value into a finite number.
  * Returns undefined for null, undefined, boolean, empty strings, whitespace, NaN, and Infinity.
+ * Enforces strict decimal notation (rejects hex '0x10' and scientific '1e3').
  */
 export function parseAmount(val: unknown): number | undefined {
   if (val == null || typeof val === 'boolean') return undefined;
-  if (typeof val === 'string' && val.trim() === '') return undefined;
-  const num = typeof val === 'number' ? val : Number(val);
-  return !isNaN(num) && isFinite(num) ? num : undefined;
+  if (typeof val === 'number') {
+    return !isNaN(val) && isFinite(val) ? val : undefined;
+  }
+  if (typeof val === 'string') {
+    const str = val.trim();
+    if (!/^-?\d+(\.\d+)?$/.test(str)) return undefined;
+    const num = Number(str);
+    return !isNaN(num) && isFinite(num) ? num : undefined;
+  }
+  return undefined;
 }
 
 /**
  * Safely parses amounts denominated in minor units (cents) into major units.
- * Returns undefined if the input cannot be parsed.
+ * Returns undefined if the input cannot be parsed or is not an integer number of cents.
  */
 export function parseAmountFromCents(val: unknown): number | undefined {
-  const num = parseAmount(val);
-  return num !== undefined ? num / 100 : undefined;
+  if (val == null || typeof val === 'boolean') return undefined;
+  if (typeof val === 'number') {
+    return Number.isInteger(val) && isFinite(val) ? val / 100 : undefined;
+  }
+  if (typeof val === 'string') {
+    const str = val.trim();
+    if (!/^-?\d+$/.test(str)) return undefined;
+    const num = Number(str);
+    return !isNaN(num) && isFinite(num) ? num / 100 : undefined;
+  }
+  return undefined;
 }
 
 const NEXI_NUMERIC_CURRENCY_MAP: Record<string, string> = {

@@ -136,7 +136,7 @@ describe('SatispayProvider', () => {
         expect(result.currency).toBe('EUR');
     });
 
-    it('should leave amount undefined when amount_unit is missing', async () => {
+    it('should leave amount undefined when amount_unit is missing and return success: false', async () => {
         (global.fetch as any).mockResolvedValue({
             ok: true,
             text: vi.fn().mockResolvedValue(JSON.stringify({
@@ -146,8 +146,9 @@ describe('SatispayProvider', () => {
         });
 
         const result = await provider.getPaymentDetails('SAT-NO-AMOUNT');
-        expect(result.success).toBe(true);
+        expect(result.success).toBe(false);
         expect(result.amount).toBeUndefined();
+        expect(result.error).toContain('Payment amount is missing or invalid');
     });
 
     it('should handle incoming webhook with payment_id in query and undefined body', async () => {
@@ -175,7 +176,54 @@ describe('SatispayProvider', () => {
         expect(options).toMatchObject({ method: 'GET' });
     });
 
-    it('should reject webhook without Authorization when webhookPublicKey is configured', async () => {
+    it('should accept unsigned GET webhook callback as API re-read trigger even when webhookPublicKey is configured', async () => {
+        const secureProvider = new SatispayProvider({
+            keyId: 'test-key',
+            privateKey: validFakePrivateKey,
+            webhookPublicKey: validFakePublicKey,
+            serverUrl: 'http://localhost',
+        });
+        const mockResponse = {
+            ok: true,
+            text: vi.fn().mockResolvedValue(JSON.stringify({
+                id: 'SAT-123',
+                status: 'ACCEPTED',
+                amount_unit: 1999,
+                currency: 'EUR',
+            }))
+        };
+        (global.fetch as any).mockResolvedValue(mockResponse);
+
+        const result = await secureProvider.handleWebhook(
+            undefined,
+            {},
+            { payment_id: 'SAT-123' },
+            { method: 'GET', path: '/checkout/satispay/webhook?payment_id=SAT-123' },
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.paymentId).toBe('SAT-123');
+        expect(result.amount).toBe(19.99);
+        expect(result.currency).toBe('EUR');
+        expect(global.fetch).toHaveBeenCalled();
+    });
+
+    it('should NOT leak provider response body in error message on API failure', async () => {
+        (global.fetch as any).mockResolvedValue({
+            ok: false,
+            status: 404,
+            text: vi.fn().mockResolvedValue(JSON.stringify({ secret: 'PROVIDER_SECRET_BODY' })),
+        });
+
+        const result = await provider.handleWebhook(undefined, {}, { payment_id: 'SAT-123' });
+
+        expect(result.success).toBe(false);
+        expect(result.error).not.toContain('PROVIDER_SECRET_BODY');
+        expect(result.error).not.toContain('secret');
+        expect(result.error).toContain('404');
+    });
+
+    it('should reject webhook without Authorization when webhookPublicKey is configured and method is not GET', async () => {
         const secureProvider = new SatispayProvider({
             keyId: 'test-key',
             privateKey: validFakePrivateKey,
@@ -183,7 +231,12 @@ describe('SatispayProvider', () => {
             serverUrl: 'http://localhost',
         });
 
-        const result = await secureProvider.handleWebhook(undefined, {}, { payment_id: 'SAT-123' });
+        const result = await secureProvider.handleWebhook(
+            { event: 'payment' },
+            {},
+            { payment_id: 'SAT-123' },
+            { method: 'POST', path: '/checkout/satispay/webhook' },
+        );
 
         expect(result.success).toBe(false);
         expect(result.error).toBe('Webhook signature verification failed');
@@ -304,20 +357,39 @@ describe('SatispayProvider', () => {
             const rejectedExpired = secureProvider.verifyWebhookSignature(body, { ...expiredHeaders, authorization: authExpired }, { method: 'POST', path: '/checkout/satispay/webhook', rawBody });
             expect(rejectedExpired).toBe(false);
 
-            // 6. Signature over host date digest (no request-target) still verifies with fresh date and matching digest
+            // 6. Signature lacking (request-target) is rejected
             const sigNoTarget = sign(['host', 'date', 'digest']);
             const authNoTarget = `Signature keyId="test-key",algorithm="rsa-sha256",headers="host date digest",signature="${sigNoTarget}"`;
             const okNoTarget = secureProvider.verifyWebhookSignature(body, { ...headers, authorization: authNoTarget }, { rawBody });
-            expect(okNoTarget).toBe(true);
+            expect(okNoTarget).toBe(false);
 
-            // 7. Wrong RSA key is rejected
+            // 7. Signature lacking date is rejected
+            const sigNoDate = sign(['(request-target)', 'host', 'digest'], 'post', '/checkout/satispay/webhook');
+            const authNoDate = `Signature keyId="test-key",algorithm="rsa-sha256",headers="(request-target) host digest",signature="${sigNoDate}"`;
+            const okNoDate = secureProvider.verifyWebhookSignature(body, { ...headers, authorization: authNoDate }, { method: 'POST', path: '/checkout/satispay/webhook', rawBody });
+            expect(okNoDate).toBe(false);
+
+            // 8. Request lacking Date HTTP header is rejected
+            const headersNoDate = { ...headers };
+            delete (headersNoDate as any).date;
+            delete (headersNoDate as any).Date;
+            const okMissingDateHeader = secureProvider.verifyWebhookSignature(body, { ...headersNoDate, authorization: validAuthHeader }, { method: 'POST', path: '/checkout/satispay/webhook', rawBody });
+            expect(okMissingDateHeader).toBe(false);
+
+            // 9. Request with body where signed headers lack digest is rejected
+            const sigNoDigest = sign(['(request-target)', 'host', 'date'], 'post', '/checkout/satispay/webhook');
+            const authNoDigest = `Signature keyId="test-key",algorithm="rsa-sha256",headers="(request-target) host date",signature="${sigNoDigest}"`;
+            const okNoDigest = secureProvider.verifyWebhookSignature(body, { ...headers, authorization: authNoDigest }, { method: 'POST', path: '/checkout/satispay/webhook', rawBody });
+            expect(okNoDigest).toBe(false);
+
+            // 10. Wrong RSA key is rejected
             const { privateKey: wrongPrivateKey } = crypto.generateKeyPairSync('rsa', {
                 modulusLength: 2048,
                 privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
             } as any);
-            const wrongSig = sign(['host', 'date', 'digest'], 'post', '', wrongPrivateKey as string);
-            const authWrongKey = `Signature keyId="test-key",algorithm="rsa-sha256",headers="host date digest",signature="${wrongSig}"`;
-            const rejectedWrongKey = secureProvider.verifyWebhookSignature(body, { ...headers, authorization: authWrongKey }, { rawBody });
+            const wrongSig = sign(['(request-target)', 'host', 'date', 'digest'], 'post', '/checkout/satispay/webhook', wrongPrivateKey as string);
+            const authWrongKey = `Signature keyId="test-key",algorithm="rsa-sha256",headers="(request-target) host date digest",signature="${wrongSig}"`;
+            const rejectedWrongKey = secureProvider.verifyWebhookSignature(body, { ...headers, authorization: authWrongKey }, { method: 'POST', path: '/checkout/satispay/webhook', rawBody });
             expect(rejectedWrongKey).toBe(false);
         });
 

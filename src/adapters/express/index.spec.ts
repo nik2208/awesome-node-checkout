@@ -49,16 +49,22 @@ describe('Express Adapter (createCheckoutRouter)', () => {
 
         expect(response.status).toBe(201);
         expect(response.body.paymentId).toBe('PAY-123');
+        expect(response.body.raw).toBeUndefined();
         expect(checkout.createPayment).toHaveBeenCalledWith('dummy', { amount: 10, currency: 'EUR' });
     });
 
-    it('POST /:provider/execute - should map to executePayment and return 200 on success', async () => {
+    it('POST /:provider/execute - should map to executePayment and return 200 on success (stripping raw)', async () => {
+        vi.spyOn(checkout, 'executePayment').mockResolvedValue({
+            success: true, paymentId: 'PAY-123', status: 'COMPLETED', raw: { secretPayer: 'confidential' }
+        });
+
         const response = await request(app)
             .post('/payments/dummy/execute')
             .send({ paymentId: 'PAY-123', data: { payerId: 'user-1' } });
 
         expect(response.status).toBe(200);
         expect(response.body.status).toBe('COMPLETED');
+        expect(response.body.raw).toBeUndefined();
         expect(checkout.executePayment).toHaveBeenCalledWith('dummy', 'PAY-123', { payerId: 'user-1' });
     });
 
@@ -110,19 +116,31 @@ describe('Express Adapter (createCheckoutRouter)', () => {
         expect(checkout.getPaymentDetails).not.toHaveBeenCalled();
     });
 
-    it('GET /:provider/redirect - should map to handleRedirect (using query string)', async () => {
+    it('GET /:provider/redirect - should map to handleRedirect and strip raw in JSON mode', async () => {
+        vi.spyOn(checkout, 'handleRedirect').mockResolvedValue({
+            success: true, paymentId: 'PAY-123', status: 'REDIRECT', raw: { sensitive: 'foo' }
+        });
+
         const response = await request(app)
             .get('/payments/dummy/redirect?order_id=ORD-1');
 
         expect(response.status).toBe(200);
+        expect(response.body.paymentId).toBe('PAY-123');
+        expect(response.body.raw).toBeUndefined();
         expect(checkout.handleRedirect).toHaveBeenCalledWith('dummy', { order_id: 'ORD-1' });
     });
 
-    it('GET /:provider/:id - should map to getPaymentDetails', async () => {
+    it('GET /:provider/:id - should map to getPaymentDetails and strip raw', async () => {
+        vi.spyOn(checkout, 'getPaymentDetails').mockResolvedValue({
+            success: true, paymentId: 'PAY-123', status: 'DETAILS', raw: { payerCard: '1234' }
+        });
+
         const response = await request(app)
             .get('/payments/dummy/PAY-123');
 
         expect(response.status).toBe(200);
+        expect(response.body.paymentId).toBe('PAY-123');
+        expect(response.body.raw).toBeUndefined();
         expect(checkout.getPaymentDetails).toHaveBeenCalledWith('dummy', 'PAY-123');
     });
 
@@ -400,6 +418,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
                 .send({ paymentId: 'PAY-123', amount: 5.00 });
 
             expect(response.status).toBe(200);
+            expect(response.body.raw).toBeUndefined();
             expect(checkout.refundPayment).toHaveBeenCalledWith('dummy', 'PAY-123', 5.00);
         });
 

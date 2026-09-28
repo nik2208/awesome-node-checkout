@@ -204,7 +204,8 @@ export function createCheckoutRouter(
         paymentRequest = body;
       }
       const result = await checkout.createPayment(provider, paymentRequest);
-      res.status(result.success ? 201 : 400).json(result);
+      const { raw, ...safeResult } = result;
+      res.status(result.success ? 201 : 400).json(safeResult);
     } catch (err) {
       sendError(res, err);
     }
@@ -222,7 +223,8 @@ export function createCheckoutRouter(
         await options.execute.onBeforeExecute(req, paymentId);
       }
       const result = await checkout.executePayment(String(req.params.provider), paymentId, data);
-      res.status(result.success ? 200 : 400).json(result);
+      const { raw, ...safeResult } = result;
+      res.status(result.success ? 200 : 400).json(safeResult);
     } catch (err) {
       sendError(res, err);
     }
@@ -238,7 +240,8 @@ export function createCheckoutRouter(
       try {
         const { paymentId, amount } = req.body as { paymentId: string; amount?: number };
         const result = await checkout.refundPayment(String(req.params.provider), paymentId, amount);
-        res.status(result.success ? 200 : 400).json(result);
+        const { raw, ...safeResult } = result;
+        res.status(result.success ? 200 : 400).json(safeResult);
       } catch (err) {
         sendError(res, err);
       }
@@ -285,7 +288,8 @@ export function createCheckoutRouter(
           : options.redirect.onFailure(result, req);
         return res.redirect(302, targetUrl);
       }
-      res.status(result.success ? 200 : 400).json(result);
+      const { raw, ...safeResult } = result;
+      res.status(result.success ? 200 : 400).json(safeResult);
     } catch (err) {
       sendError(res, err);
     }
@@ -302,7 +306,8 @@ export function createCheckoutRouter(
     }
     try {
       const result = await checkout.getPaymentDetails(String(req.params.provider), String(req.params.id));
-      res.status(result.success ? 200 : 404).json(result);
+      const { raw, ...safeResult } = result;
+      res.status(result.success ? 200 : 404).json(safeResult);
     } catch (err) {
       sendError(res, err);
     }

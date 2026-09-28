@@ -317,8 +317,9 @@ describe('NexiProvider', () => {
       mac,
     });
 
-    expect(result.success).toBe(true);
+    expect(result.success).toBe(false);
     expect(result.amount).toBeUndefined();
+    expect(result.error).toContain('Payment amount is missing or invalid');
   });
 
   // ---------------------------------------------------------------------------
@@ -614,9 +615,55 @@ describe('NexiProvider', () => {
     });
 
     const resUnknown = await provider.getPaymentDetails('ORD-UNKNOWN');
-    expect(resUnknown.success).toBe(true);
+    expect(resUnknown.success).toBe(false);
     expect(resUnknown.currency).toBeUndefined();
     expect(resUnknown.amount).toBeUndefined();
+    expect(resUnknown.error).toContain('Payment amount is missing or invalid');
+  });
+
+  it('should return success: false when status is not paid or amount is missing in getPaymentDetails', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1700000000000);
+    const respMac = sha1(`esito=OKidOperazione=OP-1timeStamp=1700000000001${config.macKey}`);
+
+    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        esito: 'OK',
+        idOperazione: 'OP-1',
+        timeStamp: '1700000000001',
+        mac: respMac,
+        report: [{
+          codiceTransazione: 'ORD-CANCELLED',
+          stato: 'Annullato',
+          importo: '1500',
+          divisa: 'EUR',
+        }],
+      }),
+    });
+
+    const result = await provider.getPaymentDetails('ORD-CANCELLED');
+    expect(result.success).toBe(false);
+    expect(result.status).toBe('Annullato');
+    expect(result.error).toContain('Payment status is Annullato');
+  });
+
+  it('should return success: false when amount is empty or missing in executePayment or handleWebhook', async () => {
+    const codTrans = 'ORD-001';
+    const esito = 'OK';
+    const importo = '';
+    const divisa = 'EUR';
+    const dataStr = '20260927';
+    const orario = '120000';
+    const codAut = 'AUTH123';
+    const mac = sha1(`codTrans=${codTrans}esito=${esito}importo=${importo}divisa=${divisa}data=${dataStr}orario=${orario}codAut=${codAut}${config.macKey}`);
+
+    const execResult = await provider.executePayment(codTrans, { codTrans, esito, importo, divisa, data: dataStr, orario, codAut, mac });
+    expect(execResult.success).toBe(false);
+    expect(execResult.error).toContain('Payment amount is missing or invalid');
+
+    const webhookResult = await provider.handleWebhook({ codTrans, esito, importo, divisa, data: dataStr, orario, codAut, mac });
+    expect(webhookResult.success).toBe(false);
+    expect(webhookResult.error).toContain('Payment amount is missing or invalid');
   });
 
   it('should handle API HTTP errors gracefully in getPaymentDetails', async () => {

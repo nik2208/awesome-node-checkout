@@ -6,13 +6,13 @@
 export function parseAmount(val: unknown): number | undefined {
   if (val == null || typeof val === 'boolean') return undefined;
   if (typeof val === 'number') {
-    return !isNaN(val) && isFinite(val) ? val : undefined;
+    return !isNaN(val) && isFinite(val) && val >= 0 ? val : undefined;
   }
   if (typeof val === 'string') {
     const str = val.trim();
-    if (!/^-?\d+(\.\d+)?$/.test(str)) return undefined;
+    if (!/^\d+(\.\d+)?$/.test(str)) return undefined;
     const num = Number(str);
-    return !isNaN(num) && isFinite(num) ? num : undefined;
+    return !isNaN(num) && isFinite(num) && num >= 0 ? num : undefined;
   }
   return undefined;
 }
@@ -24,13 +24,13 @@ export function parseAmount(val: unknown): number | undefined {
 export function parseAmountFromCents(val: unknown): number | undefined {
   if (val == null || typeof val === 'boolean') return undefined;
   if (typeof val === 'number') {
-    return Number.isInteger(val) && isFinite(val) ? val / 100 : undefined;
+    return Number.isInteger(val) && isFinite(val) && val >= 0 ? val / 100 : undefined;
   }
   if (typeof val === 'string') {
     const str = val.trim();
-    if (!/^-?\d+$/.test(str)) return undefined;
+    if (!/^\d+$/.test(str)) return undefined;
     const num = Number(str);
-    return !isNaN(num) && isFinite(num) ? num / 100 : undefined;
+    return !isNaN(num) && isFinite(num) && num >= 0 ? num / 100 : undefined;
   }
   return undefined;
 }

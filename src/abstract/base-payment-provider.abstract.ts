@@ -29,7 +29,10 @@ export abstract class BasePaymentProvider implements IPaymentProvider {
    * Extracts message from Error instances automatically.
    */
   protected errorResult(error: unknown, fallback = 'Unknown error'): PaymentResult {
-    const message = error instanceof Error ? error.message : fallback;
+    let message = error instanceof Error ? error.message : fallback;
+    if (error instanceof SyntaxError || /JSON|Unexpected token/i.test(message)) {
+      message = 'Invalid provider response';
+    }
     return { success: false, error: message };
   }
 }

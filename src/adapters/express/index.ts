@@ -271,6 +271,7 @@ export function createCheckoutRouter(
   };
 
   router.get('/:provider/webhook', webhookHandler);
+  router.head('/:provider/webhook', webhookHandler);
   router.post('/:provider/webhook', webhookHandler);
 
   // ---- GET /:provider/redirect — handle redirect callback ------------------
@@ -331,7 +332,10 @@ function sendError(res: Response, err: unknown): void {
     const status = statusMap[err.code] ?? 400;
     res.status(status).json({ success: false, error: err.message, code: err.code });
   } else {
-    const message = err instanceof Error ? err.message : 'Internal server error';
+    let message = err instanceof Error ? err.message : 'Internal server error';
+    if (err instanceof SyntaxError || /JSON|Unexpected token/i.test(message)) {
+      message = 'Invalid provider response';
+    }
     res.status(500).json({ success: false, error: message });
   }
 }

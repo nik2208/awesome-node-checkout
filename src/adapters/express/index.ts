@@ -342,6 +342,7 @@ export function createCheckoutRouter(
 
 function sendError(res: Response, err: unknown, isProvider = true): void {
   if (res.headersSent) return;
+  const isListenerError = !!(err && typeof err === 'object' && (err as any).__isEventListenerError);
   if (err instanceof CheckoutError) {
     const statusMap: Record<string, number> = {
       PROVIDER_NOT_FOUND: 404,
@@ -351,8 +352,8 @@ function sendError(res: Response, err: unknown, isProvider = true): void {
     const status = statusMap[err.code] ?? 400;
     res.status(status).json({ success: false, error: err.message, code: err.code });
   } else {
-    let message = err instanceof Error ? err.message : 'Internal server error';
-    if (isProvider && (err instanceof SyntaxError || /JSON|Unexpected token/i.test(message))) {
+    let message = err instanceof Error ? err.message : String(err ?? 'Internal server error');
+    if (!isListenerError && isProvider && (err instanceof SyntaxError || /JSON|Unexpected token/i.test(message))) {
       message = 'Invalid provider response';
     }
     res.status(500).json({ success: false, error: message });

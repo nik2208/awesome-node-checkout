@@ -36,7 +36,7 @@ export interface WebhookResult {
   /** True when payment is confirmed/completed with a valid captured amount */
   success: boolean;
   /** True when the webhook authenticity (signature/MAC or API re-read) was verified */
-  verified?: boolean;
+  verified: boolean;
   paymentId?: string;
   orderId?: string;
   status?: string;

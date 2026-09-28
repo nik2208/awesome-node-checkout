@@ -272,4 +272,66 @@ describe('PayPalProvider', () => {
         expect(result.success).toBe(false);
         expect(result.error).toContain('No capture found');
     });
+
+    describe('Issue #21 residuals', () => {
+        it('should return success: false when amount is 0 or negative', async () => {
+            (provider as any).ordersController = {
+                getOrder: vi.fn().mockResolvedValue({
+                    result: {
+                        id: 'PAYPAL-ORD-ZERO',
+                        status: 'COMPLETED',
+                        purchaseUnits: [{
+                            payments: {
+                                captures: [{
+                                    id: 'CAP-ZERO',
+                                    status: 'COMPLETED',
+                                    amount: { currencyCode: 'EUR', value: '0.00' }
+                                }]
+                            }
+                        }]
+                    }
+                })
+            };
+
+            const result = await provider.getPaymentDetails('PAYPAL-ORD-ZERO');
+            expect(result.success).toBe(false);
+            expect(result.amount).toBe(0);
+            expect(result.error).toBe('Payment amount is missing or invalid');
+        });
+
+        it('should return success: false when currencyCode is missing', async () => {
+            (provider as any).ordersController = {
+                captureOrder: vi.fn().mockResolvedValue({
+                    result: {
+                        id: 'PAYPAL-ORD-NOCURR',
+                        status: 'COMPLETED',
+                        purchaseUnits: [{
+                            payments: {
+                                captures: [{
+                                    id: 'CAP-NOCURR',
+                                    status: 'COMPLETED',
+                                    amount: { value: '25.00' }
+                                }]
+                            }
+                        }]
+                    }
+                })
+            };
+
+            const result = await provider.executePayment('PAYPAL-ORD-NOCURR');
+            expect(result.success).toBe(false);
+            expect(result.currency).toBeUndefined();
+            expect(result.error).toBe('Payment currency is missing or invalid');
+        });
+
+        it('should mask SyntaxError or JSON errors with Invalid provider response', async () => {
+            (provider as any).ordersController = {
+                getOrder: vi.fn().mockRejectedValue(new SyntaxError('Unexpected token < in JSON at position 0'))
+            };
+
+            const result = await provider.getPaymentDetails('PAYPAL-JSON-ERR');
+            expect(result.success).toBe(false);
+            expect(result.error).toBe('Invalid provider response');
+        });
+    });
 });

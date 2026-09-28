@@ -6,13 +6,13 @@ describe('parsing.util', () => {
     it('returns finite numbers directly', () => {
       expect(parseAmount(12.34)).toBe(12.34);
       expect(parseAmount(0)).toBe(0);
-      expect(parseAmount(-5)).toBe(-5);
+      expect(parseAmount(-5)).toBeUndefined();
     });
 
     it('parses valid numeric strings', () => {
       expect(parseAmount('12.34')).toBe(12.34);
       expect(parseAmount('0')).toBe(0);
-      expect(parseAmount('-5.5')).toBe(-5.5);
+      expect(parseAmount('-5.5')).toBeUndefined();
     });
 
     it('returns undefined for empty strings, whitespace, null, undefined, booleans', () => {
@@ -45,6 +45,8 @@ describe('parsing.util', () => {
       expect(parseAmountFromCents(1999)).toBe(19.99);
       expect(parseAmountFromCents('1999')).toBe(19.99);
       expect(parseAmountFromCents(0)).toBe(0);
+      expect(parseAmountFromCents(-100)).toBeUndefined();
+      expect(parseAmountFromCents('-100')).toBeUndefined();
     });
 
     it('returns undefined for invalid, non-integer, or empty inputs', () => {

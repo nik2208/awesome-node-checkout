@@ -107,7 +107,7 @@ export class PayPalProvider extends BasePaymentProvider {
       const captureStatus = typeof capture?.status === 'string' ? capture.status : undefined;
       const amount = parseAmount(capture?.amount?.value);
       const currency = typeof capture?.amount?.currencyCode === 'string' ? capture.amount.currencyCode : undefined;
-      const isCaptureCompleted = captureStatus === 'COMPLETED' && amount !== undefined;
+      const isCaptureCompleted = captureStatus === 'COMPLETED' && amount !== undefined && amount > 0 && !!currency && currency.trim() !== '';
       const status = captureStatus ?? 'NO_CAPTURE';
 
       return {
@@ -124,8 +124,10 @@ export class PayPalProvider extends BasePaymentProvider {
               error:
                 !capture
                   ? 'Payment capture not found'
-                  : captureStatus === 'COMPLETED' && amount === undefined
-                  ? 'Payment amount is missing or invalid'
+                  : captureStatus === 'COMPLETED'
+                  ? (amount === undefined || amount <= 0
+                      ? 'Payment amount is missing or invalid'
+                      : 'Payment currency is missing or invalid')
                   : `Payment capture status is ${captureStatus ?? 'unknown'}`,
             }),
       };
@@ -147,7 +149,7 @@ export class PayPalProvider extends BasePaymentProvider {
       const captureStatus = typeof capture?.status === 'string' ? capture.status : undefined;
       const amount = parseAmount(capture?.amount?.value);
       const currency = typeof capture?.amount?.currencyCode === 'string' ? capture.amount.currencyCode : undefined;
-      const isCaptureCompleted = captureStatus === 'COMPLETED' && amount !== undefined;
+      const isCaptureCompleted = captureStatus === 'COMPLETED' && amount !== undefined && amount > 0 && !!currency && currency.trim() !== '';
       const status = captureStatus ?? 'NO_CAPTURE';
 
       return {
@@ -164,8 +166,10 @@ export class PayPalProvider extends BasePaymentProvider {
               error:
                 !capture
                   ? 'Payment capture not found'
-                  : captureStatus === 'COMPLETED' && amount === undefined
-                  ? 'Payment amount is missing or invalid'
+                  : captureStatus === 'COMPLETED'
+                  ? (amount === undefined || amount <= 0
+                      ? 'Payment amount is missing or invalid'
+                      : 'Payment currency is missing or invalid')
                   : `Payment capture status is ${captureStatus ?? 'unknown'}`,
             }),
       };

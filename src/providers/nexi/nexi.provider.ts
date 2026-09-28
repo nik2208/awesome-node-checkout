@@ -202,7 +202,7 @@ export class NexiProvider extends BasePaymentProvider {
 
       const amount = parseAmountFromCents(importo);
       const currency = parseNexiCurrency(divisa);
-      const isPaid = esito === 'OK' && amount !== undefined;
+      const isPaid = esito === 'OK' && amount !== undefined && amount > 0 && !!currency && currency.trim() !== '';
 
       return {
         success: isPaid,
@@ -215,8 +215,10 @@ export class NexiProvider extends BasePaymentProvider {
           ? {}
           : {
               error:
-                esito === 'OK' && amount === undefined
-                  ? 'Payment amount is missing or invalid'
+                esito === 'OK'
+                  ? (amount === undefined || amount <= 0
+                      ? 'Payment amount is missing or invalid'
+                      : 'Payment currency is missing or invalid')
                   : `Payment failed with outcome ${esito}`,
             }),
       };
@@ -257,7 +259,7 @@ export class NexiProvider extends BasePaymentProvider {
 
       const amount = parseAmountFromCents(importo);
       const currency = parseNexiCurrency(divisa);
-      const isPaid = esito === 'OK' && amount !== undefined;
+      const isPaid = esito === 'OK' && amount !== undefined && amount > 0 && !!currency && currency.trim() !== '';
 
       return {
         success: isPaid,
@@ -270,8 +272,10 @@ export class NexiProvider extends BasePaymentProvider {
           ? {}
           : {
               error:
-                esito === 'OK' && amount === undefined
-                  ? 'Payment amount is missing or invalid'
+                esito === 'OK'
+                  ? (amount === undefined || amount <= 0
+                      ? 'Payment amount is missing or invalid'
+                      : 'Payment currency is missing or invalid')
                   : `Payment failed with outcome ${esito}`,
             }),
       };
@@ -299,11 +303,16 @@ export class NexiProvider extends BasePaymentProvider {
       });
 
       if (!response.ok) throw new Error(`Nexi API error: ${response.statusText}`);
-      const result = await response.json() as Record<string, unknown>;
+      let result: Record<string, unknown>;
+      try {
+        result = (await response.json()) as Record<string, unknown>;
+      } catch {
+        throw new Error('Invalid provider response');
+      }
 
       const esito = String(result['esito'] ?? '');
       if (esito !== 'OK') {
-        const errMsg = (result['errore'] as any)?.messaggio ?? 'Payment details request failed';
+        const errMsg = 'Payment details request failed';
         return { success: false, paymentId, error: errMsg, raw: result };
       }
 
@@ -358,7 +367,7 @@ export class NexiProvider extends BasePaymentProvider {
       const NEXI_PAID_STATUSES = new Set(['autorizzato', 'contabilizzato', 'catturato']);
       const statoStr = typeof stato === 'string' ? stato.toLowerCase() : '';
       const isPaidStatus = NEXI_PAID_STATUSES.has(statoStr);
-      const isSuccess = isPaidStatus && amount !== undefined;
+      const isSuccess = isPaidStatus && amount !== undefined && amount > 0 && !!currency && currency.trim() !== '';
 
       return {
         success: isSuccess,
@@ -371,8 +380,10 @@ export class NexiProvider extends BasePaymentProvider {
           ? {}
           : {
               error:
-                isPaidStatus && amount === undefined
-                  ? 'Payment amount is missing or invalid'
+                isPaidStatus
+                  ? (amount === undefined || amount <= 0
+                      ? 'Payment amount is missing or invalid'
+                      : 'Payment currency is missing or invalid')
                   : `Payment status is ${stato ?? 'unknown'}`,
             }),
       };
@@ -402,7 +413,12 @@ export class NexiProvider extends BasePaymentProvider {
       });
 
       if (!response.ok) throw new Error(`Nexi API error: ${response.statusText}`);
-      const result = await response.json() as Record<string, unknown>;
+      let result: Record<string, unknown>;
+      try {
+        result = (await response.json()) as Record<string, unknown>;
+      } catch {
+        throw new Error('Invalid provider response');
+      }
 
       return {
         success: result['esito'] === 'OK',

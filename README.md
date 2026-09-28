@@ -185,7 +185,7 @@ To ensure safe fulfillment:
 1. **Verify Amount & Currency**: `PaymentResult` and `WebhookResult` return `amount` and `currency` extracted directly from the provider. Compare amounts in minor units (cents) or with rounding to prevent floating-point discrepancies:
    ```typescript
    const result = await checkout.handleRedirect(provider, req.query);
-   if (result.success && (result.status === 'COMPLETED' || result.status === 'ACCEPTED')) {
+   if (result.success) {
      if (result.amount === undefined) {
        throw new Error('Payment reported success but amount is missing');
      }

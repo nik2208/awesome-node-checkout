@@ -195,5 +195,27 @@ describe('CheckoutConfigurator', () => {
         expect((configurator as any).paymentOrders.has('pay-0')).toBe(false);
         expect((configurator as any).paymentOrders.has('pay-10000')).toBe(true);
     });
+
+    it('should ignore query.order_id on GET and HEAD webhooks in handleWebhook', async () => {
+        // GET request with query.order_id
+        const resultGet = await configurator.handleWebhook(
+            'dummy',
+            undefined,
+            {},
+            { payment_id: 'dummy-123', order_id: 'SPOOFED-GET' },
+            { method: 'GET', path: '/checkout/dummy/webhook' },
+        );
+        expect(resultGet.orderId).toBeUndefined();
+
+        // HEAD request with query.order_id
+        const resultHead = await configurator.handleWebhook(
+            'dummy',
+            undefined,
+            {},
+            { payment_id: 'dummy-123', order_id: 'SPOOFED-HEAD' },
+            { method: 'HEAD', path: '/checkout/dummy/webhook' },
+        );
+        expect(resultHead.orderId).toBeUndefined();
+    });
 });
 

@@ -187,12 +187,14 @@ export class CheckoutConfigurator {
     }
     const result = await provider.handleWebhook(body, headers, query, context);
     const rawAny = result.raw as any;
+    const method = context?.method?.toUpperCase();
+    const isGetOrHead = method === 'GET' || method === 'HEAD';
     const orderId =
-      rawAny?.orderId ??
-      rawAny?.order_id ??
+      result.orderId ??
+      (!isGetOrHead ? (rawAny?.orderId ?? rawAny?.order_id) : undefined) ??
       rawAny?.external_code ??
       rawAny?.codTrans ??
-      query?.order_id ??
+      (!isGetOrHead ? query?.order_id : undefined) ??
       (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined);
 
     if (orderId && !result.orderId) {

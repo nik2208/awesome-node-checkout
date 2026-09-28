@@ -515,7 +515,7 @@ describe('NexiProvider', () => {
     expect(result.error).toMatch(/MAC verification failed/);
   });
 
-  it('should return failure when esito is KO with error message', async () => {
+  it('should return failure when esito is KO without leaking error message', async () => {
     (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       json: vi.fn().mockResolvedValue({
@@ -526,7 +526,8 @@ describe('NexiProvider', () => {
 
     const result = await provider.getPaymentDetails('ORD-001');
     expect(result.success).toBe(false);
-    expect(result.error).toContain('Transazione non trovata');
+    expect(result.error).toBe('Payment details request failed');
+    expect(result.error).not.toContain('Transazione non trovata');
   });
 
   it('should return failure when report is empty or missing', async () => {
@@ -730,5 +731,92 @@ describe('NexiProvider', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toContain('Network failure');
+  });
+
+  describe('Issue #21 residuals', () => {
+    it('should return Invalid provider response on non-JSON 200 in getPaymentDetails and refundPayment', async () => {
+      // getPaymentDetails non-JSON 200
+      (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: vi.fn().mockRejectedValue(new SyntaxError('Unexpected token < in JSON at position 0')),
+      });
+
+      const detailsResult = await provider.getPaymentDetails('ORD-001');
+      expect(detailsResult.success).toBe(false);
+      expect(detailsResult.error).toBe('Invalid provider response');
+
+      // refundPayment non-JSON 200
+      (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: vi.fn().mockRejectedValue(new SyntaxError('Unexpected token < in JSON at position 0')),
+      });
+
+      const refundResult = await provider.refundPayment('ORD-001');
+      expect(refundResult.success).toBe(false);
+      expect(refundResult.error).toBe('Invalid provider response');
+    });
+
+    it('should return success: false when amount is 0 or negative in executePayment, handleWebhook, and getPaymentDetails', async () => {
+      const dataStr = '20231114';
+      const orario = '123456';
+      const codAut = 'AUTH01';
+
+      // 1. executePayment with amount = 0
+      const macZero = sha1(`codTrans=ORD-Zesito=OKimporto=0divisa=EURdata=${dataStr}orario=${orario}codAut=${codAut}${config.macKey}`);
+      const resExecZero = await provider.executePayment('ORD-Z', {
+        codTrans: 'ORD-Z',
+        esito: 'OK',
+        importo: '0',
+        divisa: 'EUR',
+        data: dataStr,
+        orario,
+        codAut,
+        mac: macZero,
+      });
+      expect(resExecZero.success).toBe(false);
+      expect(resExecZero.amount).toBe(0);
+      expect(resExecZero.error).toBe('Payment amount is missing or invalid');
+
+      // 2. handleWebhook with amount = -100
+      const macNeg = sha1(`codTrans=ORD-Nesito=OKimporto=-100divisa=EURdata=${dataStr}orario=${orario}codAut=${codAut}${config.macKey}`);
+      const resWebNeg = await provider.handleWebhook({
+        codTrans: 'ORD-N',
+        esito: 'OK',
+        importo: '-100',
+        divisa: 'EUR',
+        data: dataStr,
+        orario,
+        codAut,
+        mac: macNeg,
+      });
+      expect(resWebNeg.success).toBe(false);
+      expect(resWebNeg.amount).toBeUndefined();
+      expect(resWebNeg.error).toBe('Payment amount is missing or invalid');
+
+      // 3. getPaymentDetails with missing currency
+      const respMac = sha1(`esito=OKidOperazione=OP-NCtimeStamp=1700000000001${config.macKey}`);
+      (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue({
+          esito: 'OK',
+          idOperazione: 'OP-NC',
+          timeStamp: '1700000000001',
+          mac: respMac,
+          report: [{
+            codiceTransazione: 'ORD-NC',
+            stato: 'Contabilizzato',
+            importo: '5000',
+            divisa: 'INVALID_CURR',
+          }],
+        }),
+      });
+
+      const resDetailsNoCurr = await provider.getPaymentDetails('ORD-NC');
+      expect(resDetailsNoCurr.success).toBe(false);
+      expect(resDetailsNoCurr.currency).toBeUndefined();
+      expect(resDetailsNoCurr.error).toBe('Payment currency is missing or invalid');
+    });
   });
 });

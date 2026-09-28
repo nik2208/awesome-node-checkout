@@ -406,5 +406,116 @@ describe('SatispayProvider', () => {
             expect(refundResult.success).toBe(false);
             expect(refundResult.error).toContain('Invalid payment ID format');
         });
+
+        describe('Issue #21 residuals', () => {
+            it('should return Invalid provider response on non-JSON 200 without leaking response text', async () => {
+                (global.fetch as any).mockResolvedValue({
+                    ok: true,
+                    status: 200,
+                    text: vi.fn().mockResolvedValue('<html><head><title>502 Bad Gateway</title></head><body>upstream error body</body></html>'),
+                });
+
+                const result = await provider.getPaymentDetails('SAT-123');
+                expect(result.success).toBe(false);
+                expect(result.error).toBe('Invalid provider response');
+                expect(result.error).not.toContain('upstream error body');
+                expect(result.error).not.toContain('<html>');
+            });
+
+            it('should treat HEAD webhook like GET without requiring signature and only read payment_id from query', async () => {
+                const secureProvider = new SatispayProvider({
+                    keyId: 'test-key',
+                    privateKey: validFakePrivateKey,
+                    webhookPublicKey: validFakePublicKey,
+                    serverUrl: 'http://localhost',
+                });
+
+                (global.fetch as any).mockResolvedValue({
+                    ok: true,
+                    text: vi.fn().mockResolvedValue(JSON.stringify({
+                        id: 'SAT-HEAD-1',
+                        status: 'ACCEPTED',
+                        amount_unit: 5000,
+                        currency: 'EUR',
+                        external_code: 'REAL-ORD-1',
+                    })),
+                });
+
+                // HEAD with payment_id in query and a spoofed body
+                const result = await secureProvider.handleWebhook(
+                    { payment_id: 'SPOOFED-BODY-ID' },
+                    {},
+                    { payment_id: 'SAT-HEAD-1', order_id: 'SPOOFED-QUERY-ORD' },
+                    { method: 'HEAD', path: '/checkout/satispay/webhook?payment_id=SAT-HEAD-1' },
+                );
+
+                expect(result.success).toBe(true);
+                expect(result.paymentId).toBe('SAT-HEAD-1');
+                expect(result.orderId).toBe('REAL-ORD-1');
+                expect(result.amount).toBe(50.0);
+            });
+
+            it('should ignore body payment_id on GET webhook and require payment_id in query', async () => {
+                const result = await provider.handleWebhook(
+                    { payment_id: 'SAT-IN-BODY' },
+                    {},
+                    {},
+                    { method: 'GET', path: '/checkout/satispay/webhook' },
+                );
+
+                expect(result.success).toBe(false);
+                expect(result.error).toBe('Missing payment_id in webhook body or query');
+            });
+
+            it('should return success: false when amount_unit is 0 or negative', async () => {
+                // amount_unit = 0
+                (global.fetch as any).mockResolvedValueOnce({
+                    ok: true,
+                    text: vi.fn().mockResolvedValue(JSON.stringify({
+                        id: 'SAT-ZERO',
+                        status: 'ACCEPTED',
+                        amount_unit: 0,
+                        currency: 'EUR',
+                    })),
+                });
+
+                const resZero = await provider.getPaymentDetails('SAT-ZERO');
+                expect(resZero.success).toBe(false);
+                expect(resZero.amount).toBe(0);
+                expect(resZero.error).toBe('Payment amount is missing or invalid');
+
+                // amount_unit = -100
+                (global.fetch as any).mockResolvedValueOnce({
+                    ok: true,
+                    text: vi.fn().mockResolvedValue(JSON.stringify({
+                        id: 'SAT-NEG',
+                        status: 'ACCEPTED',
+                        amount_unit: -100,
+                        currency: 'EUR',
+                    })),
+                });
+
+                const resNeg = await provider.getPaymentDetails('SAT-NEG');
+                expect(resNeg.success).toBe(false);
+                expect(resNeg.amount).toBeUndefined();
+                expect(resNeg.error).toBe('Payment amount is missing or invalid');
+            });
+
+            it('should return success: false when currency is missing or empty string', async () => {
+                (global.fetch as any).mockResolvedValueOnce({
+                    ok: true,
+                    text: vi.fn().mockResolvedValue(JSON.stringify({
+                        id: 'SAT-NOCURR',
+                        status: 'ACCEPTED',
+                        amount_unit: 1000,
+                        currency: '',
+                    })),
+                });
+
+                const result = await provider.getPaymentDetails('SAT-NOCURR');
+                expect(result.success).toBe(false);
+                expect(result.error).toBe('Payment currency is missing or invalid');
+            });
+        });
     });
 });

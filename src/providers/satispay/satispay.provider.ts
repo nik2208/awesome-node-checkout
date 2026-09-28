@@ -303,7 +303,11 @@ export class SatispayProvider extends BasePaymentProvider {
       throw new Error(`Satispay API returned HTTP ${response.status}`);
     }
 
-    return JSON.parse(text) as T;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new Error('Invalid provider response');
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -374,7 +378,7 @@ export class SatispayProvider extends BasePaymentProvider {
       const amount = parseAmountFromCents(payment['amount_unit']);
       const currency = payment['currency'] as string | undefined;
       const status = payment['status'] as string | undefined;
-      const isAccepted = status === 'ACCEPTED' && amount !== undefined;
+      const isAccepted = status === 'ACCEPTED' && amount !== undefined && amount > 0 && !!currency && currency.trim() !== '';
 
       return {
         success: isAccepted,
@@ -387,8 +391,10 @@ export class SatispayProvider extends BasePaymentProvider {
           ? {}
           : {
               error:
-                status === 'ACCEPTED' && amount === undefined
-                  ? 'Payment amount is missing or invalid'
+                status === 'ACCEPTED'
+                  ? (amount === undefined || amount <= 0
+                      ? 'Payment amount is missing or invalid'
+                      : 'Payment currency is missing or invalid')
                   : `Payment is ${status ?? 'unknown'}`,
             }),
       };
@@ -431,10 +437,10 @@ export class SatispayProvider extends BasePaymentProvider {
    * Flow:
    * - POST webhooks: The HTTP Signature in the Authorization header is verified
    *   against `config.webhookPublicKey` (when configured) before processing.
-   * - GET callbacks: Satispay GET callbacks (?payment_id=...) do not carry HTTP signatures.
-   *   An unsigned GET is accepted solely as a trigger for a secure server-to-server
+   * - GET/HEAD callbacks: Satispay GET callbacks (?payment_id=...) do not carry HTTP signatures.
+   *   An unsigned GET/HEAD is accepted solely as a trigger for a secure server-to-server
    *   API re-read using the merchant's RSA private key. The payment ID is validated
-   *   and nothing from the query string is trusted.
+   *   exclusively from the query string and nothing else from the query string is trusted.
    */
   async handleWebhook(
     body?: Record<string, unknown>,
@@ -442,19 +448,19 @@ export class SatispayProvider extends BasePaymentProvider {
     query: Record<string, string> = {},
     context?: { method?: string; path?: string; rawBody?: Buffer | string },
   ): Promise<WebhookResult> {
-    const isGet = context?.method?.toUpperCase() === 'GET';
+    const method = context?.method?.toUpperCase();
+    const isGetOrHead = method === 'GET' || method === 'HEAD';
 
-    if (!isGet) {
+    if (!isGetOrHead) {
       if (!this.verifyWebhookSignature(body, headers, context)) {
         return { success: false, error: 'Webhook signature verification failed' };
       }
     }
 
     const b = body ?? {};
-    const rawId: unknown =
-      b['payment_id'] ??
-      b['id'] ??
-      query['payment_id'];
+    const rawId: unknown = isGetOrHead
+      ? query['payment_id']
+      : (b['payment_id'] ?? b['id'] ?? query['payment_id']);
     if (!rawId) {
       return { success: false, error: 'Missing payment_id in webhook body or query' };
     }
@@ -471,11 +477,13 @@ export class SatispayProvider extends BasePaymentProvider {
       const amount = parseAmountFromCents(payment['amount_unit']);
       const currency = payment['currency'] as string | undefined;
       const status = payment['status'] as string | undefined;
-      const isAccepted = status === 'ACCEPTED' && amount !== undefined;
+      const isAccepted = status === 'ACCEPTED' && amount !== undefined && amount > 0 && !!currency && currency.trim() !== '';
+      const orderId = (payment['external_code'] as string) || undefined;
 
       return {
         success: isAccepted,
         paymentId: payment['id'] as string,
+        orderId,
         status: status ?? 'UNKNOWN',
         amount,
         currency,
@@ -484,13 +492,18 @@ export class SatispayProvider extends BasePaymentProvider {
           ? {}
           : {
               error:
-                status === 'ACCEPTED' && amount === undefined
-                  ? 'Payment amount is missing or invalid'
+                status === 'ACCEPTED'
+                  ? (amount === undefined || amount <= 0
+                      ? 'Payment amount is missing or invalid'
+                      : 'Payment currency is missing or invalid')
                   : `Payment is ${status ?? 'unknown'}`,
             }),
       };
     } catch (error) {
-      const msg = error instanceof Error ? error.message : 'Webhook handling failed';
+      let msg = error instanceof Error ? error.message : 'Webhook handling failed';
+      if (error instanceof SyntaxError || /JSON|Unexpected token/i.test(msg)) {
+        msg = 'Invalid provider response';
+      }
       return { success: false, paymentId, error: msg };
     }
   }
@@ -527,6 +540,7 @@ export class SatispayProvider extends BasePaymentProvider {
       amount: details.amount,
       currency: details.currency,
       raw: details.raw,
+      ...(details.success ? {} : { error: details.error }),
     };
   }
 }

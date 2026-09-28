@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] - 2026-09-28
+
+### Security
+- **Providers**: Masked JSON parse syntax errors across all providers and Express adapter to return a generic `'Invalid provider response'`, ensuring no provider response body or syntax details leak to callers. Resolves #21.
+- **Nexi**: Sanitized `getPaymentDetails` error handling when outcome is not OK (`esito !== 'OK'`), returning generic `'Payment details request failed'` instead of leaking provider internal message (`errore.messaggio`). Resolves #21.
+- **Satispay**: Hardened unsigned GET/HEAD callbacks to extract `payment_id` strictly from query parameters and prevent untrusted query parameters from setting `orderId`. HEAD requests are now processed identically to GET. Resolves #21.
+
+### Fixed
+- **Core**: Hardened `parseAmount` and `parseAmountFromCents` to reject negative numbers (returning `undefined`). Resolves #21.
+- **Providers**: Enforced that `success` is strictly `false` when amount is ≤ 0 or currency is missing across all providers (Satispay, Nexi, PayPal), returning `'Payment amount or currency is missing or invalid'`. Resolves #21.
+- **Documentation**: Corrected README line 188 example to gate order fulfillment check directly on `result.success`. Resolves #21.
+
 ## [1.2.2] - 2026-09-28
 
 ### Security

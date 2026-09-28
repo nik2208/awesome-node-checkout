@@ -716,5 +716,29 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             expect(resNoMac.status).toBe(400);
             expect(resNoMac.body.error).toBe('MAC verification failed');
         });
+
+        it('should handle HEAD /payments/:provider/webhook without errors', async () => {
+            const headApp = express();
+            headApp.use('/payments', createCheckoutRouter(checkout));
+
+            const res = await request(headApp)
+                .head('/payments/dummy/webhook?payment_id=dummy-123');
+
+            expect(res.status).toBe(200);
+        });
+
+        it('should sanitize unhandled SyntaxError / JSON parse errors to Invalid provider response', async () => {
+            vi.spyOn(checkout, 'getPaymentDetails').mockImplementation(() => {
+                throw new SyntaxError('Unexpected token < in JSON at position 0: <html><body>Error body</body></html>');
+            });
+
+            const res = await request(app).get('/payments/dummy/err-id');
+
+            expect(res.status).toBe(500);
+            expect(res.body.success).toBe(false);
+            expect(res.body.error).toBe('Invalid provider response');
+            expect(res.body.error).not.toContain('<html>');
+            expect(res.body.error).not.toContain('Error body');
+        });
     });
 });

@@ -198,21 +198,45 @@ export class SatispayProvider extends BasePaymentProvider {
 
       const headerNames = signedHeaders.split(' ').map((h) => h.trim().toLowerCase()).filter(Boolean);
 
-      // 1. Freshness check on Date if 'date' is signed or present
+      // Require minimum signed headers
+      if (!headerNames.includes('(request-target)') || !headerNames.includes('date')) {
+        return false;
+      }
+
+      const hasBody =
+        (context?.rawBody !== undefined &&
+          (typeof context.rawBody === 'string'
+            ? context.rawBody.length > 0
+            : Buffer.isBuffer(context.rawBody)
+            ? context.rawBody.length > 0
+            : false)) ||
+        (body !== undefined &&
+          body !== null &&
+          (typeof body === 'string'
+            ? body.length > 0
+            : Buffer.isBuffer(body)
+            ? body.length > 0
+            : typeof body === 'object'
+            ? Object.keys(body).length > 0
+            : false));
+
+      if (hasBody && !headerNames.includes('digest')) {
+        return false;
+      }
+
+      // 1. Freshness check on Date: Date header is strictly required
       const rawDate = headers['date'] ?? headers['Date'];
-      if (headerNames.includes('date') || rawDate) {
-        if (!rawDate) return false;
-        const dateParsed = new Date(rawDate);
-        if (isNaN(dateParsed.getTime())) return false;
-        const maxAgeMs = this.config.signatureMaxAgeMs ?? 300_000;
-        if (Math.abs(Date.now() - dateParsed.getTime()) > maxAgeMs) {
-          return false;
-        }
+      if (!rawDate) return false;
+      const dateParsed = new Date(rawDate);
+      if (isNaN(dateParsed.getTime())) return false;
+      const maxAgeMs = this.config.signatureMaxAgeMs ?? 300_000;
+      if (Math.abs(Date.now() - dateParsed.getTime()) > maxAgeMs) {
+        return false;
       }
 
       // 2. Digest comparison: Digest header MUST match SHA-256 of the raw body
       const headerDigest = headers['digest'] ?? headers['Digest'];
-      if (headerNames.includes('digest')) {
+      if (headerNames.includes('digest') || hasBody) {
         if (!headerDigest) return false;
 
         let rawBytes: Buffer;
@@ -276,7 +300,7 @@ export class SatispayProvider extends BasePaymentProvider {
 
     const text = await response.text();
     if (!response.ok) {
-      throw new Error(`Satispay API ${response.status}: ${text}`);
+      throw new Error(`Satispay API returned HTTP ${response.status}`);
     }
 
     return JSON.parse(text) as T;
@@ -349,14 +373,24 @@ export class SatispayProvider extends BasePaymentProvider {
       );
       const amount = parseAmountFromCents(payment['amount_unit']);
       const currency = payment['currency'] as string | undefined;
+      const status = payment['status'] as string | undefined;
+      const isAccepted = status === 'ACCEPTED' && amount !== undefined;
 
       return {
-        success: true,
+        success: isAccepted,
         paymentId: payment['id'] as string,
-        status: payment['status'] as string,
+        status: status ?? 'UNKNOWN',
         amount,
         currency,
         raw: payment,
+        ...(isAccepted
+          ? {}
+          : {
+              error:
+                status === 'ACCEPTED' && amount === undefined
+                  ? 'Payment amount is missing or invalid'
+                  : `Payment is ${status ?? 'unknown'}`,
+            }),
       };
     } catch (error) {
       return this.errorResult(error, 'Failed to get Satispay payment details');
@@ -393,9 +427,14 @@ export class SatispayProvider extends BasePaymentProvider {
   /**
    * Handles the async webhook notification from Satispay.
    * Satispay calls this URL with `payment_id` (the Satispay payment UUID).
-   * The HTTP Signature in the Authorization header is verified against
-   * `config.webhookPublicKey` (when configured) before processing.
-   * We then confirm the payment status via an authenticated API call.
+   *
+   * Flow:
+   * - POST webhooks: The HTTP Signature in the Authorization header is verified
+   *   against `config.webhookPublicKey` (when configured) before processing.
+   * - GET callbacks: Satispay GET callbacks (?payment_id=...) do not carry HTTP signatures.
+   *   An unsigned GET is accepted solely as a trigger for a secure server-to-server
+   *   API re-read using the merchant's RSA private key. The payment ID is validated
+   *   and nothing from the query string is trusted.
    */
   async handleWebhook(
     body?: Record<string, unknown>,
@@ -403,8 +442,12 @@ export class SatispayProvider extends BasePaymentProvider {
     query: Record<string, string> = {},
     context?: { method?: string; path?: string; rawBody?: Buffer | string },
   ): Promise<WebhookResult> {
-    if (!this.verifyWebhookSignature(body, headers, context)) {
-      return { success: false, error: 'Webhook signature verification failed' };
+    const isGet = context?.method?.toUpperCase() === 'GET';
+
+    if (!isGet) {
+      if (!this.verifyWebhookSignature(body, headers, context)) {
+        return { success: false, error: 'Webhook signature verification failed' };
+      }
     }
 
     const b = body ?? {};
@@ -427,14 +470,24 @@ export class SatispayProvider extends BasePaymentProvider {
       );
       const amount = parseAmountFromCents(payment['amount_unit']);
       const currency = payment['currency'] as string | undefined;
+      const status = payment['status'] as string | undefined;
+      const isAccepted = status === 'ACCEPTED' && amount !== undefined;
 
       return {
-        success: payment['status'] === 'ACCEPTED',
+        success: isAccepted,
         paymentId: payment['id'] as string,
-        status: payment['status'] as string,
+        status: status ?? 'UNKNOWN',
         amount,
         currency,
         raw: payment,
+        ...(isAccepted
+          ? {}
+          : {
+              error:
+                status === 'ACCEPTED' && amount === undefined
+                  ? 'Payment amount is missing or invalid'
+                  : `Payment is ${status ?? 'unknown'}`,
+            }),
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Webhook handling failed';

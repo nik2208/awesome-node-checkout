@@ -105,18 +105,29 @@ export class PayPalProvider extends BasePaymentProvider {
         : undefined;
       const capture = pu?.payments?.captures?.[0];
       const captureStatus = typeof capture?.status === 'string' ? capture.status : undefined;
-      const isCaptureCompleted = captureStatus === 'COMPLETED';
       const amount = parseAmount(capture?.amount?.value);
       const currency = typeof capture?.amount?.currencyCode === 'string' ? capture.amount.currencyCode : undefined;
-      const status = captureStatus ?? (order.status as string);
+      const isCaptureCompleted = captureStatus === 'COMPLETED' && amount !== undefined;
+      const status = captureStatus ?? 'NO_CAPTURE';
 
       return {
         success: isCaptureCompleted,
         paymentId: order.id as string,
         status,
+        captureStatus,
         amount,
         currency,
         raw: order,
+        ...(isCaptureCompleted
+          ? {}
+          : {
+              error:
+                !capture
+                  ? 'Payment capture not found'
+                  : captureStatus === 'COMPLETED' && amount === undefined
+                  ? 'Payment amount is missing or invalid'
+                  : `Payment capture status is ${captureStatus ?? 'unknown'}`,
+            }),
       };
     } catch (error) {
       return this.errorResult(error, 'Failed to execute PayPal payment');
@@ -134,18 +145,29 @@ export class PayPalProvider extends BasePaymentProvider {
         : undefined;
       const capture = pu?.payments?.captures?.[0];
       const captureStatus = typeof capture?.status === 'string' ? capture.status : undefined;
-      const isCaptureCompleted = captureStatus === 'COMPLETED';
       const amount = parseAmount(capture?.amount?.value);
       const currency = typeof capture?.amount?.currencyCode === 'string' ? capture.amount.currencyCode : undefined;
-      const status = captureStatus ?? (order.status as string);
+      const isCaptureCompleted = captureStatus === 'COMPLETED' && amount !== undefined;
+      const status = captureStatus ?? 'NO_CAPTURE';
 
       return {
         success: isCaptureCompleted,
         paymentId: order.id as string,
         status,
+        captureStatus,
         amount,
         currency,
         raw: order,
+        ...(isCaptureCompleted
+          ? {}
+          : {
+              error:
+                !capture
+                  ? 'Payment capture not found'
+                  : captureStatus === 'COMPLETED' && amount === undefined
+                  ? 'Payment amount is missing or invalid'
+                  : `Payment capture status is ${captureStatus ?? 'unknown'}`,
+            }),
       };
     } catch (error) {
       return this.errorResult(error, 'Failed to get PayPal payment details');

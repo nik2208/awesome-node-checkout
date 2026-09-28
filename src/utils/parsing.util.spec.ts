@@ -31,6 +31,13 @@ describe('parsing.util', () => {
       expect(parseAmount('abc')).toBeUndefined();
       expect(parseAmount('12abc')).toBeUndefined();
     });
+
+    it('rejects hex, octal, binary and scientific notation', () => {
+      expect(parseAmount('0x10')).toBeUndefined();
+      expect(parseAmount('1e3')).toBeUndefined();
+      expect(parseAmount('0b10')).toBeUndefined();
+      expect(parseAmount('0o77')).toBeUndefined();
+    });
   });
 
   describe('parseAmountFromCents', () => {
@@ -40,12 +47,15 @@ describe('parsing.util', () => {
       expect(parseAmountFromCents(0)).toBe(0);
     });
 
-    it('returns undefined for invalid or empty inputs', () => {
+    it('returns undefined for invalid, non-integer, or empty inputs', () => {
       expect(parseAmountFromCents('')).toBeUndefined();
       expect(parseAmountFromCents('  ')).toBeUndefined();
       expect(parseAmountFromCents(null)).toBeUndefined();
       expect(parseAmountFromCents(undefined)).toBeUndefined();
       expect(parseAmountFromCents('invalid')).toBeUndefined();
+      expect(parseAmountFromCents('19.99')).toBeUndefined();
+      expect(parseAmountFromCents('0x10')).toBeUndefined();
+      expect(parseAmountFromCents('1e3')).toBeUndefined();
     });
   });
 

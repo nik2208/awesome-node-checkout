@@ -111,6 +111,7 @@ describe('PayPalProvider', () => {
         expect(result.success).toBe(true);
         expect(result.paymentId).toBe('PAYPAL-ORD-123');
         expect(result.status).toBe('COMPLETED');
+        expect(result.captureStatus).toBe('COMPLETED');
         expect(result.amount).toBe(50);
         expect(result.currency).toBe('EUR');
 
@@ -127,6 +128,7 @@ describe('PayPalProvider', () => {
         expect(result.success).toBe(true);
         expect(result.paymentId).toBe('PAYPAL-ORD-123');
         expect(result.status).toBe('COMPLETED');
+        expect(result.captureStatus).toBe('COMPLETED');
         expect(result.amount).toBe(50);
         expect(result.currency).toBe('EUR');
     });
@@ -144,6 +146,8 @@ describe('PayPalProvider', () => {
 
         const result = await provider.getPaymentDetails('PAYPAL-ORD-NO-CAPTURE');
         expect(result.success).toBe(false);
+        expect(result.status).toBe('NO_CAPTURE');
+        expect(result.captureStatus).toBeUndefined();
         expect(result.amount).toBeUndefined();
     });
 
@@ -215,7 +219,10 @@ describe('PayPalProvider', () => {
         };
 
         const result = await provider.getPaymentDetails('PAYPAL-ORD-EMPTY-STR');
+        expect(result.success).toBe(false);
         expect(result.amount).toBeUndefined();
+        expect(result.captureStatus).toBe('COMPLETED');
+        expect(result.error).toContain('Payment amount is missing or invalid');
     });
 
     it('should gracefully handle order creation API failures', async () => {

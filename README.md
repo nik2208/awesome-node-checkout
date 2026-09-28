@@ -40,8 +40,9 @@ checkout
   .registerProvider(new SatispayProvider({
     keyId: process.env.SATISPAY_KEY_ID!,
     privateKey: fs.readFileSync('private.pem', 'utf8'),
+    webhookPublicKey: fs.readFileSync('satispay_public.pem', 'utf8'), // Required in production to verify incoming webhook signatures
     environment: 'sandbox',
-    serverUrl: 'https://myapp.com', // Base URL for callbacks: serverUrl + callbackPath
+    serverUrl: 'https://myapp.com', // Base URL for callbacks: serverUrl + callbackPath (must include router mount prefix, e.g. /checkout)
     callbackPath: '/checkout/satispay/webhook', // Optional: defaults to /checkout/satispay/webhook
   }));
 
@@ -178,15 +179,18 @@ A full-featured reference implementation using Express 5, SQLite (`ITransactionS
 Relying solely on front-end browser redirects (`GET /:provider/redirect`) to fulfill orders introduces significant risk:
 - **Drop-off**: Shoppers may close the tab, lose connectivity, or navigate away before reaching your redirect URL.
 - **Tampering**: Unless protected by cryptographic signatures (such as Nexi's mandatory outcome MAC), client-controlled URL parameters can be manipulated.
-- **Amount Mismatch**: Always verify that the captured payment amount matches your order ledger before fulfilling goods or services.
+- **Amount Mismatch**: Always verify that the captured payment amount matches your order ledger before fulfilling goods or services. In `awesome-node-checkout`, `success: true` strictly requires that a payment is confirmed with a valid amount.
 
 To ensure safe fulfillment:
 1. **Verify Amount & Currency**: `PaymentResult` and `WebhookResult` return `amount` and `currency` extracted directly from the provider. Compare amounts in minor units (cents) or with rounding to prevent floating-point discrepancies:
    ```typescript
    const result = await checkout.handleRedirect(provider, req.query);
-   if (result.success && result.status === 'COMPLETED') {
+   if (result.success && (result.status === 'COMPLETED' || result.status === 'ACCEPTED')) {
+     if (result.amount === undefined) {
+       throw new Error('Payment reported success but amount is missing');
+     }
      const orderCents = Math.round(order.totalAmount * 100);
-     const resultCents = Math.round((result.amount ?? 0) * 100);
+     const resultCents = Math.round(result.amount * 100);
      if (resultCents !== orderCents || result.currency !== order.currency) {
        throw new Error('Authorized amount does not match order total');
      }
@@ -194,7 +198,12 @@ To ensure safe fulfillment:
    ```
 2. **Use Server Notifications / Webhooks**:
    - For **Nexi**: Pass `notifyUrl` in `PaymentRequest` (e.g. `https://myapp.com/checkout/nexi/webhook`). Nexi sends a server-to-server POST notification (`urlpost`) with the 7-field outcome MAC. Ensure your app includes `app.use(express.urlencoded({ extended: false }))`.
-   - For **Satispay**: Set `serverUrl` (and optionally `callbackPath`, default `/checkout/satispay/webhook`). POST notifications verify RSA-SHA256 HTTP signatures against Satispay's RSA public key with `(request-target)` and SHA-256 `Digest` binding to `rawBody`. GET callbacks (`?payment_id=...`) are verified by server-side query to Satispay's API with merchant RSA authentication.
+   - For **Satispay**: Set `serverUrl` (and optionally `callbackPath`, default `/checkout/satispay/webhook`). Note that `serverUrl + callbackPath` must include the router mount prefix (e.g. if mounted at `/checkout`, use `/checkout/satispay/webhook`).
+     - **Production Requirement**: Configure `webhookPublicKey` with Satispay's RSA public key (obtained via `GET /g_business/v1/consumers/{keyId}`) to enforce HTTP Signature verification. The verifier strictly requires at least `(request-target)`, `date`, and `digest` (when a body is present), as well as a valid `Date` header within the freshness window.
+     - **Raw Body Requirement**: In Express, capture the raw body buffer using `express.json({ verify: (req, _res, buf) => { (req as any).rawBody = buf; } })`. Passing a re-serialized or pretty-printed JSON body will alter whitespace and fail SHA-256 digest validation.
+     - **GET Callbacks vs POST Webhooks**:
+       - **POST Webhooks**: Sent directly from Satispay servers with an HTTP `Signature` header. When `webhookPublicKey` is configured, signature validity, header completeness, and freshness are strictly verified before processing.
+       - **GET Callbacks** (`?payment_id=...`): Satispay GET callbacks (e.g. user return/redirect) do not carry HTTP signatures. An unsigned GET callback is accepted solely as a trigger for a secure server-to-server re-read (`GET /payments/{id}`) authenticated with your merchant RSA private key. The `payment_id` is strictly sanitized to prevent traversal, and all parameters from the query string are ignored.
 3. **Idempotency**: Because both the redirect callback and the webhook notification may arrive for the same order, ensure your fulfillment handler is idempotent.
 
 ---

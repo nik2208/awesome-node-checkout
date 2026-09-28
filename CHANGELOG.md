@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.5] - 2026-09-28
+
+### Security
+- **Nexi Redirect**: Prevented unsigned query parameter `order_id` from populating `orderId` during redirect handling; `orderId` is strictly resolved from MAC-covered `codTrans` or the local transaction map. On failed MAC verification, `orderId` and `paymentId` remain strictly `undefined` to prevent spoofing. Resolves #25.
+- **Express Adapter**: Prevented consumer event listener errors containing "JSON" from being masked as `'Invalid provider response'`; consumer listener errors and strings bubble up cleanly with original error details. Resolves #25.
+- **Nexi Outcome MAC**: Omitted unverified `paymentId` (set to `undefined`) in `handleWebhook` and `executePayment` when MAC verification fails. Resolves #25.
+
+### Added
+- **Types**: Made `verified: boolean` required on `WebhookResult` and `CheckoutEventPayload`, ensuring callers do not need an undefined check branch. Resolves #25.
+
+### Fixed
+- **Satispay Currency**: Enforced strict ISO-4217 validation across `createPayment`, `getPaymentDetails`, and `handleWebhook`, rejecting non-standard currency names (e.g. `'EURO'`). Resolves #25.
+- **Documentation**: Documented `verified` vs `error` semantics in `WebhookResult` and event payload in README. Detailed Satispay `verified` guarantees both with and without `webhookPublicKey`. Resolves #25.
+
 ## [1.2.4] - 2026-09-28
 
 ### Security

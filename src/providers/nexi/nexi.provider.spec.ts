@@ -126,7 +126,7 @@ describe('NexiProvider', () => {
     const resMissing = await provider.handleRedirect({ codTrans: 'ORD-42', esito: 'OK' });
     expect(resMissing).toEqual({
       success: false,
-      paymentId: 'ORD-42',
+      paymentId: undefined,
       status: 'FAILED',
       error: 'MAC missing',
     });
@@ -134,7 +134,7 @@ describe('NexiProvider', () => {
     const resEmpty = await provider.executePayment('ORD-42', { esito: 'OK', mac: '' });
     expect(resEmpty).toEqual({
       success: false,
-      paymentId: 'ORD-42',
+      paymentId: undefined,
       status: 'FAILED',
       error: 'MAC missing',
     });
@@ -150,7 +150,7 @@ describe('NexiProvider', () => {
     expect(result.status).toBe('FAILED');
     expect(spyEmit).toHaveBeenCalledWith('payment.failed', expect.objectContaining({
       provider: 'nexi',
-      paymentId: 'ORD-42',
+      paymentId: undefined,
       status: 'FAILED',
       error: 'MAC missing',
     }));

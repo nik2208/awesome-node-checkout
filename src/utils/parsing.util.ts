@@ -69,3 +69,10 @@ export function parseNexiCurrency(code: unknown): string | undefined {
   }
   return undefined;
 }
+
+/**
+ * Validates and normalizes ISO-4217 currency codes (alpha-3 or mapped numeric codes).
+ * Non-ISO codes (e.g. 'EURO') return undefined.
+ */
+export const parseIsoCurrency = parseNexiCurrency;
+

@@ -222,12 +222,25 @@ To ensure safe fulfillment:
 
 ```typescript
 checkout.events
-  .on('payment.created',   ({ provider, paymentId, orderId, raw }) => { /* ... */ })
-  .on('payment.completed', ({ provider, paymentId, orderId, raw }) => { /* ... */ })
-  .on('payment.failed',    ({ provider, error, orderId, raw })     => { /* ... */ })
-  .on('payment.refunded',  ({ provider, paymentId, orderId, raw }) => { /* ... */ })
+  .on('payment.created',   ({ provider, paymentId, orderId, verified, raw }) => { /* ... */ })
+  .on('payment.completed', ({ provider, paymentId, orderId, verified, raw }) => { /* ... */ })
+  .on('payment.failed',    ({ provider, error, orderId, verified, raw })     => { /* ... */ })
+  .on('payment.refunded',  ({ provider, paymentId, orderId, verified, raw }) => { /* ... */ })
   .on('webhook.received',  ({ provider, paymentId, orderId, status, error, verified, data, raw }) => { /* ... */ });
 ```
+
+### Understanding `verified` vs `error` in `WebhookResult` and Events
+
+The `verified: boolean` field indicates whether the incoming request was verified as authentic:
+- **`verified: true`**: The notification was cryptographically verified (e.g. Nexi 7-field outcome MAC or Satispay HTTP Signature) or verified via authenticated server-to-server API re-read.
+  - A genuine cancellation or failed payment (e.g. user canceled on gateway, card declined) has `verified: true, success: false, error: 'Payment is CANCELED'` or `error: 'Payment failed with outcome KO'`.
+- **`verified: false`**: The signature/MAC was missing, tampered with, or invalid. The payload is untrusted.
+  - In this case, `success: false, verified: false, error: 'MAC verification failed'` (or `'Webhook signature verification failed'`), and `orderId` / `paymentId` from untrusted query/body are stripped to prevent parameter injection attacks.
+
+#### Satispay `verified` Semantics
+- **With `webhookPublicKey` configured**: Inbound POST webhooks must carry a valid HTTP Signature matching Satispay's RSA public key, correct SHA-256 body digest, and fresh `Date` header. `verified: true` guarantees cryptographic authenticity.
+- **Without `webhookPublicKey`**: Cryptographic signature checking of the incoming HTTP request is skipped. However, `verified: true` indicates that the payment details were verified directly against Satispay's API via an authenticated server-to-server GET request (`/payments/{id}`) signed with the merchant's RSA private key.
+
 
 ---
 

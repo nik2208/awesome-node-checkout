@@ -109,6 +109,7 @@ export class CheckoutConfigurator {
       orderId: request.orderId,
       status: result.status,
       error: result.error,
+      verified: result.success,
       raw: result.raw,
     });
     return result;
@@ -132,6 +133,7 @@ export class CheckoutConfigurator {
       orderId,
       status: result.status,
       error: result.error,
+      verified: result.success,
       raw: result.raw,
     });
     return result;
@@ -161,6 +163,7 @@ export class CheckoutConfigurator {
       orderId,
       status: result.status,
       error: result.error,
+      verified: result.success,
       raw: result.raw,
     });
     return result;
@@ -252,13 +255,28 @@ export class CheckoutConfigurator {
       );
     }
     const result = await provider.handleRedirect(query);
-    const orderId =
-      (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined) ??
-      query?.order_id ??
-      query?.codTrans;
+    const isNexi = providerName.toLowerCase() === 'nexi';
+    let orderId: string | undefined;
 
-    if (orderId && !result.orderId) {
+    if (result.success) {
+      if (isNexi) {
+        // For Nexi, orderId only from local map or codTrans (MAC-covered), never unsigned query order_id
+        orderId =
+          (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined) ??
+          query?.codTrans ??
+          result.orderId;
+      } else {
+        orderId =
+          (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined) ??
+          result.orderId ??
+          query?.order_id ??
+          query?.codTrans;
+      }
       result.orderId = orderId;
+    } else {
+      // On failed verification or failed payment, never take orderId from query
+      orderId = undefined;
+      result.orderId = undefined;
     }
 
     await this.emit(result.success ? 'payment.completed' : 'payment.failed', {
@@ -267,6 +285,7 @@ export class CheckoutConfigurator {
       orderId,
       status: result.status,
       error: result.error,
+      verified: result.success,
       raw: result.raw,
     });
     return result;

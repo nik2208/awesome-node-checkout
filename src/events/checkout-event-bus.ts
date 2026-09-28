@@ -11,7 +11,8 @@ export interface CheckoutEventPayload {
   orderId?: string;
   status?: string;
   error?: string;
-  verified?: boolean;
+  /** True when the transaction / notification authenticity was verified */
+  verified: boolean;
   data?: any;
   raw?: unknown;
   timestamp: Date;
@@ -52,6 +53,21 @@ export class CheckoutEventBus {
   ): Promise<void> {
     const handlers = this.listeners.get(event) ?? [];
     const fullPayload: CheckoutEventPayload = { ...payload, timestamp: new Date() };
-    await Promise.all(handlers.map((h) => h(fullPayload)));
+    await Promise.all(
+      handlers.map(async (h) => {
+        try {
+          await h(fullPayload);
+        } catch (err) {
+          if (err && typeof err === 'object') {
+            (err as any).__isEventListenerError = true;
+            throw err;
+          }
+          const wrapped = new Error(String(err));
+          (wrapped as any).__isEventListenerError = true;
+          (wrapped as any).originalError = err;
+          throw wrapped;
+        }
+      }),
+    );
   }
 }

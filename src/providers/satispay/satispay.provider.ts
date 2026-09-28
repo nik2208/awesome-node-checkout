@@ -324,10 +324,19 @@ export class SatispayProvider extends BasePaymentProvider {
       const callbackUrl =
         `${baseUrl}${callbackPath}?order_id=${encodeURIComponent(orderId)}&payment_id={uuid}`;
 
+      const validatedCurrency = parseNexiCurrency(request.currency);
+      if (!validatedCurrency) {
+        return {
+          success: false,
+          error: 'Payment currency is missing or invalid',
+          status: 'FAILED',
+        };
+      }
+
       const body = {
         flow: 'MATCH_CODE',
         amount_unit: Math.round(request.amount * 100),
-        currency: request.currency,
+        currency: validatedCurrency,
         external_code: orderId,
         callback_url: callbackUrl,
         redirect_url: request.returnUrl,
@@ -377,7 +386,7 @@ export class SatispayProvider extends BasePaymentProvider {
       );
       const amount = parseAmountFromCents(payment['amount_unit']);
       const currencyRaw = payment['currency'];
-      const currency = parseNexiCurrency(currencyRaw) ?? (typeof currencyRaw === 'string' && currencyRaw.trim() !== '' ? currencyRaw.trim() : undefined);
+      const currency = parseNexiCurrency(currencyRaw);
       const status = payment['status'] as string | undefined;
       const isAccepted = status === 'ACCEPTED' && amount !== undefined && amount > 0 && !!currency;
 
@@ -438,6 +447,9 @@ export class SatispayProvider extends BasePaymentProvider {
    * Flow:
    * - POST webhooks: The HTTP Signature in the Authorization header is verified
    *   against `config.webhookPublicKey` (when configured) before processing.
+   *   When `config.webhookPublicKey` is omitted, cryptographic signature verification is skipped,
+   *   and `verified: true` indicates that the payment details and status were securely verified
+   *   directly via an authenticated server-to-server API re-read signed with the merchant's RSA private key.
    * - GET/HEAD callbacks: Satispay GET callbacks (?payment_id=...) do not carry HTTP signatures.
    *   An unsigned GET/HEAD is accepted solely as a trigger for a secure server-to-server
    *   API re-read using the merchant's RSA private key. The payment ID is validated
@@ -477,7 +489,7 @@ export class SatispayProvider extends BasePaymentProvider {
       );
       const amount = parseAmountFromCents(payment['amount_unit']);
       const currencyRaw = payment['currency'];
-      const currency = parseNexiCurrency(currencyRaw) ?? (typeof currencyRaw === 'string' && currencyRaw.trim() !== '' ? currencyRaw.trim() : undefined);
+      const currency = parseNexiCurrency(currencyRaw);
       const status = payment['status'] as string | undefined;
       const isAccepted = status === 'ACCEPTED' && amount !== undefined && amount > 0 && !!currency;
       const orderId = (payment['external_code'] as string) || undefined;

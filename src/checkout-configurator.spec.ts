@@ -72,6 +72,7 @@ describe('CheckoutConfigurator', () => {
             orderId: 'ord-123',
             status: 'CREATED',
             error: undefined,
+            verified: true,
             raw: req,
         });
     });
@@ -98,6 +99,7 @@ describe('CheckoutConfigurator', () => {
             orderId: undefined,
             status: 'FAILED',
             error: 'Simulated failure',
+            verified: false,
             raw: undefined,
         });
     });
@@ -122,6 +124,7 @@ describe('CheckoutConfigurator', () => {
             orderId: 'ORD-REMEMBERED',
             status: 'COMPLETED',
             error: undefined,
+            verified: true,
             raw: { data: '123' },
         });
     });
@@ -179,6 +182,7 @@ describe('CheckoutConfigurator', () => {
             orderId: 'ORD-REDIR',
             status: 'REDIRECT',
             error: undefined,
+            verified: true,
             raw: { id: 'test-id', order_id: 'ORD-REDIR' },
         });
     });

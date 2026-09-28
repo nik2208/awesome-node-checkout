@@ -185,7 +185,7 @@ export class NexiProvider extends BasePaymentProvider {
       if (!mac) {
         return {
           success: false,
-          paymentId: codTrans,
+          paymentId: undefined,
           status: 'FAILED',
           error: 'MAC missing',
         };
@@ -194,7 +194,7 @@ export class NexiProvider extends BasePaymentProvider {
       if (!this.isValidHexMac(mac) || !this.safeVerifyResponseMac(codTrans, esito, importo, divisa, dataStr, orario, codAut, mac)) {
         return {
           success: false,
-          paymentId: codTrans,
+          paymentId: undefined,
           status: 'FAILED',
           error: 'MAC verification failed: response may have been tampered with',
         };
@@ -253,7 +253,7 @@ export class NexiProvider extends BasePaymentProvider {
         return {
           success: false,
           verified: false,
-          paymentId: codTrans || undefined,
+          paymentId: undefined,
           error: 'MAC verification failed',
         };
       }

@@ -12,6 +12,7 @@ const mockCaptureOrder = vi.fn().mockResolvedValue({
             payments: {
                 captures: [{
                     id: 'CAPTURE-123',
+                    status: 'COMPLETED',
                     amount: { currencyCode: 'EUR', value: '50.00' }
                 }]
             }
@@ -24,8 +25,13 @@ const mockGetOrder = vi.fn().mockResolvedValue({
         id: 'PAYPAL-ORD-123',
         status: 'COMPLETED',
         purchaseUnits: [{
-            amount: { currencyCode: 'EUR', value: '50.00' },
-            payments: { captures: [{ id: 'CAPTURE-123' }] }
+            payments: {
+                captures: [{
+                    id: 'CAPTURE-123',
+                    status: 'COMPLETED',
+                    amount: { currencyCode: 'EUR', value: '50.00' }
+                }]
+            }
         }]
     }
 });
@@ -115,7 +121,7 @@ describe('PayPalProvider', () => {
         });
     });
 
-    it('should return amount and currency in getPaymentDetails via purchase-unit fallback', async () => {
+    it('should return amount and currency in getPaymentDetails via completed capture', async () => {
         const result = await provider.getPaymentDetails('PAYPAL-ORD-123');
 
         expect(result.success).toBe(true);
@@ -125,19 +131,90 @@ describe('PayPalProvider', () => {
         expect(result.currency).toBe('EUR');
     });
 
-    it('should return undefined amount when order does not report any amount', async () => {
+    it('should return success: false and amount: undefined when order has no capture', async () => {
         (provider as any).ordersController = {
             getOrder: vi.fn().mockResolvedValue({
                 result: {
-                    id: 'PAYPAL-ORD-NO-AMOUNT',
+                    id: 'PAYPAL-ORD-NO-CAPTURE',
                     status: 'COMPLETED',
                     purchaseUnits: [{}]
                 }
             })
         };
 
-        const result = await provider.getPaymentDetails('PAYPAL-ORD-NO-AMOUNT');
-        expect(result.success).toBe(true);
+        const result = await provider.getPaymentDetails('PAYPAL-ORD-NO-CAPTURE');
+        expect(result.success).toBe(false);
+        expect(result.amount).toBeUndefined();
+    });
+
+    it('should return success: false when capture is PENDING or DECLINED despite order COMPLETED', async () => {
+        (provider as any).ordersController = {
+            captureOrder: vi.fn().mockResolvedValue({
+                result: {
+                    id: 'PAYPAL-ORD-PENDING',
+                    status: 'COMPLETED',
+                    purchaseUnits: [{
+                        payments: {
+                            captures: [{
+                                id: 'CAPTURE-PENDING',
+                                status: 'PENDING',
+                                amount: { currencyCode: 'EUR', value: '50.00' }
+                            }]
+                        }
+                    }]
+                }
+            })
+        };
+
+        const result = await provider.executePayment('PAYPAL-ORD-PENDING');
+        expect(result.success).toBe(false);
+        expect(result.status).toBe('PENDING');
+        expect(result.amount).toBe(50);
+
+        (provider as any).ordersController = {
+            captureOrder: vi.fn().mockResolvedValue({
+                result: {
+                    id: 'PAYPAL-ORD-DECLINED',
+                    status: 'COMPLETED',
+                    purchaseUnits: [{
+                        payments: {
+                            captures: [{
+                                id: 'CAPTURE-DECLINED',
+                                status: 'DECLINED',
+                                amount: { currencyCode: 'EUR', value: '50.00' }
+                            }]
+                        }
+                    }]
+                }
+            })
+        };
+
+        const declinedResult = await provider.executePayment('PAYPAL-ORD-DECLINED');
+        expect(declinedResult.success).toBe(false);
+        expect(declinedResult.status).toBe('DECLINED');
+        expect(declinedResult.amount).toBe(50);
+    });
+
+    it('should return undefined amount when capture value is empty string or whitespace', async () => {
+        (provider as any).ordersController = {
+            getOrder: vi.fn().mockResolvedValue({
+                result: {
+                    id: 'PAYPAL-ORD-EMPTY-STR',
+                    status: 'COMPLETED',
+                    purchaseUnits: [{
+                        payments: {
+                            captures: [{
+                                id: 'CAPTURE-EMPTY',
+                                status: 'COMPLETED',
+                                amount: { currencyCode: 'EUR', value: '   ' }
+                            }]
+                        }
+                    }]
+                }
+            })
+        };
+
+        const result = await provider.getPaymentDetails('PAYPAL-ORD-EMPTY-STR');
         expect(result.amount).toBeUndefined();
     });
 

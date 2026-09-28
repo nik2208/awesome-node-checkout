@@ -36,7 +36,7 @@ export interface IPaymentProvider {
     body?: Record<string, unknown>,
     headers?: Record<string, string>,
     query?: Record<string, string>,
-    context?: { method?: string; path?: string },
+    context?: { method?: string; path?: string; rawBody?: Buffer | string },
   ): Promise<WebhookResult>;
 
   /**

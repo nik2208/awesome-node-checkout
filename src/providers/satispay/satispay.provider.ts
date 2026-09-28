@@ -4,6 +4,7 @@ import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult, WebhookResult } from '../../models/payment-result.model';
 import { ITransactionStore } from '../../interfaces/transaction-store.interface';
 import { InMemoryTransactionStore } from '../../stores/in-memory-transaction.store';
+import { parseAmountFromCents } from '../../utils/parsing.util';
 
 export interface SatispayProviderConfig {
   keyId: string;
@@ -33,6 +34,12 @@ export interface SatispayProviderConfig {
    * @default '/checkout/satispay/webhook'
    */
   callbackPath?: string;
+  /**
+   * Maximum acceptable age of the webhook `Date` header in milliseconds.
+   * Requests older than this window are rejected to prevent replay attacks.
+   * @default 300_000 (5 minutes)
+   */
+  signatureMaxAgeMs?: number;
   /**
    * Custom transaction store for correlating webhooks with orders.
    * Defaults to InMemoryTransactionStore.
@@ -119,39 +126,51 @@ export class SatispayProvider extends BasePaymentProvider {
    * Supports (request-target) via context or headers, and verifies signature over
    * headers with constant-time security.
    */
+  /**
+   * Validates that the payment ID contains only safe alphanumeric/hyphen characters.
+   */
+  private isValidPaymentId(id: unknown): id is string {
+    return (
+      typeof id === 'string' &&
+      /^[A-Za-z0-9_-]{1,64}$/.test(id) &&
+      !id.includes('/') &&
+      !id.includes('..')
+    );
+  }
+
+  /**
+   * Verifies the HTTP Signature in an inbound Satispay webhook request.
+   * Satispay signs webhooks with their own RSA private key; we verify using
+   * the corresponding public key supplied in `config.webhookPublicKey`.
+   *
+   * Validates:
+   * - Presence and format of Authorization/Signature header
+   * - Freshness of Date header within `signatureMaxAgeMs` (default 5 minutes)
+   * - Exact match between Digest header and SHA-256 of raw body
+   * - (request-target) exclusively from context (never client body/headers)
+   * - Constant-time RSA-SHA256 signature verification
+   */
   verifyWebhookSignature(
-    bodyOrHeaders?: unknown,
-    headersOrBody?: Record<string, string> | unknown,
-    context?: { method?: string; path?: string },
+    body?: unknown,
+    headers?: Record<string, string>,
+    context?: { method?: string; path?: string; rawBody?: Buffer | string },
   ): boolean {
     if (!this.config.webhookPublicKey) {
       return true; // verification skipped — no public key configured
     }
 
+    if (!headers || typeof headers !== 'object') {
+      return false;
+    }
+
     try {
-      let body = bodyOrHeaders;
-      let headers = headersOrBody as Record<string, string> | undefined;
-
-      // Handle argument order flexibility: verifyWebhookSignature(body, headers) or (headers, body)
-      if (
-        typeof body === 'object' &&
-        body !== null &&
-        (('authorization' in body) || ('Authorization' in body) || ('signature' in body) || ('Signature' in body)) &&
-        (!headers || !('authorization' in headers || 'signature' in headers))
-      ) {
-        headers = body as Record<string, string>;
-        body = headersOrBody;
-      }
-
-      if (!headers) return false;
-
       const authHeader =
-        (headers['authorization'] ??
+        headers['authorization'] ??
         headers['Authorization'] ??
         headers['signature'] ??
-        headers['Signature']) as string | undefined;
+        headers['Signature'];
 
-      if (!authHeader) return false;
+      if (!authHeader || typeof authHeader !== 'string') return false;
 
       // Parse the Signature params from the Authorization header.
       // Format: Signature keyId="...", algorithm="...", headers="...", signature="..."
@@ -165,7 +184,7 @@ export class SatispayProvider extends BasePaymentProvider {
       for (const part of paramStr.split(',')) {
         const eqIdx = part.indexOf('="');
         if (eqIdx === -1) continue;
-        const key = part.slice(0, eqIdx).trim();
+        const key = part.slice(0, eqIdx).trim().toLowerCase();
         const valueStart = eqIdx + 2;
         const valueEnd = part.lastIndexOf('"');
         if (valueEnd <= valueStart) continue;
@@ -173,30 +192,59 @@ export class SatispayProvider extends BasePaymentProvider {
         if (key) sigParams[key] = value;
       }
 
-      const { signature, headers: signedHeaders = '(request-target) host date digest' } = sigParams;
+      const signature = sigParams['signature'];
+      const signedHeaders = sigParams['headers'] ?? '(request-target) host date digest';
       if (!signature) return false;
 
-      // Reconstruct the signed message from the incoming headers
-      const headerNames = signedHeaders.split(' ');
-      const headerDigest = headers['digest'] ?? headers['Digest'];
-      const bodyString =
-        body !== undefined && body !== null
-          ? (typeof body === 'string' ? body : JSON.stringify(body))
-          : '';
-      const computedDigest =
-        'SHA-256=' + crypto.createHash('sha256').update(bodyString).digest('base64');
-      const digest = headerDigest ?? computedDigest;
+      const headerNames = signedHeaders.split(' ').map((h) => h.trim().toLowerCase()).filter(Boolean);
 
+      // 1. Freshness check on Date if 'date' is signed or present
+      const rawDate = headers['date'] ?? headers['Date'];
+      if (headerNames.includes('date') || rawDate) {
+        if (!rawDate) return false;
+        const dateParsed = new Date(rawDate);
+        if (isNaN(dateParsed.getTime())) return false;
+        const maxAgeMs = this.config.signatureMaxAgeMs ?? 300_000;
+        if (Math.abs(Date.now() - dateParsed.getTime()) > maxAgeMs) {
+          return false;
+        }
+      }
+
+      // 2. Digest comparison: Digest header MUST match SHA-256 of the raw body
+      const headerDigest = headers['digest'] ?? headers['Digest'];
+      if (headerNames.includes('digest')) {
+        if (!headerDigest) return false;
+
+        let rawBytes: Buffer;
+        if (context?.rawBody !== undefined) {
+          rawBytes = Buffer.isBuffer(context.rawBody)
+            ? context.rawBody
+            : Buffer.from(context.rawBody, 'utf-8');
+        } else if (Buffer.isBuffer(body)) {
+          rawBytes = body;
+        } else if (typeof body === 'string') {
+          rawBytes = Buffer.from(body, 'utf-8');
+        } else if (body !== undefined && body !== null && typeof body === 'object') {
+          rawBytes = Buffer.from(JSON.stringify(body), 'utf-8');
+        } else {
+          rawBytes = Buffer.from('', 'utf-8');
+        }
+
+        const expectedDigest = 'SHA-256=' + crypto.createHash('sha256').update(rawBytes).digest('base64');
+        if (headerDigest !== expectedDigest) {
+          return false;
+        }
+      }
+
+      // 3. Reconstruct the signed message from headers and context
       const parts: string[] = [];
       for (const name of headerNames) {
         if (name === '(request-target)') {
-          const target =
-            headers['(request-target)'] ??
-            (context?.method && context?.path ? `${context.method.toLowerCase()} ${context.path}` : undefined);
-          if (!target) return false;
-          parts.push(`(request-target): ${target}`);
+          // (request-target) MUST come strictly from context
+          if (!context?.method || !context?.path) return false;
+          parts.push(`(request-target): ${context.method.toLowerCase()} ${context.path}`);
         } else if (name === 'digest') {
-          parts.push(`digest: ${digest}`);
+          parts.push(`digest: ${headerDigest}`);
         } else {
           const value =
             headers[name] ??
@@ -286,11 +334,20 @@ export class SatispayProvider extends BasePaymentProvider {
   }
 
   async getPaymentDetails(paymentId: string): Promise<PaymentResult> {
+    if (!this.isValidPaymentId(paymentId)) {
+      return {
+        success: false,
+        paymentId: typeof paymentId === 'string' ? paymentId : undefined,
+        status: 'FAILED',
+        error: 'Invalid payment ID format',
+      };
+    }
     try {
-      const payment = await this.request<Record<string, unknown>>('GET', `${this.apiUrl}/payments/${paymentId}`);
-      const amountUnit = payment['amount_unit'];
-      const amount =
-        amountUnit != null && !isNaN(Number(amountUnit)) ? Number(amountUnit) / 100 : undefined;
+      const payment = await this.request<Record<string, unknown>>(
+        'GET',
+        `${this.apiUrl}/payments/${encodeURIComponent(paymentId)}`,
+      );
+      const amount = parseAmountFromCents(payment['amount_unit']);
       const currency = payment['currency'] as string | undefined;
 
       return {
@@ -307,11 +364,19 @@ export class SatispayProvider extends BasePaymentProvider {
   }
 
   async refundPayment(paymentId: string, amount?: number): Promise<PaymentResult> {
+    if (!this.isValidPaymentId(paymentId)) {
+      return {
+        success: false,
+        paymentId: typeof paymentId === 'string' ? paymentId : undefined,
+        status: 'REFUND_FAILED',
+        error: 'Invalid payment ID format',
+      };
+    }
     try {
       const body = amount ? { amount_unit: Math.round(amount * 100) } : {};
       const refund = await this.request<Record<string, unknown>>(
         'POST',
-        `${this.apiUrl}/payments/${paymentId}/refunds`,
+        `${this.apiUrl}/payments/${encodeURIComponent(paymentId)}/refunds`,
         body,
       );
       return {
@@ -336,25 +401,31 @@ export class SatispayProvider extends BasePaymentProvider {
     body?: Record<string, unknown>,
     headers: Record<string, string> = {},
     query: Record<string, string> = {},
-    context?: { method?: string; path?: string },
+    context?: { method?: string; path?: string; rawBody?: Buffer | string },
   ): Promise<WebhookResult> {
     if (!this.verifyWebhookSignature(body, headers, context)) {
       return { success: false, error: 'Webhook signature verification failed' };
     }
 
     const b = body ?? {};
-    const paymentId: string | undefined =
-      (b['payment_id'] as string | undefined) ??
-      (b['id'] as string | undefined) ??
+    const rawId: unknown =
+      b['payment_id'] ??
+      b['id'] ??
       query['payment_id'];
-    if (!paymentId) {
+    if (!rawId) {
       return { success: false, error: 'Missing payment_id in webhook body or query' };
     }
+    if (!this.isValidPaymentId(rawId)) {
+      return { success: false, error: 'Invalid payment ID format' };
+    }
+    const paymentId = rawId;
+
     try {
-      const payment = await this.request<Record<string, unknown>>('GET', `${this.apiUrl}/payments/${paymentId}`);
-      const amountUnit = payment['amount_unit'];
-      const amount =
-        amountUnit != null && !isNaN(Number(amountUnit)) ? Number(amountUnit) / 100 : undefined;
+      const payment = await this.request<Record<string, unknown>>(
+        'GET',
+        `${this.apiUrl}/payments/${encodeURIComponent(paymentId)}`,
+      );
+      const amount = parseAmountFromCents(payment['amount_unit']);
       const currency = payment['currency'] as string | undefined;
 
       return {

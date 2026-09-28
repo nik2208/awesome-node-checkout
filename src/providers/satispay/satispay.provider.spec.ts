@@ -232,57 +232,107 @@ describe('SatispayProvider', () => {
     // -------------------------------------------------------------------------
     // HTTP Signatures tests (Issue #11)
     // -------------------------------------------------------------------------
-    describe('HTTP Signatures verification (Issue #11)', () => {
-        it('verifies signatures over (request-target) host date digest and rejects wrong path or key', () => {
+    describe('HTTP Signatures verification (Issues #11 and #16)', () => {
+        it('verifies signatures over (request-target) host date digest with raw body and rejects tampered body, wrong path or expired date', () => {
             const secureProvider = new SatispayProvider({
                 keyId: 'test-key',
                 privateKey: validFakePrivateKey,
                 webhookPublicKey: validFakePublicKey,
+                signatureMaxAgeMs: 300_000,
             });
+
+            const rawBody = JSON.stringify({ id: 'SAT-123' });
+            const body = JSON.parse(rawBody);
+            const validDigest = 'SHA-256=' + crypto.createHash('sha256').update(rawBody).digest('base64');
 
             const headers: Record<string, string> = {
                 host: 'example.test',
                 date: new Date().toUTCString(),
-                digest: 'SHA-256=abc',
+                digest: validDigest,
             };
 
-            const sign = (list: string[], method = 'post', path = '/checkout/satispay/webhook', privKey = validFakePrivateKey) => {
+            const sign = (list: string[], method = 'post', path = '/checkout/satispay/webhook', privKey = validFakePrivateKey, customHeaders = headers) => {
                 const s = crypto.createSign('RSA-SHA256');
-                const msg = list.map(h => h === '(request-target)' ? `(request-target): ${method} ${path}` : `${h}: ${headers[h]}`).join('\n');
+                const msg = list.map(h => h === '(request-target)' ? `(request-target): ${method} ${path}` : `${h}: ${customHeaders[h]}`).join('\n');
                 s.update(msg);
                 return s.sign(privKey, 'base64');
             };
 
-            // Valid signature with (request-target)
+            // Valid signature with (request-target) and matching rawBody
             const sigWithTarget = sign(['(request-target)', 'host', 'date', 'digest'], 'post', '/checkout/satispay/webhook');
             const validAuthHeader = `Signature keyId="test-key",algorithm="rsa-sha256",headers="(request-target) host date digest",signature="${sigWithTarget}"`;
 
-            // Should verify with matching context
-            const ok = secureProvider.verifyWebhookSignature({}, { ...headers, authorization: validAuthHeader }, { method: 'POST', path: '/checkout/satispay/webhook' });
+            // Should verify with matching context and rawBody
+            const ok = secureProvider.verifyWebhookSignature(body, { ...headers, authorization: validAuthHeader }, { method: 'POST', path: '/checkout/satispay/webhook', rawBody });
             expect(ok).toBe(true);
 
-            // Same signature with different method or path should be rejected
-            const badMethod = secureProvider.verifyWebhookSignature({}, { ...headers, authorization: validAuthHeader }, { method: 'GET', path: '/checkout/satispay/webhook' });
+            // 1. Same request with one byte of body changed should be rejected
+            const tamperedRawBody = JSON.stringify({ id: 'SAT-124' });
+            const tamperedBody = JSON.parse(tamperedRawBody);
+            const rejectedTamperedBody = secureProvider.verifyWebhookSignature(tamperedBody, { ...headers, authorization: validAuthHeader }, { method: 'POST', path: '/checkout/satispay/webhook', rawBody: tamperedRawBody });
+            expect(rejectedTamperedBody).toBe(false);
+
+            // 2. A Digest header that does not match the raw body should be rejected
+            const badDigestHeaders = { ...headers, digest: 'SHA-256=invalid' };
+            const sigBadDigest = sign(['(request-target)', 'host', 'date', 'digest'], 'post', '/checkout/satispay/webhook', validFakePrivateKey, badDigestHeaders);
+            const authBadDigest = `Signature keyId="test-key",algorithm="rsa-sha256",headers="(request-target) host date digest",signature="${sigBadDigest}"`;
+            const rejectedBadDigest = secureProvider.verifyWebhookSignature(body, { ...badDigestHeaders, authorization: authBadDigest }, { method: 'POST', path: '/checkout/satispay/webhook', rawBody });
+            expect(rejectedBadDigest).toBe(false);
+
+            // 3. Body containing signature/authorization is never read as headers (must be rejected if headers has no Signature)
+            const fakeBodyWithHeaders = {
+                authorization: validAuthHeader,
+                host: 'example.test',
+                date: new Date().toUTCString(),
+                digest: validDigest,
+            };
+            const rejectedBodyAsHeaders = secureProvider.verifyWebhookSignature(fakeBodyWithHeaders, {}, { method: 'POST', path: '/checkout/satispay/webhook' });
+            expect(rejectedBodyAsHeaders).toBe(false);
+
+            // 4. Same signature with different method or path should be rejected
+            const badMethod = secureProvider.verifyWebhookSignature(body, { ...headers, authorization: validAuthHeader }, { method: 'GET', path: '/checkout/satispay/webhook', rawBody });
             expect(badMethod).toBe(false);
 
-            const badPath = secureProvider.verifyWebhookSignature({}, { ...headers, authorization: validAuthHeader }, { method: 'POST', path: '/other/path' });
+            const badPath = secureProvider.verifyWebhookSignature(body, { ...headers, authorization: validAuthHeader }, { method: 'POST', path: '/other/path', rawBody });
             expect(badPath).toBe(false);
 
-            // Signature over host date digest (no request-target) still verifies without context
+            // 5. Expired Date header outside window is rejected
+            const oldDate = new Date(Date.now() - 600_000).toUTCString(); // 10 minutes ago
+            const expiredHeaders = { ...headers, date: oldDate };
+            const sigExpired = sign(['(request-target)', 'host', 'date', 'digest'], 'post', '/checkout/satispay/webhook', validFakePrivateKey, expiredHeaders);
+            const authExpired = `Signature keyId="test-key",algorithm="rsa-sha256",headers="(request-target) host date digest",signature="${sigExpired}"`;
+            const rejectedExpired = secureProvider.verifyWebhookSignature(body, { ...expiredHeaders, authorization: authExpired }, { method: 'POST', path: '/checkout/satispay/webhook', rawBody });
+            expect(rejectedExpired).toBe(false);
+
+            // 6. Signature over host date digest (no request-target) still verifies with fresh date and matching digest
             const sigNoTarget = sign(['host', 'date', 'digest']);
             const authNoTarget = `Signature keyId="test-key",algorithm="rsa-sha256",headers="host date digest",signature="${sigNoTarget}"`;
-            const okNoTarget = secureProvider.verifyWebhookSignature({}, { ...headers, authorization: authNoTarget });
+            const okNoTarget = secureProvider.verifyWebhookSignature(body, { ...headers, authorization: authNoTarget }, { rawBody });
             expect(okNoTarget).toBe(true);
 
-            // Wrong RSA key is rejected
+            // 7. Wrong RSA key is rejected
             const { privateKey: wrongPrivateKey } = crypto.generateKeyPairSync('rsa', {
                 modulusLength: 2048,
                 privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
             } as any);
             const wrongSig = sign(['host', 'date', 'digest'], 'post', '', wrongPrivateKey as string);
             const authWrongKey = `Signature keyId="test-key",algorithm="rsa-sha256",headers="host date digest",signature="${wrongSig}"`;
-            const rejectedWrongKey = secureProvider.verifyWebhookSignature({}, { ...headers, authorization: authWrongKey });
+            const rejectedWrongKey = secureProvider.verifyWebhookSignature(body, { ...headers, authorization: authWrongKey }, { rawBody });
             expect(rejectedWrongKey).toBe(false);
+        });
+
+        it('rejects path traversal and invalid payment_id formats', async () => {
+            const result = await provider.getPaymentDetails('../../v1/consumers/k');
+            expect(result.success).toBe(false);
+            expect(result.error).toContain('Invalid payment ID format');
+
+            const webhookResult = await provider.handleWebhook(undefined, {}, { payment_id: '../malicious/path' });
+            expect(webhookResult.success).toBe(false);
+            expect(webhookResult.error).toContain('Invalid payment ID format');
+
+            const refundResult = await provider.refundPayment('path/traversal');
+            expect(refundResult.success).toBe(false);
+            expect(refundResult.error).toContain('Invalid payment ID format');
         });
     });
 });

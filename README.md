@@ -203,7 +203,7 @@ To ensure safe fulfillment:
      - **Raw Body Requirement**: In Express, capture the raw body buffer using `express.json({ verify: (req, _res, buf) => { (req as any).rawBody = buf; } })`. Passing a re-serialized or pretty-printed JSON body will alter whitespace and fail SHA-256 digest validation.
      - **GET Callbacks vs POST Webhooks**:
        - **POST Webhooks**: Sent directly from Satispay servers with an HTTP `Signature` header. When `webhookPublicKey` is configured, signature validity, header completeness, and freshness are strictly verified before processing.
-       - **GET Callbacks** (`?payment_id=...`): Satispay GET callbacks (e.g. user return/redirect) do not carry HTTP signatures. An unsigned GET callback is accepted solely as a trigger for a secure server-to-server re-read (`GET /payments/{id}`) authenticated with your merchant RSA private key. The `payment_id` is strictly sanitized to prevent traversal, and all parameters from the query string are ignored.
+        - **GET Callbacks** (`?payment_id=...`): Satispay GET callbacks (e.g. user return/redirect) do not carry HTTP signatures. An unsigned GET callback is accepted solely as a trigger for a secure server-to-server re-read (`GET /payments/{id}`) authenticated with your merchant RSA private key. The `payment_id` is read from the query string and strictly sanitized to prevent traversal, while all other parameters from the query string are ignored.
 3. **Idempotency**: Because both the redirect callback and the webhook notification may arrive for the same order, ensure your fulfillment handler is idempotent.
 
 ---
@@ -226,7 +226,7 @@ checkout.events
   .on('payment.completed', ({ provider, paymentId, orderId, raw }) => { /* ... */ })
   .on('payment.failed',    ({ provider, error, orderId, raw })     => { /* ... */ })
   .on('payment.refunded',  ({ provider, paymentId, orderId, raw }) => { /* ... */ })
-  .on('webhook.received',  ({ provider, data, orderId, raw })      => { /* ... */ });
+  .on('webhook.received',  ({ provider, paymentId, orderId, status, error, verified, data, raw }) => { /* ... */ });
 ```
 
 ---

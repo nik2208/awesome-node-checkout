@@ -4,7 +4,7 @@ import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult, WebhookResult } from '../../models/payment-result.model';
 import { ITransactionStore } from '../../interfaces/transaction-store.interface';
 import { InMemoryTransactionStore } from '../../stores/in-memory-transaction.store';
-import { parseAmountFromCents } from '../../utils/parsing.util';
+import { parseAmountFromCents, parseNexiCurrency } from '../../utils/parsing.util';
 
 export interface SatispayProviderConfig {
   keyId: string;
@@ -376,9 +376,10 @@ export class SatispayProvider extends BasePaymentProvider {
         `${this.apiUrl}/payments/${encodeURIComponent(paymentId)}`,
       );
       const amount = parseAmountFromCents(payment['amount_unit']);
-      const currency = payment['currency'] as string | undefined;
+      const currencyRaw = payment['currency'];
+      const currency = parseNexiCurrency(currencyRaw) ?? (typeof currencyRaw === 'string' && currencyRaw.trim() !== '' ? currencyRaw.trim() : undefined);
       const status = payment['status'] as string | undefined;
-      const isAccepted = status === 'ACCEPTED' && amount !== undefined && amount > 0 && !!currency && currency.trim() !== '';
+      const isAccepted = status === 'ACCEPTED' && amount !== undefined && amount > 0 && !!currency;
 
       return {
         success: isAccepted,
@@ -453,7 +454,7 @@ export class SatispayProvider extends BasePaymentProvider {
 
     if (!isGetOrHead) {
       if (!this.verifyWebhookSignature(body, headers, context)) {
-        return { success: false, error: 'Webhook signature verification failed' };
+        return { success: false, verified: false, error: 'Webhook signature verification failed' };
       }
     }
 
@@ -462,10 +463,10 @@ export class SatispayProvider extends BasePaymentProvider {
       ? query['payment_id']
       : (b['payment_id'] ?? b['id'] ?? query['payment_id']);
     if (!rawId) {
-      return { success: false, error: 'Missing payment_id in webhook body or query' };
+      return { success: false, verified: false, error: 'Missing payment_id in webhook body or query' };
     }
     if (!this.isValidPaymentId(rawId)) {
-      return { success: false, error: 'Invalid payment ID format' };
+      return { success: false, verified: false, error: 'Invalid payment ID format' };
     }
     const paymentId = rawId;
 
@@ -475,13 +476,15 @@ export class SatispayProvider extends BasePaymentProvider {
         `${this.apiUrl}/payments/${encodeURIComponent(paymentId)}`,
       );
       const amount = parseAmountFromCents(payment['amount_unit']);
-      const currency = payment['currency'] as string | undefined;
+      const currencyRaw = payment['currency'];
+      const currency = parseNexiCurrency(currencyRaw) ?? (typeof currencyRaw === 'string' && currencyRaw.trim() !== '' ? currencyRaw.trim() : undefined);
       const status = payment['status'] as string | undefined;
-      const isAccepted = status === 'ACCEPTED' && amount !== undefined && amount > 0 && !!currency && currency.trim() !== '';
+      const isAccepted = status === 'ACCEPTED' && amount !== undefined && amount > 0 && !!currency;
       const orderId = (payment['external_code'] as string) || undefined;
 
       return {
         success: isAccepted,
+        verified: true,
         paymentId: payment['id'] as string,
         orderId,
         status: status ?? 'UNKNOWN',
@@ -504,7 +507,7 @@ export class SatispayProvider extends BasePaymentProvider {
       if (error instanceof SyntaxError || /JSON|Unexpected token/i.test(msg)) {
         msg = 'Invalid provider response';
       }
-      return { success: false, paymentId, error: msg };
+      return { success: false, verified: false, paymentId, error: msg };
     }
   }
 

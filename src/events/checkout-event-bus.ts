@@ -11,6 +11,7 @@ export interface CheckoutEventPayload {
   orderId?: string;
   status?: string;
   error?: string;
+  verified?: boolean;
   data?: any;
   raw?: unknown;
   timestamp: Date;

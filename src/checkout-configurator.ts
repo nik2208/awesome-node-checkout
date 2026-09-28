@@ -189,24 +189,46 @@ export class CheckoutConfigurator {
     const rawAny = result.raw as any;
     const method = context?.method?.toUpperCase();
     const isGetOrHead = method === 'GET' || method === 'HEAD';
-    const orderId =
-      result.orderId ??
-      (!isGetOrHead ? (rawAny?.orderId ?? rawAny?.order_id) : undefined) ??
-      rawAny?.external_code ??
-      rawAny?.codTrans ??
-      (!isGetOrHead ? query?.order_id : undefined) ??
-      (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined);
+    const isNexi = providerName.toLowerCase() === 'nexi';
+    const isVerified = result.verified ?? result.success;
 
-    if (orderId && !result.orderId) {
-      result.orderId = orderId;
+    let orderId: string | undefined;
+    if (isVerified) {
+      if (isNexi) {
+        // For Nexi, orderId only from local map or codTrans (which is MAC-covered), never unsigned body or query
+        orderId =
+          (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined) ??
+          rawAny?.codTrans ??
+          result.orderId;
+        result.orderId = orderId;
+      } else {
+        orderId =
+          (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined) ??
+          result.orderId ??
+          (!isGetOrHead ? (rawAny?.orderId ?? rawAny?.order_id) : undefined) ??
+          rawAny?.external_code ??
+          (!isGetOrHead ? query?.order_id : undefined);
+        if (orderId) {
+          result.orderId = orderId;
+        }
+      }
+    } else {
+      // When verification failed, do not populate orderId from query or unsigned body fields
+      orderId = undefined;
+      result.orderId = undefined;
+    }
+
+    if (result.verified === undefined) {
+      result.verified = isVerified;
     }
 
     await this.emit('webhook.received', {
       provider: providerName,
       paymentId: result.paymentId,
-      orderId,
+      orderId: result.orderId,
       status: result.status,
       error: result.error,
+      verified: isVerified,
       data: body ?? query,
       raw: result.raw,
     });

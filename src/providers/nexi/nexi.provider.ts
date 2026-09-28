@@ -237,7 +237,7 @@ export class NexiProvider extends BasePaymentProvider {
   ): Promise<WebhookResult> {
     try {
       if (!body) {
-        return { success: false, error: 'MAC verification failed' };
+        return { success: false, verified: false, error: 'MAC verification failed' };
       }
       const f = (k: string) => String(body?.[k] ?? '');
       const codTrans = f('codTrans');
@@ -252,6 +252,7 @@ export class NexiProvider extends BasePaymentProvider {
       if (!this.isValidHexMac(mac) || !this.safeVerifyResponseMac(codTrans, esito, importo, divisa, dataStr, orario, codAut, mac)) {
         return {
           success: false,
+          verified: false,
           paymentId: codTrans || undefined,
           error: 'MAC verification failed',
         };
@@ -263,7 +264,9 @@ export class NexiProvider extends BasePaymentProvider {
 
       return {
         success: isPaid,
+        verified: true,
         paymentId: codTrans,
+        orderId: codTrans,
         status: esito === 'OK' ? 'COMPLETED' : 'FAILED',
         amount,
         currency,
@@ -280,7 +283,7 @@ export class NexiProvider extends BasePaymentProvider {
             }),
       };
     } catch (error) {
-      return { success: false, error: 'MAC verification failed' };
+      return { success: false, verified: false, error: 'MAC verification failed' };
     }
   }
 
@@ -302,7 +305,7 @@ export class NexiProvider extends BasePaymentProvider {
         body: JSON.stringify(requestBody),
       });
 
-      if (!response.ok) throw new Error(`Nexi API error: ${response.statusText}`);
+      if (!response.ok) throw new Error(`Nexi API error: HTTP ${response.status}`);
       let result: Record<string, unknown>;
       try {
         result = (await response.json()) as Record<string, unknown>;
@@ -412,7 +415,7 @@ export class NexiProvider extends BasePaymentProvider {
         body: new URLSearchParams(params),
       });
 
-      if (!response.ok) throw new Error(`Nexi API error: ${response.statusText}`);
+      if (!response.ok) throw new Error(`Nexi API error: HTTP ${response.status}`);
       let result: Record<string, unknown>;
       try {
         result = (await response.json()) as Record<string, unknown>;

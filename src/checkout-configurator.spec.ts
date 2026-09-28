@@ -137,6 +137,7 @@ describe('CheckoutConfigurator', () => {
             orderId: undefined,
             status: 'WEBHOOK',
             error: undefined,
+            verified: true,
             data: { id: 'evt-1' },
             raw: { id: 'evt-1' },
         });
@@ -161,6 +162,7 @@ describe('CheckoutConfigurator', () => {
             orderId: undefined,
             status: 'WEBHOOK',
             error: undefined,
+            verified: true,
             data: { payment_id: 'X' },
             raw: { payment_id: 'X' },
         });

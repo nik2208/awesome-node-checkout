@@ -155,10 +155,16 @@ export function createCheckoutRouter(
       const provider = String(req.params.provider);
       let paymentRequest: PaymentRequest;
       if (options.buildPaymentRequest) {
-        const customReq = await options.buildPaymentRequest(req, {
-          provider,
-          res,
-        });
+        let customReq: PaymentRequest | null | undefined;
+        try {
+          customReq = await options.buildPaymentRequest(req, {
+            provider,
+            res,
+          });
+        } catch (consumerErr) {
+          sendError(res, consumerErr, false);
+          return;
+        }
 
         if (res.headersSent) {
           return;
@@ -207,7 +213,7 @@ export function createCheckoutRouter(
       const { raw, ...safeResult } = result;
       res.status(result.success ? 201 : 400).json(safeResult);
     } catch (err) {
-      sendError(res, err);
+      sendError(res, err, true);
     }
   });
 
@@ -220,13 +226,18 @@ export function createCheckoutRouter(
     try {
       const { paymentId, data } = req.body as { paymentId: string; data?: any };
       if (options.execute?.onBeforeExecute) {
-        await options.execute.onBeforeExecute(req, paymentId);
+        try {
+          await options.execute.onBeforeExecute(req, paymentId);
+        } catch (consumerErr) {
+          sendError(res, consumerErr, false);
+          return;
+        }
       }
       const result = await checkout.executePayment(String(req.params.provider), paymentId, data);
       const { raw, ...safeResult } = result;
       res.status(result.success ? 200 : 400).json(safeResult);
     } catch (err) {
-      sendError(res, err);
+      sendError(res, err, true);
     }
   });
 
@@ -243,7 +254,7 @@ export function createCheckoutRouter(
         const { raw, ...safeResult } = result;
         res.status(result.success ? 200 : 400).json(safeResult);
       } catch (err) {
-        sendError(res, err);
+        sendError(res, err, true);
       }
     });
   }
@@ -266,7 +277,7 @@ export function createCheckoutRouter(
       const { raw, ...safeResult } = result;
       res.status(result.success ? 200 : 400).json(safeResult);
     } catch (err) {
-      sendError(res, err);
+      sendError(res, err, true);
     }
   };
 
@@ -278,22 +289,30 @@ export function createCheckoutRouter(
   // NOTE: must be defined BEFORE /:provider/:id to avoid "redirect" being
   // treated as a paymentId.
   router.get('/:provider/redirect', async (req: Request, res: Response) => {
+    let result: PaymentResult;
     try {
-      const result = await checkout.handleRedirect(
+      result = await checkout.handleRedirect(
         String(req.params.provider),
         req.query as Record<string, string>,
       );
-      if (options.redirect) {
-        const targetUrl = result.success
+    } catch (err) {
+      sendError(res, err, true);
+      return;
+    }
+    if (options.redirect) {
+      let targetUrl: string;
+      try {
+        targetUrl = result.success
           ? options.redirect.onSuccess(result, req)
           : options.redirect.onFailure(result, req);
-        return res.redirect(302, targetUrl);
+      } catch (consumerErr) {
+        sendError(res, consumerErr, false);
+        return;
       }
-      const { raw, ...safeResult } = result;
-      res.status(result.success ? 200 : 400).json(safeResult);
-    } catch (err) {
-      sendError(res, err);
+      return res.redirect(302, targetUrl);
     }
+    const { raw, ...safeResult } = result;
+    res.status(result.success ? 200 : 400).json(safeResult);
   });
 
   // ---- GET /:provider/:id — get payment details ----------------------------
@@ -310,7 +329,7 @@ export function createCheckoutRouter(
       const { raw, ...safeResult } = result;
       res.status(result.success ? 200 : 404).json(safeResult);
     } catch (err) {
-      sendError(res, err);
+      sendError(res, err, true);
     }
   });
 
@@ -321,7 +340,7 @@ export function createCheckoutRouter(
 // Helpers
 // ---------------------------------------------------------------------------
 
-function sendError(res: Response, err: unknown): void {
+function sendError(res: Response, err: unknown, isProvider = true): void {
   if (res.headersSent) return;
   if (err instanceof CheckoutError) {
     const statusMap: Record<string, number> = {
@@ -333,7 +352,7 @@ function sendError(res: Response, err: unknown): void {
     res.status(status).json({ success: false, error: err.message, code: err.code });
   } else {
     let message = err instanceof Error ? err.message : 'Internal server error';
-    if (err instanceof SyntaxError || /JSON|Unexpected token/i.test(message)) {
+    if (isProvider && (err instanceof SyntaxError || /JSON|Unexpected token/i.test(message))) {
       message = 'Invalid provider response';
     }
     res.status(500).json({ success: false, error: message });

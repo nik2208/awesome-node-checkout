@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.4] - 2026-09-28
+
+### Security
+- **Nexi**: Strictly prevented unsigned extra body fields (`orderId`/`order_id`) from overwriting `orderId` in webhook responses and `webhook.received` events; `orderId` is strictly resolved from MAC-covered `codTrans` or the local transaction map. Resolves #23.
+- **Core**: Prevented untrusted query parameter `order_id` from populating `orderId` in webhook results and `webhook.received` events when callback verification fails. Resolves #23.
+- **Nexi**: Removed HTTP reason phrase (`response.statusText`) from error responses in `getPaymentDetails` and `refundPayment` to prevent upstream provider status phrase leakage. Resolves #23.
+- **Express Adapter**: Limited unhandled JSON parse error masking (`'Invalid provider response'`) strictly to provider errors, allowing consumer hook errors (`buildPaymentRequest`, `onBeforeExecute`, `options.redirect`) to bubble without alteration. Resolves #23.
+
+### Added
+- **Core & Events**: Added `verified: boolean` flag to `WebhookResult` and `webhook.received` event payload, distinguishing callbacks authenticated via cryptographic signature/MAC or server-to-server API re-read from unauthenticated callbacks or legitimate cancellations (e.g. genuine `CANCELED`). Resolves #23.
+
+### Fixed
+- **Satispay**: Safely handled numeric ISO-4217 currency codes (e.g. `978` -> `EUR`) without throwing `TypeError: currency.trim is not a function`. Resolves #23.
+- **Documentation**: Clarified that `payment_id` is extracted from query parameters in GET callbacks while other query parameters are ignored, and documented all `webhook.received` event payload fields in README. Resolves #23.
+
 ## [1.2.3] - 2026-09-28
 
 ### Security
@@ -14,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Core**: Hardened `parseAmount` and `parseAmountFromCents` to reject negative numbers (returning `undefined`). Resolves #21.
-- **Providers**: Enforced that `success` is strictly `false` when amount is ≤ 0 or currency is missing across all providers (Satispay, Nexi, PayPal), returning `'Payment amount or currency is missing or invalid'`. Resolves #21.
+- **Providers**: Enforced that `success` is strictly `false` when amount is ≤ 0 or currency is missing across all providers (Satispay, Nexi, PayPal), returning `'Payment amount is missing or invalid'` or `'Payment currency is missing or invalid'`. Resolves #21.
 - **Documentation**: Corrected README line 188 example to gate order fulfillment check directly on `result.success`. Resolves #21.
 
 ## [1.2.2] - 2026-09-28

@@ -5,7 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-09-29
+
+### Breaking
+- **Custom `IPaymentProvider` implementations must authenticate their outcomes.** Redirect, webhook and execute outcomes from a provider that does not set `verified: true` now fail closed: `success: false`, `verified: false`, no `paymentId`/`orderId`, error `'Payment outcome could not be verified'`.
+- **`orderId` is no longer read from the query or unsigned body fields.** The configurator no longer reads `query.order_id`, `raw.orderId` or `raw.external_code`: a provider that relied on this must return `orderId` itself.
+- **Listener errors are wrapped.** Direct API callers now receive `CheckoutListenerError`; the original value is in `cause`.
+- Released as a minor version because these paths were the security holes fixed here (#27). The built-in Nexi, PayPal and Satispay providers are updated.
+
 
 ### Security
 - **Nexi Execute**: `executePayment` is keyed on the MAC-covered `codTrans`: result `paymentId`/`orderId`, the local order lookup and the emitted event no longer use the caller's `paymentId`. A non-empty `paymentId` argument different from the outcome's `codTrans` now fails (`success: false`, `verified: false`, error `'Payment id does not match the outcome'`) and emits `payment.failed`, never `payment.completed`. The configurator applies the same check to every provider's execute outcome. Resolves #27.

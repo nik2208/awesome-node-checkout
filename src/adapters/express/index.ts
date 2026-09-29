@@ -3,6 +3,7 @@ import { CheckoutConfigurator } from '../../checkout-configurator';
 import { CheckoutError } from '../../models/errors';
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult } from '../../models/payment-result.model';
+import { CheckoutListenerError } from '../../events/checkout-event-bus';
 
 export interface PaymentRequestContext {
   provider: string;
@@ -342,7 +343,11 @@ export function createCheckoutRouter(
 
 function sendError(res: Response, err: unknown, isProvider = true): void {
   if (res.headersSent) return;
-  const isListenerError = !!(err && typeof err === 'object' && (err as any).__isEventListenerError);
+  const isListenerError = err instanceof CheckoutListenerError;
+  if (err instanceof CheckoutListenerError && err.cause instanceof CheckoutError) {
+    // A listener that throws a CheckoutError keeps its status mapping
+    err = err.cause;
+  }
   if (err instanceof CheckoutError) {
     const statusMap: Record<string, number> = {
       PROVIDER_NOT_FOUND: 404,

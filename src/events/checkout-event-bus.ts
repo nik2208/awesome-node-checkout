@@ -11,11 +11,38 @@ export interface CheckoutEventPayload {
   orderId?: string;
   status?: string;
   error?: string;
-  /** True when the transaction / notification authenticity was verified */
+  /**
+   * True only when the outcome reported by this event was authenticated, either by a
+   * provider signature/MAC checked by the library or by an authenticated server-to-server
+   * read from the provider API. Always false for `payment.created` (no outcome exists yet)
+   * and for any outcome built from unauthenticated input. When false on
+   * `payment.completed` / `payment.failed` / `webhook.received`, `paymentId` and `orderId`
+   * are omitted.
+   */
   verified: boolean;
   data?: any;
   raw?: unknown;
   timestamp: Date;
+}
+
+/**
+ * Wraps an error thrown (or a value rejected) by a consumer event listener.
+ * The consumer's original value is never mutated: it is available unchanged as `cause`,
+ * and `message` is copied from it (or `String(value)` for non-Error values).
+ */
+export class CheckoutListenerError extends Error {
+  /** The original value thrown by the listener, untouched */
+  readonly cause: unknown;
+  /** The event whose listener threw */
+  readonly event: CheckoutEventName;
+
+  constructor(event: CheckoutEventName, cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = 'CheckoutListenerError';
+    this.cause = cause;
+    this.event = event;
+    Object.setPrototypeOf(this, CheckoutListenerError.prototype);
+  }
 }
 
 type EventListener = (payload: CheckoutEventPayload) => void | Promise<void>;
@@ -58,14 +85,8 @@ export class CheckoutEventBus {
         try {
           await h(fullPayload);
         } catch (err) {
-          if (err && typeof err === 'object') {
-            (err as any).__isEventListenerError = true;
-            throw err;
-          }
-          const wrapped = new Error(String(err));
-          (wrapped as any).__isEventListenerError = true;
-          (wrapped as any).originalError = err;
-          throw wrapped;
+          // Never mutate the consumer's error (it may be frozen): wrap it instead.
+          throw new CheckoutListenerError(event, err);
         }
       }),
     );

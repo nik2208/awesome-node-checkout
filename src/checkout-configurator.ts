@@ -95,6 +95,33 @@ export class CheckoutConfigurator {
     return Array.from(this.providers.keys());
   }
 
+  /**
+   * Normalizes a callback / redirect / execute outcome according to the single meaning of
+   * `verified` ("the outcome was authenticated by a signature/MAC or by an authenticated
+   * read from the provider API"):
+   * - `verified` is `true` only when the provider explicitly set it to `true` (fail closed);
+   * - an unverified outcome never reports `success: true`, and carries no `paymentId` / `orderId`;
+   * - a verified outcome takes `orderId` from the local paymentId -> orderId map (keyed on the
+   *   provider-authenticated `paymentId`) or from the provider's own `orderId`, never from the
+   *   request query or from unsigned body fields, whatever name the provider is registered under.
+   */
+  private normalizeOutcome<T extends PaymentResult | WebhookResult>(result: T): T & { verified: boolean } {
+    const verified = result.verified === true;
+    if (!verified) {
+      result.paymentId = undefined;
+      result.orderId = undefined;
+      if (result.success) {
+        result.success = false;
+        result.error = result.error ?? 'Payment outcome could not be verified';
+      }
+    } else {
+      result.orderId =
+        (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined) ?? result.orderId;
+    }
+    result.verified = verified;
+    return result as T & { verified: boolean };
+  }
+
   /** Create a new payment via the specified provider */
   async createPayment(providerName: string, request: PaymentRequest): Promise<PaymentResult> {
     const provider = this.getProvider(providerName);
@@ -109,31 +136,49 @@ export class CheckoutConfigurator {
       orderId: request.orderId,
       status: result.status,
       error: result.error,
-      verified: result.success,
+      // Creation reports no payment outcome: nothing has been authenticated yet.
+      verified: false,
       raw: result.raw,
     });
     return result;
   }
 
-  /** Execute/capture a previously created payment */
+  /**
+   * Execute/capture a previously created payment.
+   * The result and the emitted event are keyed on the `paymentId` authenticated by the
+   * provider (e.g. the MAC-covered Nexi `codTrans`), never on the caller's argument.
+   * When a non-empty `paymentId` argument differs from the authenticated one, the call fails
+   * with `success: false`, `verified: false`, error `'Payment id does not match the outcome'`.
+   */
   async executePayment(
     providerName: string,
     paymentId: string,
     data?: Record<string, string>,
   ): Promise<PaymentResult> {
     const provider = this.getProvider(providerName);
-    const result = await provider.executePayment(paymentId, data);
-    const orderId = this.paymentOrders.get(paymentId);
-    if (orderId && !result.orderId) {
-      result.orderId = orderId;
+    let result = await provider.executePayment(paymentId, data);
+    if (
+      result.verified === true &&
+      typeof paymentId === 'string' &&
+      paymentId !== '' &&
+      result.paymentId !== paymentId
+    ) {
+      result = {
+        success: false,
+        verified: false,
+        status: 'FAILED',
+        error: 'Payment id does not match the outcome',
+        raw: result.raw,
+      };
     }
+    this.normalizeOutcome(result);
     await this.emit(result.success ? 'payment.completed' : 'payment.failed', {
       provider: providerName,
-      paymentId,
-      orderId,
+      paymentId: result.paymentId,
+      orderId: result.orderId,
       status: result.status,
       error: result.error,
-      verified: result.success,
+      verified: result.verified === true,
       raw: result.raw,
     });
     return result;
@@ -163,7 +208,7 @@ export class CheckoutConfigurator {
       orderId,
       status: result.status,
       error: result.error,
-      verified: result.success,
+      verified: result.verified === true,
       raw: result.raw,
     });
     return result;
@@ -189,41 +234,7 @@ export class CheckoutConfigurator {
       );
     }
     const result = await provider.handleWebhook(body, headers, query, context);
-    const rawAny = result.raw as any;
-    const method = context?.method?.toUpperCase();
-    const isGetOrHead = method === 'GET' || method === 'HEAD';
-    const isNexi = providerName.toLowerCase() === 'nexi';
-    const isVerified = result.verified ?? result.success;
-
-    let orderId: string | undefined;
-    if (isVerified) {
-      if (isNexi) {
-        // For Nexi, orderId only from local map or codTrans (which is MAC-covered), never unsigned body or query
-        orderId =
-          (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined) ??
-          rawAny?.codTrans ??
-          result.orderId;
-        result.orderId = orderId;
-      } else {
-        orderId =
-          (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined) ??
-          result.orderId ??
-          (!isGetOrHead ? (rawAny?.orderId ?? rawAny?.order_id) : undefined) ??
-          rawAny?.external_code ??
-          (!isGetOrHead ? query?.order_id : undefined);
-        if (orderId) {
-          result.orderId = orderId;
-        }
-      }
-    } else {
-      // When verification failed, do not populate orderId from query or unsigned body fields
-      orderId = undefined;
-      result.orderId = undefined;
-    }
-
-    if (result.verified === undefined) {
-      result.verified = isVerified;
-    }
+    this.normalizeOutcome(result);
 
     await this.emit('webhook.received', {
       provider: providerName,
@@ -231,7 +242,7 @@ export class CheckoutConfigurator {
       orderId: result.orderId,
       status: result.status,
       error: result.error,
-      verified: isVerified,
+      verified: result.verified,
       data: body ?? query,
       raw: result.raw,
     });
@@ -255,37 +266,15 @@ export class CheckoutConfigurator {
       );
     }
     const result = await provider.handleRedirect(query);
-    const isNexi = providerName.toLowerCase() === 'nexi';
-    let orderId: string | undefined;
-
-    if (result.success) {
-      if (isNexi) {
-        // For Nexi, orderId only from local map or codTrans (MAC-covered), never unsigned query order_id
-        orderId =
-          (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined) ??
-          query?.codTrans ??
-          result.orderId;
-      } else {
-        orderId =
-          (result.paymentId ? this.paymentOrders.get(result.paymentId) : undefined) ??
-          result.orderId ??
-          query?.order_id ??
-          query?.codTrans;
-      }
-      result.orderId = orderId;
-    } else {
-      // On failed verification or failed payment, never take orderId from query
-      orderId = undefined;
-      result.orderId = undefined;
-    }
+    this.normalizeOutcome(result);
 
     await this.emit(result.success ? 'payment.completed' : 'payment.failed', {
       provider: providerName,
       paymentId: result.paymentId,
-      orderId,
+      orderId: result.orderId,
       status: result.status,
       error: result.error,
-      verified: result.success,
+      verified: result.verified === true,
       raw: result.raw,
     });
     return result;

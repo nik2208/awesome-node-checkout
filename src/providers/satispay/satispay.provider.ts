@@ -392,6 +392,8 @@ export class SatispayProvider extends BasePaymentProvider {
 
       return {
         success: isAccepted,
+        // Outcome read from the Satispay API with a request signed by the merchant key
+        verified: true,
         paymentId: payment['id'] as string,
         status: status ?? 'UNKNOWN',
         amount,
@@ -431,6 +433,7 @@ export class SatispayProvider extends BasePaymentProvider {
       );
       return {
         success: true,
+        verified: true,
         paymentId: refund['id'] as string,
         status: refund['status'] as string,
         raw: refund,
@@ -544,13 +547,31 @@ export class SatispayProvider extends BasePaymentProvider {
 
     const details = await this.getPaymentDetails(transaction.paymentId);
 
+    const verified = details.verified === true;
+    // orderId comes from the authenticated API record (external_code) or the local
+    // transaction store, never from the redirect query.
+    const apiOrderId =
+      typeof details.raw?.external_code === 'string' && details.raw.external_code !== ''
+        ? (details.raw.external_code as string)
+        : undefined;
+    if (verified && apiOrderId !== undefined && transaction.orderId && apiOrderId !== transaction.orderId) {
+      return {
+        success: false,
+        verified: false,
+        status: 'FAILED',
+        error: 'Order id does not match the outcome',
+      };
+    }
+
     if (details.success && details.status === 'ACCEPTED') {
       await this.transactionStore.delete(orderId);
     }
 
     return {
       success: details.success && details.status === 'ACCEPTED',
-      paymentId: details.paymentId,
+      verified,
+      paymentId: verified ? details.paymentId : undefined,
+      orderId: verified ? (apiOrderId ?? transaction.orderId) : undefined,
       status: details.status,
       amount: details.amount,
       currency: details.currency,

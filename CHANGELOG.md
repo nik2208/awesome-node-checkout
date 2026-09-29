@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-09-29
+
+### Breaking
+- **Custom `IPaymentProvider` implementations must authenticate their outcomes.** Redirect, webhook and execute outcomes from a provider that does not set `verified: true` now fail closed: `success: false`, `verified: false`, no `paymentId`/`orderId`, error `'Payment outcome could not be verified'`.
+- **`orderId` is no longer read from the query or unsigned body fields.** The configurator no longer reads `query.order_id`, `raw.orderId` or `raw.external_code`: a provider that relied on this must return `orderId` itself.
+- **Listener errors are wrapped.** Direct API callers now receive `CheckoutListenerError`; the original value is in `cause`.
+- Released as a minor version because these paths were the security holes fixed here (#27). The built-in Nexi, PayPal and Satispay providers are updated.
+
+
+### Security
+- **Nexi Execute**: `executePayment` is keyed on the MAC-covered `codTrans`: result `paymentId`/`orderId`, the local order lookup and the emitted event no longer use the caller's `paymentId`. A non-empty `paymentId` argument different from the outcome's `codTrans` now fails (`success: false`, `verified: false`, error `'Payment id does not match the outcome'`) and emits `payment.failed`, never `payment.completed`. The configurator applies the same check to every provider's execute outcome. Resolves #27.
+- **Core (orderId)**: No provider takes `orderId` from the query string of a redirect or callback, or from unsigned body fields (`orderId`, `order_id`, `external_code`): `orderId` comes only from the local `paymentId -> orderId` map (keyed on the provider-authenticated `paymentId`) or from the provider's authenticated outcome. Covers the PayPal redirect, Satispay unsigned POST without `webhookPublicKey`, and Nexi under any registration name (the rule no longer depends on the provider being registered as `nexi`). Resolves #27.
+- **Core (verified)**: Unverified callback/redirect/execute outcomes carry no `paymentId`/`orderId` and never report `success: true`; a provider outcome counts as verified only when the provider sets `verified: true` (fail closed). Resolves #27.
+
+### Changed
+- **`verified` semantics**: one documented meaning on `PaymentResult`, `WebhookResult` and all events: the outcome was authenticated by a signature/MAC or by an authenticated read from the provider API. `payment.created` (and `payment.failed` from `createPayment`) is now always `verified: false`; redirect/execute outcomes with a valid MAC and `esito=KO` are `verified: true` with an error, like webhooks; `payment.refunded` reflects the provider's `verified` (PayPal/Satispay API response `true`, Nexi `false`). `PaymentResult` gains an optional `verified` field set by the built-in providers. Custom providers must now set `verified: true` on authenticated outcomes. Resolves #27.
+- **Event bus**: errors thrown by listeners are wrapped in the new exported `CheckoutListenerError` (`message` copied, original value in `cause`, `event` name) instead of being mutated; direct API callers now receive the wrapper. Resolves #27.
+- **Satispay Redirect**: `handleRedirect` returns `orderId` from the authenticated API `external_code` or the local transaction store (previously it was filled by the configurator from the query). Resolves #27.
+
+### Fixed
+- **Event bus**: frozen or non-extensible listener errors keep their message (previously replaced by `Cannot add property __isEventListenerError, object is not extensible`). Resolves #27.
+- **Currency**: `parseIsoCurrency`/`parseNexiCurrency` (used by Satispay and Nexi) check alpha-3 codes against the ISO 4217 list of active currencies (`ISO_4217_ALPHA3_CODES`, from ISO 4217 List One published 2026-09-17, non-monetary codes excluded); `'XYZ'` and `'ABC'` are rejected. Resolves #27.
+- **Documentation**: README `verified`/`paymentId`/`orderId` statements aligned with the behaviour, with a per-event `verified` table. Resolves #27.
+
 ## [1.2.5] - 2026-09-28
 
 ### Security

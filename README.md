@@ -229,13 +229,29 @@ checkout.events
   .on('webhook.received',  ({ provider, paymentId, orderId, status, error, verified, data, raw }) => { /* ... */ });
 ```
 
-### Understanding `verified` vs `error` in `WebhookResult` and Events
+An error thrown by a listener propagates to the caller wrapped in a `CheckoutListenerError` (exported): its `message` is the original message (or `String(value)` for non-Error values), `cause` is the original value, untouched (frozen errors are fine), and `event` is the event name. The Express adapter answers `500` with that message.
 
-The `verified: boolean` field indicates whether the incoming request was verified as authentic:
-- **`verified: true`**: The notification was cryptographically verified (e.g. Nexi 7-field outcome MAC or Satispay HTTP Signature) or verified via authenticated server-to-server API re-read.
-  - A genuine cancellation or failed payment (e.g. user canceled on gateway, card declined) has `verified: true, success: false, error: 'Payment is CANCELED'` or `error: 'Payment failed with outcome KO'`.
-- **`verified: false`**: The signature/MAC was missing, tampered with, or invalid. The payload is untrusted.
-  - In this case, `success: false, verified: false, error: 'MAC verification failed'` (or `'Webhook signature verification failed'`), and `orderId` / `paymentId` from untrusted query/body are stripped to prevent parameter injection attacks.
+Currencies are validated against the ISO 4217 list of active alpha-3 codes (`ISO_4217_ALPHA3_CODES`, plus the mapped Nexi numeric codes such as `978`); shape-only codes like `'XYZ'` or `'ABC'` and non-monetary codes (`XXX`, `XTS`, precious metals) are rejected.
+
+### Understanding `verified` vs `error` in Results and Events
+
+`verified` has one meaning everywhere (`PaymentResult`, `WebhookResult` and every event payload):
+
+> **`verified: true` means the outcome was authenticated**, either by a provider signature/MAC checked by the library (Nexi 7-field outcome MAC, Satispay HTTP Signature) or by an authenticated server-to-server read from the provider API (PayPal capture/order read with OAuth credentials, Satispay `GET /payments/{id}` signed with the merchant key). Anything else is `verified: false`.
+
+- `success` and `verified` are independent: a genuine cancellation or failed payment (user canceled, card declined) is `verified: true, success: false` with `error: 'Payment is CANCELED'` or `error: 'Payment failed with outcome KO'`. This holds for webhooks, redirects and `executePayment` alike (e.g. a Nexi redirect or execute with `esito=KO` and a valid MAC emits `payment.failed` with `verified: true`).
+- On a callback, redirect or execute outcome with `verified: false` (missing/tampered MAC or signature, failed API read, provider that does not assert `verified: true`), the result and the event carry **no `paymentId` and no `orderId`**, and `success` is always `false` (error e.g. `'MAC verification failed'`, `'Webhook signature verification failed'`, `'Payment outcome could not be verified'`).
+- `orderId` is never taken from the query string of a redirect or callback, nor from unsigned body fields, for any provider and under any registration name. It comes from the local `paymentId → orderId` map filled by `createPayment` (keyed on the provider-authenticated `paymentId`), or from the provider's authenticated outcome (Nexi MAC-covered `codTrans`, Satispay API `external_code` / transaction store).
+- `executePayment(provider, paymentId, data)` is keyed on the `paymentId` authenticated by the provider (for Nexi the MAC-covered `codTrans`), never on the argument. If a non-empty `paymentId` argument differs from the authenticated one, the call fails with `success: false, verified: false, error: 'Payment id does not match the outcome'` and emits `payment.failed` (never `payment.completed`).
+
+| Event | `verified` |
+|-------|------------|
+| `payment.created` (and `payment.failed` from `createPayment`) | always `false`: creation reports no payment outcome. `paymentId`/`orderId` are the ones you just created. |
+| `payment.completed` / `payment.failed` from `handleRedirect` / `executePayment` | `true` only for a MAC-verified (Nexi) or API-read (PayPal, Satispay) outcome, whatever its `success` |
+| `webhook.received` | `true` only for a MAC/signature-verified notification or an authenticated API re-read |
+| `payment.refunded` | `true` when the refund outcome comes from an authenticated provider API response (PayPal, Satispay); `false` for Nexi, whose refund response carries no MAC checked by the library |
+
+Custom providers must set `verified: true` on the outcomes they have authenticated; an outcome without it is treated as unverified.
 
 #### Satispay `verified` Semantics
 - **With `webhookPublicKey` configured**: Inbound POST webhooks must carry a valid HTTP Signature matching Satispay's RSA public key, correct SHA-256 body digest, and fresh `Date` header. `verified: true` guarantees cryptographic authenticity.
@@ -284,7 +300,9 @@ export class StripeProvider extends BasePaymentProvider {
   // ... implement other methods
 
   async handleRedirect(query: Record<string, any>): Promise<PaymentResult> {
-    // ... handle Stripe redirect
+    // ... handle Stripe redirect: re-read the session from the Stripe API and
+    // return { success, verified: true, paymentId, orderId, amount, currency }
+    // only for an authenticated outcome (see "Understanding `verified`")
   }
 }
 

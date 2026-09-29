@@ -112,6 +112,8 @@ export class PayPalProvider extends BasePaymentProvider {
 
       return {
         success: isCaptureCompleted,
+        // Outcome read from the PayPal API over the OAuth-authenticated server-to-server channel
+        verified: true,
         paymentId: order.id as string,
         status,
         captureStatus,
@@ -154,6 +156,8 @@ export class PayPalProvider extends BasePaymentProvider {
 
       return {
         success: isCaptureCompleted,
+        // Outcome read from the PayPal API over the OAuth-authenticated server-to-server channel
+        verified: true,
         paymentId: order.id as string,
         status,
         captureStatus,
@@ -224,6 +228,7 @@ export class PayPalProvider extends BasePaymentProvider {
 
       return {
         success: (refund as any)?.status === 'COMPLETED',
+        verified: true,
         paymentId: String((refund as any)?.id ?? ''),
         status: String((refund as any)?.status ?? ''),
         raw: refund,

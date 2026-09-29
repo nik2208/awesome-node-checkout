@@ -27,6 +27,16 @@ export interface PaymentResult {
   /** Error message if success is false */
   error?: string;
 
+  /**
+   * True only when this outcome was authenticated: by a provider signature/MAC checked by
+   * the library (e.g. the Nexi 7-field outcome MAC) or by an authenticated server-to-server
+   * read from the provider API (e.g. PayPal capture, Satispay `GET /payments/{id}`).
+   * `success: false` with `verified: true` is a genuine, authenticated failure (e.g. KO, CANCELED).
+   * Providers that do not set it are treated as unverified (fail closed).
+   * Not meaningful for `createPayment` (no outcome yet): the configurator does not trust it there.
+   */
+  verified?: boolean;
+
   /** Raw provider response — preserved in events and returned models, stripped from HTTP router responses */
   raw?: any;
 }
@@ -35,7 +45,11 @@ export interface PaymentResult {
 export interface WebhookResult {
   /** True when payment is confirmed/completed with a valid captured amount */
   success: boolean;
-  /** True when the webhook authenticity (signature/MAC or API re-read) was verified */
+  /**
+   * True only when the notification's outcome was authenticated by a provider signature/MAC
+   * or by an authenticated server-to-server read from the provider API. Anything other than
+   * `true` is treated as unverified.
+   */
   verified: boolean;
   paymentId?: string;
   orderId?: string;

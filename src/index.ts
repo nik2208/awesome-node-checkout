@@ -16,7 +16,7 @@ export type { CheckoutErrorCode } from './models/errors';
 export { BasePaymentProvider } from './abstract/base-payment-provider.abstract';
 
 // ---- Events ----------------------------------------------------------------
-export { CheckoutEventBus } from './events/checkout-event-bus';
+export { CheckoutEventBus, CheckoutListenerError } from './events/checkout-event-bus';
 export type { CheckoutEventName, CheckoutEventPayload } from './events/checkout-event-bus';
 
 // ---- Stores ----------------------------------------------------------------
@@ -31,3 +31,6 @@ export type { NexiProviderConfig } from './providers/nexi/nexi.provider';
 
 export { SatispayProvider } from './providers/satispay/satispay.provider';
 export type { SatispayProviderConfig } from './providers/satispay/satispay.provider';
+
+// ---- Utils -----------------------------------------------------------------
+export { ISO_4217_ALPHA3_CODES } from './utils/parsing.util';

@@ -170,11 +170,15 @@ export class NexiProvider extends BasePaymentProvider {
    * Validates the POST-back data from Nexi.
    * `data` is the query/body object sent by Nexi to the returnUrl.
    * The outcome MAC is mandatory and verified over all 7 fields before the result is considered authoritative.
+   * The result (`paymentId`, `orderId`) is keyed on the MAC-covered `codTrans`. When a non-empty
+   * `paymentId` argument is given and differs from the outcome's `codTrans`, the call fails
+   * (`success: false`, `verified: false`): a genuine outcome for one order cannot confirm another.
    */
   async executePayment(paymentId: string, data?: Record<string, string>): Promise<PaymentResult> {
     try {
       const esito: string = data?.esito ?? '';
-      const codTrans: string = data?.codTrans ?? paymentId;
+      const requestedId = typeof paymentId === 'string' && paymentId !== '' ? paymentId : undefined;
+      const codTrans: string = data?.codTrans ?? requestedId ?? '';
       const importo: string = data?.importo ?? '';
       const divisa: string = data?.divisa ?? '';
       const dataStr: string = (data as any)?.data ?? '';
@@ -185,6 +189,7 @@ export class NexiProvider extends BasePaymentProvider {
       if (!mac) {
         return {
           success: false,
+          verified: false,
           paymentId: undefined,
           status: 'FAILED',
           error: 'MAC missing',
@@ -194,9 +199,20 @@ export class NexiProvider extends BasePaymentProvider {
       if (!this.isValidHexMac(mac) || !this.safeVerifyResponseMac(codTrans, esito, importo, divisa, dataStr, orario, codAut, mac)) {
         return {
           success: false,
+          verified: false,
           paymentId: undefined,
           status: 'FAILED',
           error: 'MAC verification failed: response may have been tampered with',
+        };
+      }
+
+      if (requestedId !== undefined && requestedId !== codTrans) {
+        return {
+          success: false,
+          verified: false,
+          paymentId: undefined,
+          status: 'FAILED',
+          error: 'Payment id does not match the outcome',
         };
       }
 
@@ -206,7 +222,9 @@ export class NexiProvider extends BasePaymentProvider {
 
       return {
         success: isPaid,
+        verified: true,
         paymentId: codTrans,
+        orderId: codTrans,
         status: esito === 'OK' ? 'COMPLETED' : 'FAILED',
         amount,
         currency,
@@ -223,7 +241,7 @@ export class NexiProvider extends BasePaymentProvider {
             }),
       };
     } catch (error) {
-      return this.errorResult(error, 'Failed to execute Nexi payment');
+      return { ...this.errorResult(error, 'Failed to execute Nexi payment'), verified: false };
     }
   }
 
@@ -374,6 +392,7 @@ export class NexiProvider extends BasePaymentProvider {
 
       return {
         success: isSuccess,
+        verified: true,
         paymentId,
         status: stato,
         amount,

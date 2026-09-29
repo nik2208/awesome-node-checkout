@@ -13,7 +13,7 @@ class DummyProvider extends BasePaymentProvider {
     return { success: true, paymentId: 'dummy-123', status: 'CREATED', raw: req };
   }
   async executePayment(id: string, data?: any): Promise<PaymentResult> {
-    return { success: true, paymentId: id, status: 'COMPLETED', raw: data };
+    return { success: true, verified: true, paymentId: id, status: 'COMPLETED', raw: data };
   }
   async getPaymentDetails(id: string): Promise<PaymentResult> {
     return { success: true, paymentId: id, status: 'DETAILS', raw: {} };
@@ -26,10 +26,10 @@ class DummyProvider extends BasePaymentProvider {
     headers: Record<string, string> = {},
     query?: Record<string, string>,
   ): Promise<WebhookResult> {
-    return { success: true, paymentId: 'dummy-123', status: 'WEBHOOK', raw: body ?? query };
+    return { success: true, verified: true, paymentId: 'dummy-123', status: 'WEBHOOK', raw: body ?? query };
   }
   async handleRedirect(query: Record<string, any>): Promise<PaymentResult> {
-    return { success: true, paymentId: query.id, status: 'REDIRECT', raw: query };
+    return { success: true, verified: true, paymentId: query.id, status: 'REDIRECT', raw: query };
   }
 }
 
@@ -72,7 +72,8 @@ describe('CheckoutConfigurator', () => {
             orderId: 'ord-123',
             status: 'CREATED',
             error: undefined,
-            verified: true,
+            // payment.created reports no outcome: never verified (issue #27)
+            verified: false,
             raw: req,
         });
     });
@@ -171,7 +172,7 @@ describe('CheckoutConfigurator', () => {
         });
     });
 
-    it('should delegate redirect handling', async () => {
+    it('should delegate redirect handling (query order_id is never trusted, issue #27)', async () => {
         const spyEmit = vi.spyOn(configurator.events, 'emit');
         const result = await configurator.handleRedirect('dummy', { id: 'test-id', order_id: 'ORD-REDIR' });
         expect(result.success).toBe(true);
@@ -179,7 +180,7 @@ describe('CheckoutConfigurator', () => {
         expect(spyEmit).toHaveBeenCalledWith('payment.completed', {
             provider: 'dummy',
             paymentId: 'test-id',
-            orderId: 'ORD-REDIR',
+            orderId: undefined,
             status: 'REDIRECT',
             error: undefined,
             verified: true,

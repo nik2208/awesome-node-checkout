@@ -480,6 +480,55 @@ describe('PayPalProvider mandates (Vault)', () => {
       expect(other.firstCharge.error).toBe('Captured amount does not match');
     });
 
+    it('MANDATE_NOT_VAULTED never emits the vault token id (outcome and mandate.setup_failed)', async () => {
+      const order: any = completedOrder('APPROVED');
+      order.paymentSource.paypal.attributes.vault.id = 'vt_SECRET';
+      order.paymentSource.paypal.attributes.vault.links = [
+        { rel: 'self', href: 'https://api-m.sandbox.paypal.com/v3/vault/payment-tokens/vt_SECRET' },
+      ];
+      sdk.getOrder.mockResolvedValueOnce({ result: approvedOrder() });
+      sdk.captureOrder.mockResolvedValueOnce({ result: order });
+      const checkout = new CheckoutConfigurator();
+      checkout.registerProvider(provider);
+      const events: Array<{ event: string; payload: unknown }> = [];
+      for (const event of ['mandate.setup_failed', 'mandate.created', 'charge.succeeded'] as const) {
+        checkout.events.on(event, (payload: unknown) => {
+          events.push({ event, payload });
+        });
+      }
+      const out = await checkout.confirmMandate('paypal', pending, {});
+      expect(out.error).toBe('MANDATE_NOT_VAULTED');
+      expect(out.terminal).toBe(true);
+      expect(events.map((e) => e.event)).toEqual(['mandate.setup_failed', 'charge.succeeded']);
+      expect(JSON.stringify(events)).not.toContain('vt_SECRET');
+      expect(JSON.stringify(out)).not.toContain('vt_SECRET');
+      expect((out.raw as any).paymentSource.paypal.attributes.vault.id).toBe('[redacted]');
+      expect((out.raw as any).paymentSource.paypal.attributes.vault.status).toBe('APPROVED');
+      // The SDK result is not mutated
+      expect(order.paymentSource.paypal.attributes.vault.id).toBe('vt_SECRET');
+    });
+
+    it('ORDER_NOT_MATCHING and VOIDED never emit a vault token id', async () => {
+      const vault = { attributes: { vault: { id: 'vt_SECRET', status: 'VAULTED' } } };
+      const checkout = new CheckoutConfigurator();
+      checkout.registerProvider(provider);
+      const events: unknown[] = [];
+      checkout.events.on('mandate.setup_failed', (payload: unknown) => {
+        events.push(payload);
+      });
+      sdk.getOrder.mockResolvedValueOnce({
+        result: { ...approvedOrder({ customId: 'OTHER-MANDATE' }), paymentSource: { paypal: vault } },
+      });
+      const notMatching = await checkout.confirmMandate('paypal', pending, {});
+      expect(notMatching.error).toBe('Order does not match the pending setup');
+      sdk.getOrder.mockResolvedValueOnce({ result: { ...approvedOrder({}, 'VOIDED'), paymentSource: { paypal: vault } } });
+      const voided = await checkout.confirmMandate('paypal', pending, {});
+      expect(voided.error).toBe('ORDER_VOIDED');
+      expect(events).toHaveLength(2);
+      expect(JSON.stringify(events)).not.toContain('vt_SECRET');
+      expect(JSON.stringify([notMatching, voided])).not.toContain('vt_SECRET');
+    });
+
     it('a missing vault is MANDATE_NOT_VAULTED', async () => {
       const order = completedOrder();
       delete (order.paymentSource.paypal.attributes as any).vault;
@@ -548,6 +597,55 @@ describe('PayPalProvider mandates (Vault)', () => {
       expect(result.providerCode).toBe('DUPLICATE_INVOICE_ID');
       expect(result.error).toBe('A charge with this chargeRef was already submitted; reconcile it in PayPal');
       expect(JSON.stringify(result)).not.toContain('SECRET-TOKEN');
+    });
+
+    it('ApiError 409 PREVIOUS_REQUEST_IN_PROGRESS gives unknown: the original may still charge', async () => {
+      sdk.createOrder.mockRejectedValueOnce(
+        new ApiError(409, {
+          name: 'RESOURCE_CONFLICT',
+          message: 'The server has detected a conflict while processing this request.',
+          debug_id: 'dbg-1',
+          details: [{ issue: 'PREVIOUS_REQUEST_IN_PROGRESS' }],
+        }),
+      );
+      const result = await provider.chargeMandate(mandate, charge);
+      expect(result.status).toBe('unknown');
+      expect(result.verified).toBe(false);
+      expect(result.providerCode).toBe('PREVIOUS_REQUEST_IN_PROGRESS');
+      expect(result.error).toBe('PayPal charge outcome unknown (HTTP 409 PREVIOUS_REQUEST_IN_PROGRESS)');
+      expect(JSON.stringify(result)).not.toContain('SECRET-TOKEN');
+    });
+
+    it('ApiError 422 PREVIOUS_REQUEST_IN_PROGRESS gives unknown', async () => {
+      sdk.createOrder.mockRejectedValueOnce(apiError(422, 'PREVIOUS_REQUEST_IN_PROGRESS'));
+      const result = await provider.chargeMandate(mandate, charge);
+      expect(result.status).toBe('unknown');
+      expect(result.verified).toBe(false);
+      expect(result.providerCode).toBe('PREVIOUS_REQUEST_IN_PROGRESS');
+    });
+
+    it.each([409, 408])('ApiError %i without a body gives unknown', async (status) => {
+      sdk.createOrder.mockRejectedValueOnce(new ApiError(status));
+      const result = await provider.chargeMandate(mandate, charge);
+      expect(result.status).toBe('unknown');
+      expect(result.verified).toBe(false);
+      expect(result.providerCode).toBe(String(status));
+      expect(result.error).toBe(`PayPal charge outcome unknown (HTTP ${status})`);
+    });
+
+    it('through the configurator, a 409 is unknown and emits charge.unknown', async () => {
+      sdk.createOrder.mockRejectedValueOnce(apiError(409, 'PREVIOUS_REQUEST_IN_PROGRESS'));
+      const checkout = new CheckoutConfigurator();
+      checkout.registerProvider(provider);
+      const events: string[] = [];
+      for (const event of ['charge.unknown', 'charge.failed'] as const) {
+        checkout.events.on(event, () => {
+          events.push(event);
+        });
+      }
+      const result = await checkout.chargeMandate('paypal', mandate, charge);
+      expect(result.status).toBe('unknown');
+      expect(events).toEqual(['charge.unknown']);
     });
 
     it('ApiError 500 gives unknown', async () => {

@@ -38,6 +38,7 @@ import { PaymentResult } from '../../models/payment-result.model';
 import { parseAmount } from '../../utils/parsing.util';
 import { isInvalidAmountError, toMajorString, toMinorUnits } from '../../utils/money';
 import { appendMandateRef } from '../../utils/url';
+import { redactSecret } from '../../utils/redact';
 
 export interface PayPalProviderConfig {
   clientId: string;
@@ -74,6 +75,16 @@ function firstPurchaseUnit(order: unknown): any {
 }
 
 /** First capture of an order's first purchase unit, or undefined. */
+/**
+ * The order with its vault token id scrubbed: used for every outcome that returns no mandate, since
+ * the core redacts only `mandate.providerMandateId` from events. A token that is not `VAULTED`
+ * (yet) may still become usable, so its id never goes out in `raw`.
+ */
+function withoutVaultId<T>(order: T): T {
+  const id = (order as any)?.paymentSource?.paypal?.attributes?.vault?.id;
+  return typeof id === 'string' && id !== '' ? redactSecret(order, id) : order;
+}
+
 function firstCapture(order: unknown): any {
   const captures = firstPurchaseUnit(order)?.payments?.captures;
   return Array.isArray(captures) ? captures[0] : undefined;
@@ -500,7 +511,7 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
         terminal: true,
         firstCharge: { status: 'failed', verified: true, chargeRef, error: ORDER_NOT_MATCHING },
         error: ORDER_NOT_MATCHING,
-        raw: order,
+        raw: withoutVaultId(order),
       };
     }
 
@@ -545,7 +556,7 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
           terminal: false,
           firstCharge: { status: 'unknown', verified: true, chargeRef, error: 'ORDER_NOT_APPROVED' },
           error: 'ORDER_NOT_APPROVED',
-          raw: order,
+          raw: withoutVaultId(order),
         };
       case 'VOIDED':
         return {
@@ -554,10 +565,10 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
           terminal: true,
           firstCharge: { status: 'failed', verified: true, chargeRef, error: 'ORDER_VOIDED' },
           error: 'ORDER_VOIDED',
-          raw: order,
+          raw: withoutVaultId(order),
         };
       default:
-        return notTerminal(`Unexpected PayPal order status ${orderStatus ?? 'missing'}`, order);
+        return notTerminal(`Unexpected PayPal order status ${orderStatus ?? 'missing'}`, withoutVaultId(order));
     }
 
     // 4. First charge
@@ -583,14 +594,16 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
         raw: order,
       };
     }
-    // The money may have been captured: the app refunds it or treats it as a one-off payment
+    // The money may have been captured: the app refunds it or treats it as a one-off payment.
+    // No mandate, so the core has no id to redact: a token still APPROVED/CREATED may become
+    // VAULTED later and must not reach the mandate.setup_failed event.
     return {
       success: false,
       verified: true,
       terminal: true,
       firstCharge,
       error: 'MANDATE_NOT_VAULTED',
-      raw: order,
+      raw: withoutVaultId(order),
     };
   }
 
@@ -632,7 +645,9 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
    * Merchant-initiated charge on the vaulted PayPal wallet: a new order paid with the vault id,
    * request id and invoice id `chargeRef`. Within PayPal's 6-hour request-id window a replay gets
    * the original response; after it, PayPal refuses the duplicate invoice id (`unknown`,
-   * `DUPLICATE_INVOICE_ID`) when the account blocks multiple payments per invoice id.
+   * `DUPLICATE_INVOICE_ID`) when the account blocks multiple payments per invoice id. A replay
+   * while the original is still in progress (409 `PREVIOUS_REQUEST_IN_PROGRESS`), and a 408, are
+   * `unknown` too: the original may still take the money, so they are never a final `failed`.
    */
   async chargeMandate(mandate: Mandate, charge: ChargeRequest): Promise<ChargeResult> {
     const chargeRef = charge.chargeRef;
@@ -691,6 +706,18 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
           chargeRef,
           providerCode: 'DUPLICATE_INVOICE_ID',
           error: DUPLICATE_CHARGE,
+          raw,
+        };
+      }
+      if (status === 408 || status === 409 || issue === 'PREVIOUS_REQUEST_IN_PROGRESS') {
+        // Timeout, or a conflict with a request still in progress on the same request id: the
+        // original may complete and charge, so a new chargeRef here could charge twice
+        return {
+          status: 'unknown',
+          verified: false,
+          chargeRef,
+          providerCode: issue ?? String(status),
+          error: `PayPal charge outcome unknown (HTTP ${status}${issue ? ` ${issue}` : ''})`,
           raw,
         };
       }

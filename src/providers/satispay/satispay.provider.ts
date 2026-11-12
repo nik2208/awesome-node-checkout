@@ -6,7 +6,7 @@ import { ITransactionStore } from '../../interfaces/transaction-store.interface'
 import { InMemoryTransactionStore } from '../../stores/in-memory-transaction.store';
 import { parseAmountFromCents, parseNexiCurrency } from '../../utils/parsing.util';
 import { generateOrderId } from '../../utils/ids';
-import { isInvalidAmountError, toMinorUnits } from '../../utils/money';
+import { currencyExponent, isInvalidAmountError, toMinorUnits } from '../../utils/money';
 
 export interface SatispayProviderConfig {
   keyId: string;
@@ -334,6 +334,15 @@ export class SatispayProvider extends BasePaymentProvider {
           status: 'FAILED',
         };
       }
+      // Payment details and refunds are read and sent in hundredths: only 2-decimal currencies
+      // keep create, read-back and refund on the same scale
+      if (currencyExponent(validatedCurrency) !== 2) {
+        return {
+          success: false,
+          error: 'Payment currency is not supported by Satispay: only currencies with 2 decimal places are accepted',
+          status: 'FAILED',
+        };
+      }
 
       const body = {
         flow: 'MATCH_CODE',
@@ -430,8 +439,10 @@ export class SatispayProvider extends BasePaymentProvider {
       };
     }
     try {
-      // The refund call carries no currency: Satispay amounts are in euro cents (exponent 2)
-      const body = amount ? { amount_unit: toMinorUnits(amount, 'EUR') } : {};
+      // The refund call carries no currency. createPayment accepts only 2-decimal currencies,
+      // so a partial amount is always in hundredths. Only an omitted (undefined) amount means a
+      // full refund, as in PayPal: 0 and null are rejected by toMinorUnits like any invalid amount.
+      const body = amount !== undefined ? { amount_unit: toMinorUnits(amount, 'EUR') } : {};
       const refund = await this.request<Record<string, unknown>>(
         'POST',
         `${this.apiUrl}/payments/${encodeURIComponent(paymentId)}/refunds`,

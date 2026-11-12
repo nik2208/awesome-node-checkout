@@ -1,7 +1,7 @@
 import * as crypto from 'crypto';
 import { BasePaymentProvider } from '../../abstract/base-payment-provider.abstract';
 import { generateOrderId } from '../../utils/ids';
-import { isInvalidAmountError, toMinorUnits } from '../../utils/money';
+import { currencyExponent, isInvalidAmountError, toMinorUnits } from '../../utils/money';
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult, WebhookResult } from '../../models/payment-result.model';
 import { parseAmountFromCents, parseNexiCurrency } from '../../utils/parsing.util';
@@ -133,7 +133,18 @@ export class NexiProvider extends BasePaymentProvider {
 
   async createPayment(request: PaymentRequest): Promise<PaymentResult> {
     try {
-      const amountCents = toMinorUnits(request.amount, request.currency);
+      // Outcome amounts (redirect, webhook, details) and refunds are read and sent in hundredths:
+      // only 2-decimal currencies keep create, read-back and refund on the same scale.
+      // Numeric codes ('392') are normalised so they are checked like their alpha-3 code.
+      const currencyCode = parseNexiCurrency(request.currency) ?? request.currency;
+      if (currencyExponent(currencyCode) !== 2) {
+        return {
+          success: false,
+          error: 'Payment currency is not supported by Nexi: only currencies with 2 decimal places are accepted',
+          status: 'FAILED',
+        };
+      }
+      const amountCents = toMinorUnits(request.amount, currencyCode);
       const orderId = request.orderId ?? generateOrderId();
       const mac = this.generateMac(orderId, request.currency, amountCents);
 
@@ -422,8 +433,10 @@ export class NexiProvider extends BasePaymentProvider {
   async refundPayment(paymentId: string, amount?: number): Promise<PaymentResult> {
     try {
       const timestamp = new Date().toISOString();
-      // The refund API carries no currency: XPay amounts are in euro cents (exponent 2)
-      const importo = amount ? toMinorUnits(amount, 'EUR').toString() : '';
+      // The refund API carries no currency. createPayment accepts only 2-decimal currencies,
+      // so a partial amount is always in hundredths. Only an omitted (undefined) amount means a
+      // full refund, as in PayPal: 0 and null are rejected by toMinorUnits like any invalid amount.
+      const importo = amount !== undefined ? toMinorUnits(amount, 'EUR').toString() : '';
       const mac = this.generateRefundMac(this.config.merchantId, paymentId, importo, timestamp);
 
       const params: Record<string, string> = {

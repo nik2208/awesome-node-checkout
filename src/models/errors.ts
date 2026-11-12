@@ -6,7 +6,9 @@ export type CheckoutErrorCode =
   | 'REDIRECT_NOT_SUPPORTED'
   | 'TRANSACTION_NOT_FOUND'
   | 'INSECURE_CONFIGURATION'
-  | 'INVALID_AMOUNT';
+  | 'INVALID_AMOUNT'
+  | 'MANDATES_NOT_SUPPORTED'
+  | 'INVALID_MANDATE_REQUEST';
 
 export class CheckoutError extends Error {
   constructor(

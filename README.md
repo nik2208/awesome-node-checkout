@@ -401,6 +401,27 @@ Only `failed` counts towards dunning. Refund a mandate charge with the existing 
 
 Use `checkout.supportsMandates(provider)` to check whether a registered provider implements `IMandateProvider`.
 
+### Nexi XPay
+
+`NexiProvider` implements `IMandateProvider` with XPay contracts ("Specifiche tecniche di integrazione con il gateway di pagamento XPay" v20.4): the setup is a hosted-page first payment that registers the contract (`num_contratto` = your `mandateRef`, `tipo_servizio=paga_multi`, `tipo_richiesta=PP`, `codTrans` = `orderId`), renewals use `POST /ecomm/api/recurring/pagamentoRicorrente` (`codiceTransazione` = `chargeRef`), `getMandate` reads `dettagliContratto` and `revokeMandate` calls `cancellaContratto`.
+
+```typescript
+const nexi = new NexiProvider({
+  merchantId: process.env.NEXI_ALIAS!,
+  macKey: process.env.NEXI_MAC_KEY!,
+  environment: 'production',
+  contractType: 'S', // only if the terminal does both scheduled and unscheduled contracts
+  timeoutMs: 30000,  // recurring and contract API calls (default 30000)
+});
+```
+
+- **Terminal.** Recurring payments must be enabled on the terminal by XPay support, stating whether the contracts are **scheduled** or **unscheduled** (MIT): the two are not interchangeable. A merchant whose terminal does both sets `contractType: 'S'` or `'U'`, sent as `tipo_contratto` and included in the setup MAC.
+- **Currency: EUR only.** `pagamentoRicorrente` accepts only `divisa=978`, so `createMandate` and `chargeMandate` with any other currency return a failure without calling Nexi.
+- **Callback.** Nexi redirects the customer to `url` / `url_back` with the outcome in the query string, and sends the `urlpost` notification as a **form POST**: mount `express.urlencoded()` before the checkout router, or the notification body is empty and the outcome stays unverified. Both arrive at the callback route and are verified with the 7-field outcome MAC; the MAC-covered `codTrans`, `importo` and `divisa` must match the pending setup. The contract number is always the persisted `mandateRef`, never the query's `num_contratto`. The card expiry (`scadenza_pan`) and masked PAN are exposed only under `mandate.unverified`. A Nexi first payment is never `unknown` on a terminal outcome: the verified outcome is either OK or KO.
+- **Retries.** Before every charge the provider reads `situazioneOrdine` for the `chargeRef`: an already paid one is returned as `succeeded` without charging again, an existing unpaid one as `failed`, and a lookup that fails as `unknown` (nothing is charged). Retry an `unknown` charge with the same `chargeRef`. **A dunning retry after `failed` needs a new `chargeRef`**: Nexi would accept up to 2 retries of the same code after a KO, but the library does not use them. Codes 8, 14 and 22 (invalid contract, card expired, card not chargeable) set `mandateUnusable`; credential, MAC and technical errors are `unknown`.
+- **12-month expiry (manual, p. 61).** Contracts unused for more than 12 months expire under card-scheme rules, so a **yearly** plan sits right at the limit. Nexi's remedy is a 1-cent recurring charge followed by a refund before the 12 months run out (`chargeMandate` with a 0.01 EUR charge, then `refundPayment('nexi', result.providerPaymentId, 0.01)`): your scheduler must plan for it.
+- **Refunds.** `providerPaymentId` is the `codiceTransazione` (= `chargeRef`), so the existing `refundPayment` refunds a mandate charge.
+
 ---
 
 ## Security: A Redirect Is Not Proof of Payment

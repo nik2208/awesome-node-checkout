@@ -339,8 +339,12 @@ describe('SatispayProvider mandates (pre-authorized payment tokens)', () => {
       expect(normalized.success).toBe(false);
     });
 
-    it('(c) CANCELED is verified, terminal, with a failed first charge and no payment request', async () => {
-      routes({ [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'CANCELED' }) });
+    it('(c) CANCELED is verified, terminal, with a failed first charge when the replayed payment answers 4xx', async () => {
+      routes({
+        [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'CANCELED' }),
+        // The customer declined: no payment exists for the key, Satispay refuses the canceled token
+        [`POST ${PAYMENTS}`]: () => resp(400, { code: 36, message: 'token canceled' }),
+      });
       const outcome = await provider.confirmMandate(pending, {});
       expect(outcome.success).toBe(false);
       expect(outcome.verified).toBe(true);
@@ -353,8 +357,18 @@ describe('SatispayProvider mandates (pre-authorized payment tokens)', () => {
         error: 'Authorization canceled',
       });
       expect(outcome.mandate).toBeUndefined();
-      // One network call: the token re-read. No first payment request, no second token read
-      expect(calls().map((c) => c.key)).toEqual([`GET ${TOKENS}/tok_1`]);
+      // The token re-read, then one POST replaying the first payment (same body and key as the
+      // ACCEPTED branch); no second token read
+      expect(calls().map((c) => c.key)).toEqual([`GET ${TOKENS}/tok_1`, `POST ${PAYMENTS}`]);
+      const post = calls().find((c) => c.key === `POST ${PAYMENTS}`)!;
+      expect(bodyOf(post.init)).toEqual({
+        flow: 'PRE_AUTHORIZED',
+        token: 'tok_1',
+        amount_unit: 1990,
+        currency: 'EUR',
+        external_code: 'SUB-0001-INIT',
+      });
+      expect(headersOf(post.init)['Idempotency-Key']).toBe('SUB-0001-INIT');
     });
 
     it('(d) a 503 on the token GET is non-terminal with an unknown first charge', async () => {
@@ -431,6 +445,12 @@ describe('SatispayProvider mandates (pre-authorized payment tokens)', () => {
       return events;
     }
 
+    function setup(): { checkout: CheckoutConfigurator; events: Array<[string, unknown]> } {
+      const checkout = new CheckoutConfigurator();
+      checkout.registerProvider(provider);
+      return { checkout, events: recordEvents(checkout) };
+    }
+
     async function firstRunUnknown(checkout: CheckoutConfigurator) {
       routes({
         [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'ACCEPTED' }),
@@ -441,13 +461,73 @@ describe('SatispayProvider mandates (pre-authorized payment tokens)', () => {
       expect(o1.firstCharge.status).toBe('unknown');
     }
 
-    it('a CANCELED re-confirm is a verified failed first charge without a payment request', async () => {
-      const checkout = new CheckoutConfigurator();
-      checkout.registerProvider(provider);
-      const events = recordEvents(checkout);
+    /** Both POSTs (first run, replay) carry the same body and the same Idempotency-Key. */
+    function expectIdenticalReplay() {
+      const posts = calls().filter((c) => c.key === `POST ${PAYMENTS}`);
+      expect(posts).toHaveLength(2);
+      expect(bodyOf(posts[1].init)).toEqual(bodyOf(posts[0].init));
+      expect(headersOf(posts[0].init)['Idempotency-Key']).toBe('SUB-0001-INIT');
+      expect(headersOf(posts[1].init)['Idempotency-Key']).toBe('SUB-0001-INIT');
+      // No token re-read after the replay: only the two setup re-reads
+      expect(calls().filter((c) => c.key === `GET ${TOKENS}/tok_1`)).toHaveLength(2);
+    }
+
+    function canceledReplay(post: Route) {
+      routes({
+        [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'CANCELED' }),
+        [`POST ${PAYMENTS}`]: post,
+      });
+    }
+
+    it('replay ACCEPTED: success false, terminal, with the succeeded first charge to refund or keep', async () => {
+      const { checkout, events } = setup();
       await firstRunUnknown(checkout);
 
-      routes({ [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'CANCELED' }) });
+      canceledReplay(() => resp(200, acceptedPayment));
+      const o2 = await checkout.confirmMandate('satispay', pending, {});
+      expect(o2).toMatchObject({
+        success: false,
+        verified: true,
+        terminal: true,
+        error: 'Authorization canceled after the first charge',
+      });
+      expect(o2.mandate).toBeUndefined();
+      expect(o2.firstCharge).toMatchObject({
+        status: 'succeeded',
+        verified: true,
+        chargeRef: 'SUB-0001-INIT',
+        providerPaymentId: 'pay_1',
+        amount: 19.9,
+        currency: 'EUR',
+      });
+      expectIdenticalReplay();
+
+      expect(events.map(([name]) => name)).toEqual([
+        'mandate.created',
+        'charge.unknown',
+        'mandate.setup_failed',
+        'charge.succeeded',
+      ]);
+      expect(events.find(([name]) => name === 'mandate.setup_failed')![1]).toMatchObject({
+        orderId: 'SUB-0001-INIT',
+        error: 'Authorization canceled after the first charge',
+        raw: { id: '[redacted]', status: 'CANCELED' },
+      });
+      // The resolution of the earlier charge.unknown, refundable by paymentId
+      expect(events.find(([name]) => name === 'charge.succeeded')![1]).toMatchObject({
+        orderId: 'SUB-0001-INIT',
+        paymentId: 'pay_1',
+        verified: true,
+      });
+      // The token id never reaches an event, also when the setup failed and no mandate is returned
+      for (const [, payload] of events) expect(JSON.stringify(payload)).not.toContain('tok_1');
+    });
+
+    it('replay 4xx: a verified failed first charge (no payment exists for the key)', async () => {
+      const { checkout, events } = setup();
+      await firstRunUnknown(checkout);
+
+      canceledReplay(() => resp(400, { code: 36, message: 'token canceled' }));
       const o2 = await checkout.confirmMandate('satispay', pending, {});
       expect(o2).toMatchObject({ success: false, verified: true, terminal: true, error: 'Authorization canceled' });
       expect(o2.mandate).toBeUndefined();
@@ -457,9 +537,7 @@ describe('SatispayProvider mandates (pre-authorized payment tokens)', () => {
         chargeRef: 'SUB-0001-INIT',
         error: 'Authorization canceled',
       });
-      // Only the first run sent a payment request; the re-confirm only re-read the token
-      expect(calls().filter((c) => c.key === `POST ${PAYMENTS}`)).toHaveLength(1);
-      expect(calls().filter((c) => c.key === `GET ${TOKENS}/tok_1`)).toHaveLength(2);
+      expectIdenticalReplay();
 
       expect(events.map(([name]) => name)).toEqual([
         'mandate.created',
@@ -467,24 +545,40 @@ describe('SatispayProvider mandates (pre-authorized payment tokens)', () => {
         'mandate.setup_failed',
         'charge.failed',
       ]);
-      const setupFailed = events.find(([name]) => name === 'mandate.setup_failed')!;
-      expect(setupFailed[1]).toMatchObject({
-        orderId: 'SUB-0001-INIT',
-        raw: { id: '[redacted]', status: 'CANCELED' },
-      });
-      // The sequence a listener sees for the same orderId: charge.unknown, then a verified
-      // charge.failed 'Authorization canceled' that says nothing about the first payment (README)
-      expect(events.find(([name]) => name === 'charge.unknown')![1]).toMatchObject({
-        orderId: 'SUB-0001-INIT',
-        verified: false,
-      });
       expect(events.find(([name]) => name === 'charge.failed')![1]).toMatchObject({
         orderId: 'SUB-0001-INIT',
         verified: true,
         error: 'Authorization canceled',
       });
-      // The token id never reaches an event, also when the setup failed and no mandate is returned
       for (const [, payload] of events) expect(JSON.stringify(payload)).not.toContain('tok_1');
+    });
+
+    it('replay 5xx, 401, 403, 429, 408, 409 or a network error: unverified, non-terminal, no events', async () => {
+      const cases: Array<[string, Route]> = [
+        ...[500, 503, 401, 403, 429, 408, 409].map((status): [string, Route] => [
+          `HTTP ${status}`,
+          () => resp(status, { code: 0, message: 'x' }),
+        ]),
+        ['network error', timeout],
+      ];
+      for (const [label, post] of cases) {
+        vi.clearAllMocks();
+        const { checkout, events } = setup();
+        await firstRunUnknown(checkout);
+
+        canceledReplay(post);
+        const o2 = await checkout.confirmMandate('satispay', pending, {});
+        expect(o2, label).toMatchObject({ success: false, verified: false, terminal: false });
+        expect(o2.mandate, label).toBeUndefined();
+        expect(o2.firstCharge, label).toMatchObject({
+          status: 'unknown',
+          verified: false,
+          chargeRef: 'SUB-0001-INIT',
+        });
+        expectIdenticalReplay();
+        // Only the first run's events: a non-terminal re-confirm emits nothing
+        expect(events.map(([name]) => name), label).toEqual(['mandate.created', 'charge.unknown']);
+      }
     });
   });
 

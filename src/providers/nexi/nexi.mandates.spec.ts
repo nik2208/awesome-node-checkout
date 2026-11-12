@@ -48,6 +48,17 @@ function signedKo(codice: number): Record<string, unknown> {
   return { esito: 'KO', idOperazione, timeStamp, errore: { codice, messaggio: 'not found' }, mac };
 }
 
+/** Fixture input only (no literal vector for these esito values): never asserted. */
+function signedOutcome(esito: string, codAut = ''): Record<string, string> {
+  const mac = crypto
+    .createHash('sha1')
+    .update(
+      `codTrans=${ORDER_ID}esito=${esito}importo=1990divisa=EURdata=20261201orario=101500codAut=${codAut}${MAC_KEY}`,
+    )
+    .digest('hex');
+  return { ...okOutcome(), esito, codAut, mac };
+}
+
 function jsonResponse(body: unknown, status = 200): Response {
   return {
     ok: status >= 200 && status < 300,
@@ -340,6 +351,42 @@ describe('NexiProvider mandates (#31)', () => {
       expect(outcome.firstCharge.error).toBe('KO');
     });
 
+    it('ANNULLO and ERRORE, with a valid MAC, are verified terminal refusals', async () => {
+      for (const esito of ['ANNULLO', 'ERRORE']) {
+        const outcome = await provider.confirmMandate(pendingState(), { query: signedOutcome(esito) });
+        expect(outcome.success).toBe(false);
+        expect(outcome.verified).toBe(true);
+        expect(outcome.terminal).toBe(true);
+        expect(outcome.firstCharge.status).toBe('failed');
+      }
+    });
+
+    it('an unrecognised esito (e.g. PEN, pending), with a valid MAC, is non-terminal', async () => {
+      const outcome = await provider.confirmMandate(pendingState(), { query: signedOutcome('PEN') });
+      expectNonTerminal(outcome);
+      expect(outcome.error).toBe('Mandate setup outcome PEN is not final');
+    });
+
+    it('an OK outcome without num_contratto, with the valid MAC, is non-terminal', async () => {
+      const { num_contratto, ...rest } = okOutcome();
+      const outcome = await provider.confirmMandate(pendingState(), { query: rest });
+      expectNonTerminal(outcome);
+      expect(outcome.error).toBe('Outcome does not match the pending setup');
+    });
+
+    it('tipo_servizio / tipo_richiesta other than paga_multi / PP are rejected; the expected ones pass', async () => {
+      for (const extra of [{ tipo_servizio: 'paga_oc3d' }, { tipo_richiesta: 'PR' }]) {
+        const outcome = await provider.confirmMandate(pendingState(), { query: { ...okOutcome(), ...extra } });
+        expectNonTerminal(outcome);
+        expect(outcome.error).toBe('Outcome does not match the pending setup');
+      }
+      const ok = await provider.confirmMandate(pendingState(), {
+        query: { ...okOutcome(), tipo_servizio: 'paga_multi', tipo_richiesta: 'PP' },
+      });
+      expect(ok.success).toBe(true);
+      expect(ok.terminal).toBe(true);
+    });
+
     it('an empty input (re-confirm job) is unverified and non-terminal', async () => {
       expectNonTerminal(await provider.confirmMandate(pendingState(), {}));
     });
@@ -547,6 +594,17 @@ describe('NexiProvider mandates (#31)', () => {
       );
     });
 
+    it('a paid entry after an unpaid one for the same chargeRef is succeeded and not charged again', async () => {
+      fetchMock().mockResolvedValueOnce(
+        jsonResponse({ ...OK_RESP, report: [{ ...PAID_ENTRY, stato: 'Negato' }, PAID_ENTRY] }),
+      );
+      const result = await provider.chargeMandate(mandate(), charge);
+      expect(result.status).toBe('succeeded');
+      expect(result.verified).toBe(true);
+      expect(result.providerPaymentId).toBe('SUB-0001-2026-12');
+      expect(fetchMock()).toHaveBeenCalledTimes(1);
+    });
+
     it('an existing unpaid chargeRef is failed and not charged again', async () => {
       fetchMock().mockResolvedValueOnce(
         jsonResponse({ ...OK_RESP, report: [{ ...PAID_ENTRY, stato: 'Negato' }] }),
@@ -613,6 +671,19 @@ describe('NexiProvider mandates (#31)', () => {
 
       expect(fetchMock()).not.toHaveBeenCalled();
     });
+
+    it('an amount over 8 digits of cents fails without calling fetch; 8 digits are sent', async () => {
+      const tooLarge = await provider.chargeMandate(mandate(), { ...charge, amount: 1000000 });
+      expect(tooLarge.status).toBe('failed');
+      expect(tooLarge.verified).toBe(false);
+      expect(tooLarge.error).toBe('Amount exceeds the Nexi recurring limit (8 digits of cents)');
+      expect(fetchMock()).not.toHaveBeenCalled();
+
+      fetchMock().mockResolvedValueOnce(emptyLookup()).mockResolvedValueOnce(jsonResponse({ ...OK_RESP }));
+      const max = await provider.chargeMandate(mandate(), { ...charge, amount: 999999.99 });
+      expect(callBody(1).importo).toBe('99999999');
+      expect(max.status).toBe('succeeded');
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -675,6 +746,13 @@ describe('NexiProvider mandates (#31)', () => {
     });
 
     it("statoPrimoPag 'KO' is revoked", async () => {
+      fetchMock().mockResolvedValueOnce(
+        jsonResponse({ ...OK_RESP, contratti: [{ numeroContratto: 'MNDT0000000001', statoPrimoPag: 'KO' }] }),
+      );
+      expect(await provider.getMandate(mandate())).toMatchObject({ status: 'revoked', verified: true });
+    });
+
+    it("statoPrimoPag is compared case-insensitively ('ko' is revoked)", async () => {
       fetchMock().mockResolvedValueOnce(
         jsonResponse({ ...OK_RESP, contratti: [{ numeroContratto: 'MNDT0000000001', statoPrimoPag: 'ko' }] }),
       );

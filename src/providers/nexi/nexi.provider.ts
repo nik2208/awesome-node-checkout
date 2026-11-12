@@ -50,6 +50,12 @@ const NEXI_EUR_NUMERIC = '978';
 
 const EUR_ONLY = 'Nexi mandates support EUR only';
 
+/** `pagamentoRicorrente` `importo`: cents, at most 8 digits (pp. 188-193). */
+const NEXI_RECURRING_MAX_IMPORTO_DIGITS = 8;
+
+/** Hosted-page `esito` values that are a final refusal of the setup. */
+const NEXI_SETUP_REFUSALS = new Set(['KO', 'ANNULLO', 'ERRORE']);
+
 /** Class of a "Tabella Codici errore API Restful" code (Nexi XPay manual v20.4, pp. 883-885). */
 type NexiApiErrorClass = 'merchant' | 'duplicate' | 'notFound' | 'mandateUnusable' | 'declined';
 
@@ -368,7 +374,7 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
 
   /**
    * Reads `situazioneOrdine` for `codTrans` (same request as `getPaymentDetails`) and classifies
-   * the raw response: `paid`, `other` (exists, not paid), `absent` (OK with no matching report
+   * the raw response: `paid` (some entry for `codTrans` is paid), `other` (exists, no entry paid), `absent` (OK with no matching report
    * entry, or KO "not found" 2/13), `error` (anything else: HTTP, network, timeout, non-JSON, bad
    * MAC, a missing MAC on OK, no `report` array, any other KO).
    */
@@ -392,17 +398,25 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
     }
     if (json['esito'] !== 'OK' || !Array.isArray(json['report'])) return { kind: 'error' };
 
-    const entry = (json['report'] as unknown[]).find(
+    const entries = (json['report'] as unknown[]).filter(
       (r): r is Record<string, unknown> =>
         r !== null && typeof r === 'object' && (r as Record<string, unknown>)['codiceTransazione'] === codTrans,
     );
-    if (!entry) return { kind: 'absent' };
+    if (entries.length === 0) return { kind: 'absent' };
 
-    const stato = typeof entry['stato'] === 'string' ? entry['stato'] : undefined;
+    // Nexi may list a code more than once (it accepts up to 2 retries of a code after a KO): one
+    // paid entry means the customer was charged, whatever the order of the entries
+    const statoOf = (e: Record<string, unknown>) => (typeof e['stato'] === 'string' ? e['stato'] : undefined);
+    const isPaid = (e: Record<string, unknown>) => {
+      const stato = statoOf(e);
+      return stato !== undefined && NEXI_PAID_STATUSES.has(stato.toLowerCase());
+    };
+    const entry = entries.find(isPaid) ?? entries[0];
+    const stato = statoOf(entry);
     const amount = parseAmountFromCents(entry['importo']);
     const currency = parseNexiCurrency(entry['divisa']);
     return {
-      kind: stato !== undefined && NEXI_PAID_STATUSES.has(stato.toLowerCase()) ? 'paid' : 'other',
+      kind: isPaid(entry) ? 'paid' : 'other',
       stato,
       ...(amount !== undefined ? { amount } : {}),
       ...(currency !== undefined ? { currency } : {}),
@@ -826,10 +840,13 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
    * - The 7-field outcome MAC must be valid, and the MAC-covered `codTrans`, `importo` and
    *   `divisa` must match `pending`; otherwise the outcome is unverified and non-terminal (a forged
    *   callback never consumes the pending state). The unsigned `num_contratto`, when present, must
-   *   be `pending.mandateRef`; the contract number used is always `pending.mandateRef`.
-   * - `esito=OK`: active mandate, first charge `succeeded` (terminal).
-   * - Any other `esito`: no mandate, first charge `failed` (terminal). Start a new setup with a
-   *   fresh `mandateRef` and `orderId`: a `codTrans` is never reused.
+   *   be `pending.mandateRef` (and `tipo_servizio` / `tipo_richiesta`, when present, `paga_multi` /
+   *   `PP`); the contract number used is always `pending.mandateRef`.
+   * - `esito=OK` with `num_contratto`: active mandate, first charge `succeeded` (terminal). An OK
+   *   without `num_contratto` is unverified and non-terminal (no contract may exist).
+   * - `esito` `KO`, `ANNULLO` or `ERRORE`: no mandate, first charge `failed` (terminal). Start a
+   *   new setup with a fresh `mandateRef` and `orderId`: a `codTrans` is never reused.
+   * - Any other `esito` (e.g. a pending one) is unverified and non-terminal: it may still turn OK.
    *
    * An empty input (`{}`) has no MAC, so a re-confirm is unverified and non-terminal: Nexi never
    * reports a terminal outcome with an `unknown` first charge.
@@ -860,12 +877,24 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
       if (fields.importo !== String(toMinorUnits(pending.amount, 'EUR')) || fields.divisa !== 'EUR') {
         return unverified('Outcome amount does not match');
       }
-      // Not MAC-covered: only a tampering indicator, never the source of the contract number
+      // Not MAC-covered: only tampering indicators, never the source of the contract number
       if (params['num_contratto'] !== undefined && params['num_contratto'] !== pending.mandateRef) {
+        return unverified('Outcome does not match the pending setup');
+      }
+      if (
+        (params['tipo_servizio'] !== undefined && params['tipo_servizio'] !== 'paga_multi') ||
+        (params['tipo_richiesta'] !== undefined && params['tipo_richiesta'] !== 'PP')
+      ) {
         return unverified('Outcome does not match the pending setup');
       }
 
       if (fields.esito === 'OK') {
+        // Nexi echoes num_contratto on a contract-registering outcome. Without it, the customer may
+        // have stripped the contract parameters from the (unsigned) approvalUrl, so a plain payment
+        // was made and no contract may exist: never report that as an active mandate.
+        if (params['num_contratto'] === undefined) {
+          return unverified('Outcome does not match the pending setup');
+        }
         const unverifiedHints: NonNullable<Mandate['unverified']> = {};
         const scadenzaPan = params['scadenza_pan'];
         if (scadenzaPan !== undefined && /^\d{6}$/.test(scadenzaPan)) unverifiedHints.cardExpiry = scadenzaPan;
@@ -895,6 +924,11 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
           },
           raw: params,
         };
+      }
+
+      if (!NEXI_SETUP_REFUSALS.has(fields.esito)) {
+        // e.g. a pending outcome: the setup may still turn OK, so the pending state must survive
+        return unverified(`Mandate setup outcome ${fields.esito} is not final`);
       }
 
       const messaggio = params['messaggio'];
@@ -954,6 +988,16 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
         return { status: 'failed', verified: false, chargeRef, error: 'Nexi codiceTransazione cannot contain "_"' };
       }
       const importo = String(toMinorUnits(charge.amount, 'EUR'));
+      if (importo.length > NEXI_RECURRING_MAX_IMPORTO_DIGITS) {
+        // pagamentoRicorrente takes at most 8 digits of cents (pp. 188-193): Nexi would answer KO 1
+        // (a merchant-side `unknown`), and a retry with the same chargeRef could never succeed
+        return {
+          status: 'failed',
+          verified: false,
+          chargeRef,
+          error: 'Amount exceeds the Nexi recurring limit (8 digits of cents)',
+        };
+      }
 
       // Replay guard: never charge twice for the same chargeRef
       const lookup = await this.lookupTransaction(chargeRef);

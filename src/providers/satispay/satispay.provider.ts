@@ -807,7 +807,9 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
    * `CANCELED` is terminal (`success: false`, no mandate) with a verified `failed` first charge
    * ('Authorization canceled') and makes no payment request (#33). On a re-confirm after an
    * `unknown` first charge this says nothing about the money: `success` changed, so reconcile the
-   * first payment manually (see "Resolving an unknown first charge" in the README).
+   * first payment manually (see "Resolving an unknown first charge" in the README). The configurator
+   * still emits a verified `charge.failed` for the same `orderId` after the earlier `charge.unknown`:
+   * listeners must not read it as the resolution.
    */
   async confirmMandate(
     pending: MandatePendingState,

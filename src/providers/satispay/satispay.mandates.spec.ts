@@ -468,7 +468,21 @@ describe('SatispayProvider mandates (pre-authorized payment tokens)', () => {
         'charge.failed',
       ]);
       const setupFailed = events.find(([name]) => name === 'mandate.setup_failed')!;
-      expect(setupFailed[1]).toMatchObject({ raw: { id: '[redacted]', status: 'CANCELED' } });
+      expect(setupFailed[1]).toMatchObject({
+        orderId: 'SUB-0001-INIT',
+        raw: { id: '[redacted]', status: 'CANCELED' },
+      });
+      // The sequence a listener sees for the same orderId: charge.unknown, then a verified
+      // charge.failed 'Authorization canceled' that says nothing about the first payment (README)
+      expect(events.find(([name]) => name === 'charge.unknown')![1]).toMatchObject({
+        orderId: 'SUB-0001-INIT',
+        verified: false,
+      });
+      expect(events.find(([name]) => name === 'charge.failed')![1]).toMatchObject({
+        orderId: 'SUB-0001-INIT',
+        verified: true,
+        error: 'Authorization canceled',
+      });
       // The token id never reaches an event, also when the setup failed and no mandate is returned
       for (const [, payload] of events) expect(JSON.stringify(payload)).not.toContain('tok_1');
     });

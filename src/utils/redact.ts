@@ -1,11 +1,14 @@
 const MAX_DEPTH = 32;
 const REDACTED = '[redacted]';
+const BINARY = '[binary]';
 
 /**
  * Returns a copy of `value` in which every occurrence of `secret` inside a string (values and
  * keys) is replaced by `'[redacted]'`. Plain objects, arrays and class instances are copied
- * through their own enumerable properties; binary data and dates are kept as they are. A cycle
- * becomes `'[circular]'` and nesting deeper than 32 levels is dropped. `value` itself is never mutated.
+ * through their own enumerable properties; dates are kept as they are. Binary data (`Buffer`,
+ * typed arrays, `DataView`, `ArrayBuffer`) cannot be scrubbed reliably, so it becomes `'[binary]'`.
+ * A cycle becomes `'[circular]'` and nesting deeper than 32 levels is dropped. `value` itself is
+ * never mutated. Without a secret, `value` is returned as it is (binary data included).
  *
  * Used to keep credential-like ids (the mandate's `providerMandateId`) out of event payloads.
  */
@@ -17,7 +20,8 @@ export function redactSecret<T>(value: T, secret: string | undefined): T {
   const walk = (v: unknown, depth: number): unknown => {
     if (typeof v === 'string') return scrubString(v);
     if (v === null || typeof v !== 'object') return v;
-    if (ArrayBuffer.isView(v) || v instanceof ArrayBuffer || v instanceof Date) return v;
+    if (ArrayBuffer.isView(v) || v instanceof ArrayBuffer) return BINARY;
+    if (v instanceof Date) return v;
     if (depth >= MAX_DEPTH) return undefined;
     if (ancestors.has(v)) return '[circular]';
     ancestors.add(v);

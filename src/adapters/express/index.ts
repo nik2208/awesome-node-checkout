@@ -19,7 +19,7 @@ export interface PaymentRequestContext {
 }
 
 /**
- * Recurring payments (mandates). Mounts `POST /:provider/mandate` and
+ * Recurring payments (mandates). Mounts `POST /:provider/mandate` (`GET` answers 405) and
  * `GET|POST /:provider/mandate/callback`. Charges and revocations are never routes: call
  * `checkout.chargeMandate` / `checkout.revokeMandate` from a server job.
  *
@@ -38,7 +38,8 @@ export interface ExpressMandateOptions {
    * ignoring the client body. `mandateRef` and `orderId` must be fresh for every attempt.
    *
    * `returnUrl` and `cancelUrl` (and `notifyUrl`) **must point to the callback route**,
-   * `<mount>/<provider>/mandate/callback` (e.g. `https://app.example/checkout/nexi/mandate/callback`):
+   * `<mount>/<provider>/mandate/callback` (e.g. `https://app.example/checkout/nexi/mandate/callback`),
+   * as absolute http(s) URLs (a relative URL answers 400 `INVALID_MANDATE_REQUEST`):
    * the provider appends `mandate_ref`, the route confirms the setup when the customer comes back,
    * and `onOutcome` decides where the browser goes next.
    *
@@ -215,6 +216,7 @@ export function isPathPublic(reqPath: string, publicPaths: (string | string[])[]
  * POST   /:provider/webhook      → handleWebhook
  * GET    /:provider/redirect     → handleRedirect  (must come before /:provider/:id)
  * POST   /:provider/mandate      → createMandate (only if options.mandates is configured)
+ * GET    /:provider/mandate      → 405, Allow: POST (only if options.mandates is configured)
  * GET    /:provider/mandate/callback → confirmMandate (only if options.mandates is configured)
  * POST   /:provider/mandate/callback → confirmMandate (only if options.mandates is configured)
  * GET    /:provider/:id          → getPaymentDetails (only if options.details is configured)

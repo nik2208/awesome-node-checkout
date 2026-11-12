@@ -6,7 +6,7 @@ import { BasePaymentProvider } from './abstract/base-payment-provider.abstract';
 import { PaymentRequest } from './models/payment-request.model';
 import { PaymentResult, WebhookResult } from './models/payment-result.model';
 import { CheckoutError } from './models/errors';
-import { CheckoutEventName, CheckoutEventPayload } from './events/checkout-event-bus';
+import { CheckoutEventName, CheckoutEventPayload, CheckoutListenerError } from './events/checkout-event-bus';
 import { IMandateProvider, isMandateProvider } from './interfaces/mandate-provider.interface';
 import {
   ChargeRequest,
@@ -294,7 +294,21 @@ describe('Mandates: configurator', () => {
       ['description of 128 chars', { description: 'd'.repeat(128) }],
       ["returnUrl ''", { returnUrl: '' }],
       ["cancelUrl ''", { cancelUrl: '' }],
+      ["returnUrl '/checkout/dummy/mandate/callback' (relative)", { returnUrl: '/checkout/dummy/mandate/callback' }],
+      ["cancelUrl 'ftp://app.test/cancel'", { cancelUrl: 'ftp://app.test/cancel' }],
+      ["returnUrl 'javascript:alert(1)'", { returnUrl: 'javascript:alert(1)' }],
+      ["notifyUrl 'not a url'", { notifyUrl: 'not a url' }],
+      ["notifyUrl ''", { notifyUrl: '' }],
     ];
+
+    it('accepts an absolute http(s) notifyUrl', async () => {
+      const start = await checkout.createMandate(
+        'dummy',
+        setupRequest({ notifyUrl: 'https://app.test/checkout/dummy/mandate/callback' }),
+      );
+      expect(start.success).toBe(true);
+      expect(provider.calls.create).toHaveLength(1);
+    });
 
     it.each(invalid)('rejects %s with INVALID_MANDATE_REQUEST without calling the provider', async (_label, overrides) => {
       const err = await rejection(checkout.createMandate('dummy', setupRequest(overrides)));
@@ -1035,6 +1049,273 @@ describe('Mandates: Express adapter (AC 6, 7)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Review findings
+// ---------------------------------------------------------------------------
+
+describe('Mandates: listener errors after the provider call', () => {
+  let provider: MandateDummyProvider;
+  let errorLog: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    provider = new MandateDummyProvider();
+    errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function make(config: ConstructorParameters<typeof CheckoutConfigurator>[0] = {}): CheckoutConfigurator {
+    const checkout = new CheckoutConfigurator(config);
+    checkout.registerProvider(provider);
+    return checkout;
+  }
+
+  it('chargeMandate resolves with the verified result when a charge.succeeded listener throws', async () => {
+    const onListenerError = vi.fn();
+    const checkout = make({ onListenerError });
+    checkout.events.on('charge.succeeded', () => {
+      throw new Error('metrics down');
+    });
+    const result = await checkout.chargeMandate('dummy', activeMandate(), charge());
+    expect(result).toMatchObject({
+      status: 'succeeded',
+      verified: true,
+      chargeRef: 'SUB-0001-2026-12',
+      providerPaymentId: 'PAY-SUB-0001-2026-12',
+    });
+    expect(provider.calls.charge).toHaveLength(1);
+    expect(onListenerError).toHaveBeenCalledTimes(1);
+    const [err, event] = onListenerError.mock.calls[0];
+    expect(err).toBeInstanceOf(CheckoutListenerError);
+    expect((err as CheckoutListenerError).message).toBe('metrics down');
+    expect((err as CheckoutListenerError).event).toBe('charge.succeeded');
+    expect(event).toBe('charge.succeeded');
+    expect(errorLog).not.toHaveBeenCalled();
+  });
+
+  it('without onListenerError the listener error is logged with console.error', async () => {
+    const checkout = make();
+    checkout.events.on('charge.succeeded', () => {
+      throw new Error('metrics down');
+    });
+    const result = await checkout.chargeMandate('dummy', activeMandate(), charge());
+    expect(result.status).toBe('succeeded');
+    expect(errorLog).toHaveBeenCalledTimes(1);
+    expect(errorLog.mock.calls[0][0]).toBe('[awesome-node-checkout]');
+    expect(errorLog.mock.calls[0][1]).toBeInstanceOf(CheckoutListenerError);
+  });
+
+  it('a throwing onListenerError never rejects chargeMandate', async () => {
+    const checkout = make({
+      onListenerError: async () => {
+        throw new Error('hook down');
+      },
+    });
+    checkout.events.on('charge.succeeded', () => {
+      throw new Error('metrics down');
+    });
+    const result = await checkout.chargeMandate('dummy', activeMandate(), charge());
+    expect(result.status).toBe('succeeded');
+    expect(errorLog).toHaveBeenCalledTimes(2);
+  });
+
+  it('confirmMandate returns the outcome and still emits charge.succeeded when mandate.created throws', async () => {
+    const onListenerError = vi.fn();
+    const checkout = make({ onListenerError });
+    const seen: string[] = [];
+    checkout.events.on('mandate.created', () => {
+      throw new Error('crm down');
+    });
+    checkout.events.on('charge.succeeded', ({ orderId }) => {
+      seen.push(`charge ${orderId}`);
+    });
+    const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+    expect(outcome.success).toBe(true);
+    expect(outcome.terminal).toBe(true);
+    expect(outcome.mandate?.providerMandateId).toBe(VAULT_ID);
+    expect(outcome.firstCharge.providerPaymentId).toBe('PAY-FIRST');
+    expect(seen).toEqual(['charge SUB-0001-INIT']);
+    expect(onListenerError).toHaveBeenCalledTimes(1);
+    expect(onListenerError.mock.calls[0][1]).toBe('mandate.created');
+  });
+
+  it('revokeMandate returns the provider result when a mandate.revoked listener throws', async () => {
+    const onListenerError = vi.fn();
+    const checkout = make({ onListenerError });
+    checkout.events.on('mandate.revoked', () => {
+      throw new Error('crm down');
+    });
+    const result = await checkout.revokeMandate('dummy', activeMandate());
+    expect(result.revokedAtProvider).toBe(true);
+    expect(onListenerError).toHaveBeenCalledTimes(1);
+  });
+
+  it('mandate.setup_started still propagates the listener error (no money has moved)', async () => {
+    const onListenerError = vi.fn();
+    const checkout = make({ onListenerError });
+    checkout.events.on('mandate.setup_started', () => {
+      throw new Error('crm down');
+    });
+    await expect(checkout.createMandate('dummy', setupRequest())).rejects.toBeInstanceOf(CheckoutListenerError);
+    expect(onListenerError).not.toHaveBeenCalled();
+  });
+
+  it('Express callback: a throwing mandate.created listener still runs onOutcome once and answers', async () => {
+    const onListenerError = vi.fn();
+    const checkout = make({ onListenerError });
+    const charges: string[] = [];
+    checkout.events.on('mandate.created', () => {
+      throw new Error('crm down');
+    });
+    checkout.events.on('charge.succeeded', ({ orderId }) => {
+      charges.push(String(orderId));
+    });
+    const pendings = new Map<string, MandatePendingState>([['MNDT0000000001', pendingState()]]);
+    const saved: Mandate[] = [];
+    const onOutcome = vi.fn((outcome: MandateSetupOutcome, _req: Request, res: Response) => {
+      if (outcome.terminal && pendings.delete('MNDT0000000001') && outcome.mandate) saved.push(outcome.mandate);
+      res.redirect(302, outcome.success ? '/app/subscribed' : '/app/subscription-failed');
+    });
+    const app = express();
+    app.use(
+      '/checkout',
+      createCheckoutRouter(checkout, {
+        buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://app.test/ok', cancelUrl: 'https://app.test/ko' }),
+        mandates: {
+          buildMandateRequest: () => setupRequest(),
+          onStarted: () => {},
+          loadPending: (_req, { mandateRef }) => pendings.get(mandateRef) ?? null,
+          onOutcome,
+        },
+      }),
+    );
+    const res = await request(app).get('/checkout/dummy/mandate/callback').query({ mandate_ref: 'MNDT0000000001' });
+    expect(res.status).toBe(302);
+    expect(res.headers.location).toBe('/app/subscribed');
+    expect(provider.calls.confirm).toHaveLength(1);
+    expect(onOutcome).toHaveBeenCalledTimes(1);
+    expect(saved.map((m) => m.providerMandateId)).toEqual([VAULT_ID]);
+    expect(pendings.size).toBe(0);
+    expect(charges).toEqual(['SUB-0001-INIT']);
+    expect(onListenerError).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Mandates: event payload scrubbing and unverified first charges', () => {
+  let checkout: CheckoutConfigurator;
+  let provider: MandateDummyProvider;
+  let events: { name: CheckoutEventName; payload: CheckoutEventPayload }[];
+
+  beforeEach(() => {
+    checkout = new CheckoutConfigurator();
+    provider = new MandateDummyProvider();
+    checkout.registerProvider(provider);
+    events = recordEvents(checkout);
+  });
+
+  const startWith = (providerRef: string, raw: unknown) => (req: MandateSetupRequest): MandateSetupStart => ({
+    success: true,
+    approvalUrl: 'https://pay.test/approve',
+    pending: {
+      provider: 'dummy',
+      mandateRef: req.mandateRef,
+      orderId: req.orderId,
+      amount: req.amount,
+      currency: req.currency,
+      providerRef,
+      createdAt: CREATED_AT,
+    },
+    raw,
+  });
+
+  it('mandate.setup_started scrubs pending.providerRef (the future Satispay token id) from raw', async () => {
+    provider.nextStart = startWith('tok_SECRET', { id: 'tok_SECRET', status: 'PENDING', note: 'token tok_SECRET' });
+    const start = await checkout.createMandate('dummy', setupRequest());
+    expect(start.success).toBe(true);
+    // The returned start keeps the provider's raw untouched
+    expect(start.raw).toEqual({ id: 'tok_SECRET', status: 'PENDING', note: 'token tok_SECRET' });
+    expect(events.map((e) => e.name)).toEqual(['mandate.setup_started']);
+    expect(JSON.stringify(events[0].payload)).not.toContain('tok_SECRET');
+    expect(events[0].payload.raw).toEqual({ id: '[redacted]', status: 'PENDING', note: 'token [redacted]' });
+    expect(events[0].payload.orderId).toBe('SUB-0001-INIT');
+    expect(events[0].payload.data).toEqual({ mandateRef: 'MNDT0000000001' });
+  });
+
+  it('mandate.setup_started keeps raw when providerRef is the orderId (Nexi codTrans)', async () => {
+    provider.nextStart = startWith('SUB-0001-INIT', { codTrans: 'SUB-0001-INIT' });
+    await checkout.createMandate('dummy', setupRequest());
+    expect(events[0].payload.raw).toEqual({ codTrans: 'SUB-0001-INIT' });
+  });
+
+  it('a binary raw never reaches a charge event', async () => {
+    provider.nextCharge = (_m, c) => ({
+      status: 'succeeded',
+      verified: true,
+      chargeRef: c.chargeRef,
+      providerPaymentId: 'PAY-1',
+      raw: Buffer.from('{"vault_id":"vault-tok-SECRET-0001"}'),
+    });
+    const result = await checkout.chargeMandate('dummy', activeMandate(), charge());
+    expect(Buffer.isBuffer(result.raw)).toBe(true);
+    expect(events.map((e) => e.name)).toEqual(['charge.succeeded']);
+    expect(events[0].payload.raw).toBe('[binary]');
+  });
+
+  it('an unverified first charge carries no providerPaymentId, amount or currency', async () => {
+    provider.nextConfirm = (pending) => ({
+      success: true,
+      verified: false,
+      terminal: true,
+      firstCharge: {
+        status: 'succeeded',
+        verified: false,
+        chargeRef: 'FORGED-1',
+        providerPaymentId: 'PAY-FORGED',
+        amount: 0.01,
+        currency: 'USD',
+      },
+      raw: { from: pending.mandateRef },
+    });
+    const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+    expect(outcome).toMatchObject({ success: false, verified: false, terminal: false });
+    expect(outcome.mandate).toBeUndefined();
+    expect(outcome.firstCharge.status).toBe('unknown');
+    expect(outcome.firstCharge.chargeRef).toBe('SUB-0001-INIT');
+    expect(outcome.firstCharge.providerPaymentId).toBeUndefined();
+    expect(outcome.firstCharge.amount).toBeUndefined();
+    expect(outcome.firstCharge.currency).toBeUndefined();
+    expect(events).toHaveLength(0);
+  });
+
+  it('Express: a relative returnUrl answers 400 INVALID_MANDATE_REQUEST without calling the provider', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const app = express();
+    app.use(
+      '/checkout',
+      createCheckoutRouter(checkout, {
+        buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://app.test/ok', cancelUrl: 'https://app.test/ko' }),
+        mandates: {
+          buildMandateRequest: () => setupRequest({ returnUrl: '/checkout/dummy/mandate/callback' }),
+          onStarted: () => {},
+          loadPending: () => null,
+          onOutcome: () => {},
+        },
+      }),
+    );
+    const res = await request(app).post('/checkout/dummy/mandate');
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({
+      success: false,
+      code: 'INVALID_MANDATE_REQUEST',
+      error: 'returnUrl and cancelUrl must be absolute http(s) URLs',
+    });
+    expect(provider.calls.create).toHaveLength(0);
+    vi.restoreAllMocks();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Utils
 // ---------------------------------------------------------------------------
 
@@ -1068,5 +1349,21 @@ describe('redactSecret', () => {
     const out: any = redactSecret(cyclic, 'tok-1');
     expect(out.self).toBe('[circular]');
     expect(redactSecret(cyclic, undefined)).toBe(cyclic);
+  });
+
+  it("replaces binary values with '[binary]' and keeps dates", () => {
+    const when = new Date(CREATED_AT);
+    const out: any = redactSecret(
+      {
+        buf: Buffer.from('{"vault_id":"tok-1"}'),
+        bytes: new Uint8Array([1, 2]),
+        ab: new ArrayBuffer(4),
+        view: new DataView(new ArrayBuffer(2)),
+        when,
+      },
+      'tok-1',
+    );
+    expect(out).toEqual({ buf: '[binary]', bytes: '[binary]', ab: '[binary]', view: '[binary]', when });
+    expect(out.when).toBe(when);
   });
 });

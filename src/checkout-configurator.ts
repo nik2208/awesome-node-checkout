@@ -48,6 +48,17 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '';
 }
 
+/** An absolute `http:` or `https:` URL (what `appendMandateRef` and the providers need). */
+function isAbsoluteHttpUrl(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  try {
+    const { protocol } = new URL(value);
+    return protocol === 'https:' || protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
 /** Same amount in minor units (and same currency, when reported). Only present fields are compared. */
 function chargedAmountMatches(result: ChargeResult, amount: number, currency: string): boolean {
   if (result.currency != null) {
@@ -386,6 +397,10 @@ export class CheckoutConfigurator {
   /**
    * Event payloads never carry the credential-like `providerMandateId`. Nexi's contract number
    * is the app's own `mandateRef`, which is not a credential and is part of every payload.
+   *
+   * Used only after a mandate provider call has completed (confirm, charge, revoke): an error
+   * raised while emitting (a throwing listener) never rejects the caller, because money may
+   * already have moved. It goes to `config.onListenerError` instead (see `reportListenerError`).
    */
   private async emitMandateEvent(
     event: CheckoutEventName,
@@ -393,8 +408,26 @@ export class CheckoutConfigurator {
     providerMandateId: string | undefined,
     mandateRef: string,
   ): Promise<void> {
-    const secret = providerMandateId !== mandateRef ? providerMandateId : undefined;
-    await this.emit(event, redactSecret(payload, secret));
+    try {
+      const secret = providerMandateId !== mandateRef ? providerMandateId : undefined;
+      await this.emit(event, redactSecret(payload, secret));
+    } catch (err) {
+      await this.reportListenerError(err, event);
+    }
+  }
+
+  /** `config.onListenerError`, or `console.error` without it. Never throws. */
+  private async reportListenerError(err: unknown, event: CheckoutEventName): Promise<void> {
+    const hook = this.config.onListenerError;
+    if (typeof hook === 'function') {
+      try {
+        await hook(err, event);
+        return;
+      } catch (hookErr) {
+        console.error('[awesome-node-checkout] onListenerError threw', hookErr);
+      }
+    }
+    console.error('[awesome-node-checkout]', err);
   }
 
   private async emitChargeEvent(
@@ -467,10 +500,13 @@ export class CheckoutConfigurator {
    * (`chargeRef = request.orderId`).
    *
    * Validates the request first and throws `CheckoutError('INVALID_MANDATE_REQUEST')` (or
-   * `'INVALID_AMOUNT'` from `toMinorUnits`) without calling the provider. A successful start whose
+   * `'INVALID_AMOUNT'` from `toMinorUnits`) without calling the provider. `returnUrl` and
+   * `cancelUrl` (and `notifyUrl`, when set) must be absolute http(s) URLs. A successful start whose
    * `pending` does not match the request (provider, mandateRef, orderId) is returned as
    * `success: false`. Persist `pending` before sending the customer to `approvalUrl`.
-   * Emits `mandate.setup_started` (`verified: false`) when the start succeeded.
+   * Emits `mandate.setup_started` (`verified: false`) when the start succeeded, with
+   * `pending.providerRef` scrubbed from its `raw` (unless it is the orderId or the mandateRef).
+   * A listener error on that event propagates: no money has moved yet.
    *
    * @throws CheckoutError('MANDATES_NOT_SUPPORTED') if the provider does not implement mandates.
    */
@@ -498,6 +534,12 @@ export class CheckoutConfigurator {
     }
     if (!isNonEmptyString(request.returnUrl) || !isNonEmptyString(request.cancelUrl)) {
       throw this.invalidMandate('returnUrl and cancelUrl are required', providerName);
+    }
+    if (!isAbsoluteHttpUrl(request.returnUrl) || !isAbsoluteHttpUrl(request.cancelUrl)) {
+      throw this.invalidMandate('returnUrl and cancelUrl must be absolute http(s) URLs', providerName);
+    }
+    if (request.notifyUrl != null && !isAbsoluteHttpUrl(request.notifyUrl)) {
+      throw this.invalidMandate('notifyUrl must be an absolute http(s) URL', providerName);
     }
 
     const start = await provider.createMandate(request);
@@ -529,6 +571,15 @@ export class CheckoutConfigurator {
     }
 
     if (result.success) {
+      // `pending.providerRef` may become the credential-like providerMandateId (Satispay token
+      // id): scrub it from the event's copy of `raw`. Not when it is the app's own orderId or
+      // mandateRef (Nexi), which are part of every payload anyway.
+      const providerRef = result.pending?.providerRef;
+      const secret =
+        isNonEmptyString(providerRef) && providerRef !== request.orderId && providerRef !== request.mandateRef
+          ? providerRef
+          : undefined;
+      // No money has moved yet: a throwing listener propagates, like every non-mandate event
       await this.emit('mandate.setup_started', {
         provider: providerName,
         orderId: request.orderId,
@@ -536,7 +587,7 @@ export class CheckoutConfigurator {
         // A setup start reports no outcome: nothing has been authenticated yet
         verified: false,
         data: { mandateRef: request.mandateRef },
-        raw: result.raw,
+        raw: redactSecret(result.raw, secret),
       });
     }
     return result;
@@ -556,7 +607,10 @@ export class CheckoutConfigurator {
    *
    * Events are emitted only for terminal outcomes: `mandate.created` (success) or
    * `mandate.setup_failed`, then `charge.*` for the first charge. A non-terminal outcome emits
-   * nothing, so a forged callback never looks like a failed setup.
+   * nothing, so a forged callback never looks like a failed setup. Events can repeat for the
+   * same setup (redirect and notification, replays): listeners must be idempotent on `orderId`.
+   * A throwing listener never rejects this method: the error goes to `config.onListenerError`
+   * and the outcome is returned, so `onOutcome` can persist it.
    *
    * @throws CheckoutError('INVALID_MANDATE_REQUEST') if `pending.provider` is not `providerName`.
    */
@@ -617,8 +671,16 @@ export class CheckoutConfigurator {
     const providerCharge = isObject(source.firstCharge) ? source.firstCharge : undefined;
 
     if (source.verified !== true) {
+      // Like normalizeOutcome: an unauthenticated callback provides no identities and no amounts
       const firstCharge: ChargeResult = providerCharge
-        ? { ...providerCharge, chargeRef: pending.orderId, verified: false }
+        ? {
+            ...providerCharge,
+            chargeRef: pending.orderId,
+            verified: false,
+            providerPaymentId: undefined,
+            amount: undefined,
+            currency: undefined,
+          }
         : { status: 'unknown', verified: false, chargeRef: pending.orderId };
       if (!CHARGE_STATUSES.has(firstCharge.status)) firstCharge.status = 'unknown';
       if (firstCharge.status === 'succeeded') {
@@ -678,7 +740,9 @@ export class CheckoutConfigurator {
    * Validates `chargeRef` (/^[A-Za-z0-9-]{2,30}$/, `INVALID_MANDATE_REQUEST`) and the amount
    * (`INVALID_AMOUNT`). A `revoked` mandate returns `failed` with `mandateUnusable: true` without
    * calling the provider. A provider that throws gives `unknown`. See `normalizeCharge` for the
-   * rest. Emits `charge.succeeded`, `charge.failed`, `charge.unknown` or `charge.requires_action`.
+   * rest. Emits `charge.succeeded`, `charge.failed`, `charge.unknown` or `charge.requires_action`;
+   * a throwing listener never rejects this method (the error goes to `config.onListenerError`),
+   * so a charge that moved money always returns its result.
    *
    * Retry an `unknown` charge with the SAME `chargeRef`; a dunning retry after `failed` is a new
    * charge with a NEW `chargeRef`. The library never retries on its own.
@@ -734,8 +798,9 @@ export class CheckoutConfigurator {
 
   /**
    * Revokes the mandate at the provider, when the provider supports it, and emits
-   * `mandate.revoked` with `data: { mandateRef, revokedAtProvider }`. Mark your own copy revoked
-   * whatever the provider answers.
+   * `mandate.revoked` with `data: { mandateRef, revokedAtProvider }` (a throwing listener goes to
+   * `config.onListenerError` and never rejects). Mark your own copy revoked whatever the
+   * provider answers.
    */
   async revokeMandate(providerName: string, mandate: Mandate): Promise<MandateRevokeResult> {
     const provider = this.getMandateProvider(providerName);

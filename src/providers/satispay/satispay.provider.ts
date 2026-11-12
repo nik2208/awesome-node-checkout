@@ -7,6 +7,41 @@ import { InMemoryTransactionStore } from '../../stores/in-memory-transaction.sto
 import { parseAmountFromCents, parseNexiCurrency } from '../../utils/parsing.util';
 import { generateOrderId } from '../../utils/ids';
 import { currencyExponent, isInvalidAmountError, toMinorUnits } from '../../utils/money';
+import { appendMandateRef } from '../../utils/url';
+import { IMandateProvider } from '../../interfaces/mandate-provider.interface';
+import {
+  ChargeRequest,
+  ChargeResult,
+  Mandate,
+  MandateCallbackInput,
+  MandatePendingState,
+  MandateRevokeResult,
+  MandateSetupOutcome,
+  MandateSetupRequest,
+  MandateSetupStart,
+  MandateStatusResult,
+} from '../../models/mandate.model';
+
+/** Result of `send()`: never thrown, `networkError` for transport failures and timeouts. */
+interface SatispaySendResult {
+  ok: boolean;
+  status: number;
+  json?: Record<string, unknown>;
+  networkError?: boolean;
+}
+
+/** Outcome of a server-to-server re-read of a pre-authorized payment token. */
+type TokenRead =
+  | { kind: 'found'; status: string; json: Record<string, unknown> }
+  | { kind: 'not_found' }
+  | { kind: 'unavailable' };
+
+/** Signature headers that `extraHeaders` may never override (compared case-insensitively). */
+const PROTECTED_HEADERS = new Set(['host', 'date', 'digest', 'authorization']);
+
+const REVOKE_UNSUPPORTED =
+  'Satispay does not document a merchant-side revocation; stop charging this mandate. ' +
+  'The customer can revoke it from the Satispay app.';
 
 export interface SatispayProviderConfig {
   keyId: string;
@@ -48,6 +83,18 @@ export interface SatispayProviderConfig {
    * Use a persistent store (Redis, DB) in multi-instance deployments.
    */
   transactionStore?: ITransactionStore;
+  /**
+   * Timeout of the mandate API calls (`createMandate`, `confirmMandate`, `chargeMandate`,
+   * `getMandate`) in milliseconds. A timeout is reported as `unknown`, never `failed`.
+   * @default 30000
+   */
+  timeoutMs?: number;
+  /**
+   * Path of the mandate callback route, appended to `serverUrl` to build the authorization's
+   * `callback_url` when `MandateSetupRequest.notifyUrl` is not set.
+   * @default '/checkout/satispay/mandate/callback'
+   */
+  mandateCallbackPath?: string;
 }
 
 /**
@@ -55,8 +102,12 @@ export interface SatispayProviderConfig {
  * Flow: `webhook` — creates a MATCH_CODE payment, user pays via Satispay app,
  * Satispay calls the `callback_url` webhook, which is correlated to the order
  * via the `ITransactionStore`. The redirect is then verified via `handleRedirect`.
+ *
+ * Recurring payments (`IMandateProvider`): Automatic Payments, web-redirect flow. A setup creates
+ * a pre-authorized payment token, the customer approves it in Satispay, and every charge (the
+ * first one included) is a synchronous `PRE_AUTHORIZED` payment. EUR only.
  */
-export class SatispayProvider extends BasePaymentProvider {
+export class SatispayProvider extends BasePaymentProvider implements IMandateProvider {
   readonly name = 'satispay';
   readonly flow = 'webhook' as const;
 
@@ -309,6 +360,63 @@ export class SatispayProvider extends BasePaymentProvider {
       return JSON.parse(text) as T;
     } catch {
       throw new Error('Invalid provider response');
+    }
+  }
+
+  /**
+   * Signed request that never throws and keeps the HTTP status and the parsed body, for the
+   * mandate methods (which must tell 4xx from 5xx from a timeout). `extraHeaders` are merged after
+   * the signature headers but can never override `Host`, `Date`, `Digest` or `Authorization`
+   * (case-insensitively). `request()` keeps its throwing behaviour for the one-off payment flow.
+   */
+  private async send(
+    method: string,
+    url: string,
+    body?: unknown,
+    extraHeaders: Record<string, string> = {},
+  ): Promise<SatispaySendResult> {
+    try {
+      const parsed = new URL(url);
+      const headers: Record<string, string> = this.buildSignatureHeaders(
+        method,
+        parsed.pathname,
+        parsed.host,
+        body,
+      );
+      for (const [name, value] of Object.entries(extraHeaders)) {
+        if (PROTECTED_HEADERS.has(name.toLowerCase())) continue;
+        headers[name] = value;
+      }
+
+      const response = await fetch(url, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(this.config.timeoutMs ?? 30000),
+      });
+
+      let text: string;
+      try {
+        text = await response.text();
+      } catch {
+        // The body could not be read (connection reset, timeout while streaming)
+        return { ok: false, status: 0, networkError: true };
+      }
+
+      const status = typeof response.status === 'number' ? response.status : 0;
+      const ok = response.ok === true;
+      let json: Record<string, unknown> | undefined;
+      try {
+        const value: unknown = text ? JSON.parse(text) : undefined;
+        if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+          json = value as Record<string, unknown>;
+        }
+      } catch {
+        json = undefined;
+      }
+      return json ? { ok, status, json } : { ok, status };
+    } catch {
+      return { ok: false, status: 0, networkError: true };
     }
   }
 
@@ -598,5 +706,396 @@ export class SatispayProvider extends BasePaymentProvider {
       raw: details.raw,
       ...(details.success ? {} : { error: details.error }),
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // IMandateProvider implementation (Automatic Payments, web-redirect flow)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Creates a pre-authorized payment token (`POST /pre_authorized_payment_tokens`) and returns
+   * its `redirect_url` as `approvalUrl`. Never open that URL in a WebView.
+   *
+   * - EUR only.
+   * - `callback_url` is `notifyUrl` (or `serverUrl + mandateCallbackPath`) with `mandate_ref`
+   *   and the raw `token_id={uuid}` placeholder, which Satispay substitutes with the token id.
+   * - `redirect_url` is `returnUrl` with `mandate_ref`.
+   * - `cancelUrl` is unused: Satispay has no cancel redirect (a canceled authorization is
+   *   reported through the callback and re-read as `CANCELED`).
+   * - `Idempotency-Key: setup-<orderId>`.
+   */
+  async createMandate(request: MandateSetupRequest): Promise<MandateSetupStart> {
+    if (request.currency !== 'EUR') {
+      return { success: false, error: 'Satispay mandates support EUR only' };
+    }
+    try {
+      // The first charge is made later from the pending state: reject an invalid amount now
+      toMinorUnits(request.amount, 'EUR');
+    } catch (error) {
+      return {
+        success: false,
+        error: isInvalidAmountError(error) ? error.message : 'Invalid mandate amount',
+      };
+    }
+
+    const base =
+      request.notifyUrl ??
+      (this.config.serverUrl
+        ? this.config.serverUrl +
+          (this.config.mandateCallbackPath ?? '/checkout/satispay/mandate/callback')
+        : undefined);
+    if (!base) {
+      return { success: false, error: 'Satispay mandates require notifyUrl or serverUrl' };
+    }
+
+    let callbackUrl: string;
+    let redirectUrl: string;
+    try {
+      const callback = new URL(appendMandateRef(base, request.mandateRef));
+      callback.searchParams.delete('token_id');
+      // A fragment is never sent to a server; dropping it keeps the placeholder in the query
+      callback.hash = '';
+      // `{uuid}` is appended raw AFTER serialization: URLSearchParams would percent-encode the
+      // braces and Satispay would no longer substitute the token id
+      callbackUrl = callback.toString() + '&token_id={uuid}';
+      redirectUrl = appendMandateRef(request.returnUrl, request.mandateRef);
+    } catch {
+      return { success: false, error: 'Satispay mandate callback or return URL is not an absolute URL' };
+    }
+
+    const res = await this.send(
+      'POST',
+      `${this.apiUrl}/pre_authorized_payment_tokens`,
+      { reason: request.description, callback_url: callbackUrl, redirect_url: redirectUrl },
+      { 'Idempotency-Key': 'setup-' + request.orderId },
+    );
+    const id = res.json?.['id'];
+    const approvalUrl = res.json?.['redirect_url'];
+    if (!res.ok || typeof id !== 'string' || id === '' || typeof approvalUrl !== 'string' || approvalUrl === '') {
+      // Generic: never the response body, which may carry the token id
+      return {
+        success: false,
+        error: res.networkError
+          ? 'Satispay authorization could not be created (network error or timeout)'
+          : `Satispay authorization could not be created (HTTP ${res.status})`,
+      };
+    }
+
+    return {
+      success: true,
+      approvalUrl,
+      pending: {
+        provider: this.name,
+        mandateRef: request.mandateRef,
+        orderId: request.orderId,
+        amount: request.amount,
+        currency: 'EUR',
+        providerRef: id,
+        createdAt: new Date().toISOString(),
+      },
+      raw: res.json,
+    };
+  }
+
+  /**
+   * Re-reads the authorization server-to-server (the callback is unsigned) and, once it is
+   * `ACCEPTED`, makes the first `PRE_AUTHORIZED` payment with `Idempotency-Key = orderId`. A second
+   * confirm (a second callback, or a re-confirm job with `{}`) replays that key and gets Satispay's
+   * original response instead of charging twice. The token id is always `pending.providerRef`;
+   * a callback `token_id` only has to match it.
+   *
+   * `CANCELED` is terminal with no mandate. The first payment is replayed with the same body and
+   * `Idempotency-Key = orderId` (Satispay returns the original response for a reused key), so a
+   * re-confirm after an `unknown` first charge learns whether it was taken:
+   * - `ACCEPTED` (the authorization was canceled after the first charge): `success: false`,
+   *   verified, terminal, `succeeded` first charge, error 'Authorization canceled after the first
+   *   charge'. The app refunds it or keeps it as a one-off payment.
+   * - a 4xx (no payment exists for that key, e.g. the customer declined the authorization):
+   *   `success: false`, verified, terminal, `failed` first charge ('Authorization canceled').
+   * - 401, 403, 408, 409, 429, 5xx, a network error or an unexpected 2xx: unverified, non-terminal,
+   *   `unknown` first charge.
+   * The replay is only authoritative while Satispay keeps the key (retention not documented).
+   */
+  async confirmMandate(
+    pending: MandatePendingState,
+    input: MandateCallbackInput,
+  ): Promise<MandateSetupOutcome> {
+    const unverified = (error: string): MandateSetupOutcome => ({
+      success: false,
+      verified: false,
+      terminal: false,
+      firstCharge: { status: 'unknown', verified: false, chargeRef: pending.orderId },
+      error,
+    });
+
+    const callbackTokenId = input?.query?.['token_id'];
+    if (callbackTokenId !== undefined && callbackTokenId !== pending.providerRef) {
+      return unverified('Callback token does not match the pending setup');
+    }
+
+    const read = await this.readToken(pending.providerRef);
+    if (read.kind !== 'found') {
+      return unverified('Satispay authorization could not be read');
+    }
+
+    const firstChargeRequest: ChargeRequest = {
+      chargeRef: pending.orderId,
+      amount: pending.amount,
+      currency: 'EUR',
+    };
+
+    switch (read.status) {
+      case 'PENDING':
+        return {
+          success: false,
+          verified: true,
+          terminal: false,
+          error: 'AUTHORIZATION_PENDING',
+          firstCharge: {
+            status: 'unknown',
+            verified: false,
+            chargeRef: pending.orderId,
+            error: 'Authorization still pending',
+          },
+          raw: read.json,
+        };
+      case 'CANCELED': {
+        // Replay the first payment exactly as the ACCEPTED branch sends it (same body, same key)
+        const replay = await this.postPayment(pending.providerRef, firstChargeRequest);
+        if (replay.status === 'succeeded') {
+          return {
+            success: false,
+            verified: true,
+            terminal: true,
+            error: 'Authorization canceled after the first charge',
+            firstCharge: replay,
+            raw: read.json,
+          };
+        }
+        if (replay.status === 'failed') {
+          // A 4xx: Satispay holds no payment for this key. (A local amount or currency check that
+          // failed means no request with this body could ever have been sent.)
+          return {
+            success: false,
+            verified: true,
+            terminal: true,
+            error: 'Authorization canceled',
+            firstCharge: {
+              status: 'failed',
+              verified: true,
+              chargeRef: pending.orderId,
+              error: 'Authorization canceled',
+            },
+            raw: read.json,
+          };
+        }
+        return {
+          ...unverified('Authorization canceled; the first charge outcome is unknown'),
+          firstCharge: replay,
+        };
+      }
+      case 'ACCEPTED': {
+        const mandate: Mandate = {
+          provider: this.name,
+          mandateRef: pending.mandateRef,
+          providerMandateId: pending.providerRef,
+          status: 'active',
+          createdAt: new Date().toISOString(),
+        };
+        const firstCharge = await this.chargeMandate(mandate, firstChargeRequest);
+        return { success: true, verified: true, terminal: true, mandate, firstCharge, raw: read.json };
+      }
+      default:
+        return unverified('Satispay authorization status is not recognised');
+    }
+  }
+
+  /**
+   * Merchant-initiated `PRE_AUTHORIZED` payment, synchronous: Satispay creates it `ACCEPTED` or
+   * answers 4xx without creating a payment. `Idempotency-Key = chargeRef`: the same `chargeRef`
+   * gets Satispay's original response (retention not documented: retry `unknown` promptly).
+   * `providerPaymentId` is the Satispay payment id, refundable with `refundPayment`.
+   * 408 and 409 are `unknown`, not a refusal: they may answer a concurrent request with the same
+   * key that is still in flight (Satispay documents neither the behaviour nor the status).
+   */
+  async chargeMandate(mandate: Mandate, charge: ChargeRequest): Promise<ChargeResult> {
+    const result = await this.postPayment(mandate.providerMandateId, charge);
+    if (result.status === 'failed' && result.verified) {
+      // A refusal (4xx): tell the app whether the authorization itself is gone
+      const read = await this.readToken(mandate.providerMandateId);
+      if (read.kind === 'not_found' || (read.kind === 'found' && read.status === 'CANCELED')) {
+        result.mandateUnusable = true;
+      }
+    }
+    return result;
+  }
+
+  /**
+   * `POST /payments` (`PRE_AUTHORIZED`, `Idempotency-Key = chargeRef`) mapped to a `ChargeResult`,
+   * without the token re-read that sets `mandateUnusable`. A verified `failed` is always a 4xx.
+   */
+  private async postPayment(tokenId: string, charge: ChargeRequest): Promise<ChargeResult> {
+    const chargeRef = charge.chargeRef;
+    if (charge.currency !== 'EUR') {
+      return { status: 'failed', verified: false, chargeRef, error: 'Satispay mandates support EUR only' };
+    }
+    let amountUnit: number;
+    try {
+      amountUnit = toMinorUnits(charge.amount, 'EUR');
+    } catch (error) {
+      return {
+        status: 'failed',
+        verified: false,
+        chargeRef,
+        error: isInvalidAmountError(error) ? error.message : 'Invalid charge amount',
+      };
+    }
+
+    const res = await this.send(
+      'POST',
+      `${this.apiUrl}/payments`,
+      {
+        flow: 'PRE_AUTHORIZED',
+        token: tokenId,
+        amount_unit: amountUnit,
+        currency: 'EUR',
+        external_code: chargeRef,
+        ...(charge.description ? { metadata: { description: charge.description } } : {}),
+      },
+      { 'Idempotency-Key': chargeRef },
+    );
+
+    if (res.networkError) {
+      return { status: 'unknown', verified: false, chargeRef, error: 'Satispay charge timed out or failed to connect' };
+    }
+
+    if (res.ok) {
+      const json = res.json;
+      if (!json) {
+        return { status: 'unknown', verified: false, chargeRef, error: 'Invalid provider response' };
+      }
+      const externalCode = json['external_code'];
+      if (externalCode !== undefined && externalCode !== null && externalCode !== chargeRef) {
+        return {
+          status: 'unknown',
+          verified: false,
+          chargeRef,
+          error: 'Satispay payment does not match the charge reference',
+          raw: json,
+        };
+      }
+      const paymentId = json['id'];
+      if (json['status'] !== 'ACCEPTED' || typeof paymentId !== 'string' || paymentId === '') {
+        return {
+          status: 'unknown',
+          verified: false,
+          chargeRef,
+          error: `Satispay payment is ${typeof json['status'] === 'string' ? json['status'] : 'unknown'}`,
+          raw: json,
+        };
+      }
+      const rawAmount = json['amount_unit'];
+      const amount = parseAmountFromCents(rawAmount);
+      const currency = json['currency'];
+      if ((rawAmount != null && amount === undefined) || (currency != null && typeof currency !== 'string')) {
+        return { status: 'unknown', verified: false, chargeRef, error: 'Invalid provider response', raw: json };
+      }
+      return {
+        status: 'succeeded',
+        // Authenticated server-to-server response, as in getPaymentDetails
+        verified: true,
+        chargeRef,
+        providerPaymentId: paymentId,
+        amount,
+        currency: currency ?? undefined,
+        raw: json,
+      };
+    }
+
+    if (res.status === 401 || res.status === 403 || res.status === 429) {
+      // Merchant-side (credentials, rate limit): not a refusal of this customer's charge
+      return {
+        status: 'unknown',
+        verified: false,
+        chargeRef,
+        error: `Satispay rejected the request (HTTP ${res.status})`,
+        raw: res.json,
+      };
+    }
+
+    if (res.status === 408 || res.status === 409) {
+      // Possibly a same-key request still in flight: the original may succeed
+      return {
+        status: 'unknown',
+        verified: false,
+        chargeRef,
+        error: `Satispay charge outcome is unknown (HTTP ${res.status})`,
+        raw: res.json,
+      };
+    }
+
+    if (res.status >= 400 && res.status < 500) {
+      const json = res.json;
+      return {
+        status: 'failed',
+        verified: true,
+        chargeRef,
+        providerCode: String(json?.['code'] ?? res.status),
+        error: String(json?.['message'] ?? 'Satispay refused the charge'),
+        raw: json,
+      };
+    }
+
+    return {
+      status: 'unknown',
+      verified: false,
+      chargeRef,
+      error: `Satispay charge outcome is unknown (HTTP ${res.status})`,
+      raw: res.json,
+    };
+  }
+
+  /** Re-reads the authorization: ACCEPTED → active, CANCELED or 404 → revoked, PENDING → unknown. */
+  async getMandate(mandate: Mandate): Promise<MandateStatusResult> {
+    const read = await this.readToken(mandate.providerMandateId);
+    if (read.kind === 'not_found') return { status: 'revoked', verified: true };
+    if (read.kind === 'unavailable') return { status: 'unknown', verified: false };
+    switch (read.status) {
+      case 'ACCEPTED':
+        return { status: 'active', verified: true, raw: read.json };
+      case 'CANCELED':
+        return { status: 'revoked', verified: true, raw: read.json };
+      case 'PENDING':
+        return { status: 'unknown', verified: true, raw: read.json };
+      default:
+        return { status: 'unknown', verified: false, raw: read.json };
+    }
+  }
+
+  /**
+   * Makes no network call: Satispay documents no merchant-side revocation (the token API has only
+   * GET). The undocumented `PUT /pre_authorized_payment_tokens/{id}` is deliberately not used.
+   * Stop charging the mandate; the customer can revoke it from the Satispay app.
+   */
+  async revokeMandate(_mandate: Mandate): Promise<MandateRevokeResult> {
+    return { revokedAtProvider: false, error: REVOKE_UNSUPPORTED };
+  }
+
+  /**
+   * `GET /pre_authorized_payment_tokens/{id}`. A 2xx whose `id` is not `tokenId` or whose `status`
+   * is not a string, a network error, a 5xx and any other non-2xx except 404 are `unavailable`.
+   */
+  private async readToken(tokenId: string): Promise<TokenRead> {
+    if (typeof tokenId !== 'string' || tokenId === '') return { kind: 'unavailable' };
+    const res = await this.send(
+      'GET',
+      `${this.apiUrl}/pre_authorized_payment_tokens/${encodeURIComponent(tokenId)}`,
+    );
+    if (res.networkError) return { kind: 'unavailable' };
+    if (res.status === 404) return { kind: 'not_found' };
+    if (!res.ok || !res.json) return { kind: 'unavailable' };
+    const status = res.json['status'];
+    if (res.json['id'] !== tokenId || typeof status !== 'string') return { kind: 'unavailable' };
+    return { kind: 'found', status, json: res.json };
   }
 }

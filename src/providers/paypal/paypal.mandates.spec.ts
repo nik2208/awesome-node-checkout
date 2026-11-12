@@ -1,0 +1,649 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import { PayPalProvider } from './paypal.provider';
+import { CheckoutConfigurator } from '../../checkout-configurator';
+import { isMandateProvider } from '../../interfaces/mandate-provider.interface';
+import { Mandate, MandatePendingState, MandateSetupRequest } from '../../models/mandate.model';
+
+// Mock of PayPal Server SDK v2.5 (no enum objects: the provider writes string literals)
+const sdk = vi.hoisted(() => {
+  class ApiError extends Error {
+    statusCode: number;
+    result: unknown;
+    body: string;
+    // Like the real SDK error: carries the request with its bearer token
+    request = { headers: { authorization: 'Bearer SECRET-TOKEN' } };
+    constructor(statusCode: number, result?: unknown) {
+      super(`HTTP ${statusCode}`);
+      this.name = 'ApiError';
+      this.statusCode = statusCode;
+      this.result = result;
+      this.body = result === undefined ? '' : JSON.stringify(result);
+    }
+  }
+  return {
+    ApiError,
+    createOrder: vi.fn(),
+    captureOrder: vi.fn(),
+    getOrder: vi.fn(),
+    refundCapturedPayment: vi.fn(),
+    getPaymentToken: vi.fn(),
+    deletePaymentToken: vi.fn(),
+  };
+});
+
+vi.mock('@paypal/paypal-server-sdk', () => ({
+  Environment: {
+    Sandbox: class { constructor() {} },
+    Production: class { constructor() {} },
+  },
+  LogLevel: { Error: 'error' },
+  Client: class { constructor() {} },
+  OrdersController: class {
+    createOrder = sdk.createOrder;
+    captureOrder = sdk.captureOrder;
+    getOrder = sdk.getOrder;
+  },
+  PaymentsController: class {
+    refundCapturedPayment = sdk.refundCapturedPayment;
+  },
+  VaultController: class {
+    getPaymentToken = sdk.getPaymentToken;
+    deletePaymentToken = sdk.deletePaymentToken;
+  },
+  ApiError: sdk.ApiError,
+}));
+
+const { ApiError } = sdk;
+const apiError = (status: number, issue?: string) =>
+  new ApiError(
+    status,
+    issue
+      ? { name: 'UNPROCESSABLE_ENTITY', message: 'refused', debug_id: 'dbg-1', details: [{ issue }] }
+      : { name: 'INTERNAL_SERVER_ERROR', message: 'error', debug_id: 'dbg-1' },
+  );
+
+const NOW = new Date('2026-11-12T10:00:00.000Z');
+const ORDER_ID = 'PAYPAL-ORD-1';
+
+const setupRequest: MandateSetupRequest = {
+  mandateRef: 'MNDT0000000001',
+  orderId: 'SUB-0001-INIT',
+  amount: 19.9,
+  currency: 'EUR',
+  description: 'Monthly plan',
+  returnUrl: 'https://shop.test/checkout/paypal/mandate/callback',
+  cancelUrl: 'https://shop.test/checkout/paypal/mandate/callback?cancel=1',
+  notifyUrl: 'https://shop.test/hooks/paypal',
+};
+
+const pending: MandatePendingState = {
+  provider: 'paypal',
+  mandateRef: 'MNDT0000000001',
+  orderId: 'SUB-0001-INIT',
+  amount: 19.9,
+  currency: 'EUR',
+  providerRef: ORDER_ID,
+  createdAt: '2026-11-12T09:00:00.000Z',
+};
+
+const mandate: Mandate = {
+  provider: 'paypal',
+  mandateRef: 'MNDT0000000001',
+  providerMandateId: 'vt_1',
+  status: 'active',
+  createdAt: '2026-11-12T10:00:00.000Z',
+  providerData: { customerId: 'cus_1' },
+};
+
+function purchaseUnit(overrides: Record<string, unknown> = {}) {
+  return {
+    referenceId: 'SUB-0001-INIT',
+    invoiceId: 'SUB-0001-INIT',
+    customId: 'MNDT0000000001',
+    amount: { currencyCode: 'EUR', value: '19.90' },
+    ...overrides,
+  };
+}
+
+function approvedOrder(puOverrides: Record<string, unknown> = {}, status = 'APPROVED') {
+  return { id: ORDER_ID, status, purchaseUnits: [purchaseUnit(puOverrides)] };
+}
+
+function completedOrder(vaultStatus = 'VAULTED', captureStatus = 'COMPLETED', captureValue = '19.90') {
+  return {
+    id: ORDER_ID,
+    status: 'COMPLETED',
+    purchaseUnits: [
+      purchaseUnit({
+        payments: {
+          captures: [{ id: 'CAP-1', status: captureStatus, amount: { currencyCode: 'EUR', value: captureValue } }],
+        },
+      }),
+    ],
+    paymentSource: {
+      paypal: {
+        emailAddress: 'payer@example.com',
+        attributes: { vault: { id: 'vt_1', status: vaultStatus, customer: { id: 'cus_1' } } },
+      },
+    },
+  };
+}
+
+function chargeOrder(orderStatus: string, captureStatus?: string) {
+  return {
+    id: 'PAYPAL-ORD-2',
+    status: orderStatus,
+    purchaseUnits: [
+      {
+        invoiceId: 'SUB-0001-2026-12',
+        customId: 'MNDT0000000001',
+        amount: { currencyCode: 'EUR', value: '19.90' },
+        ...(captureStatus
+          ? {
+              payments: {
+                captures: [{ id: 'CAP-2', status: captureStatus, amount: { currencyCode: 'EUR', value: '19.90' } }],
+              },
+            }
+          : {}),
+      },
+    ],
+  };
+}
+
+const charge = { chargeRef: 'SUB-0001-2026-12', amount: 19.9, currency: 'EUR', description: 'Monthly plan 2026-12' };
+
+describe('PayPalProvider mandates (Vault)', () => {
+  let provider: PayPalProvider;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(NOW);
+    provider = new PayPalProvider({ clientId: 'id', clientSecret: 'secret', environment: 'sandbox' });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('implements IMandateProvider', () => {
+    expect(isMandateProvider(provider)).toBe(true);
+  });
+
+  describe('createMandate', () => {
+    beforeEach(() => {
+      sdk.createOrder.mockResolvedValue({
+        result: {
+          id: ORDER_ID,
+          status: 'PAYER_ACTION_REQUIRED',
+          links: [
+            { rel: 'self', href: `https://api.sandbox.paypal.com/v2/checkout/orders/${ORDER_ID}` },
+            { rel: 'payer-action', href: `https://www.sandbox.paypal.com/checkoutnow?token=${ORDER_ID}` },
+          ],
+        },
+      });
+    });
+
+    it('creates one vault-with-purchase order (criterion 1)', async () => {
+      const start = await provider.createMandate(setupRequest);
+
+      expect(sdk.createOrder).toHaveBeenCalledTimes(1);
+      const arg = sdk.createOrder.mock.calls[0][0];
+      expect(arg.body.paymentSource.paypal.attributes.vault).toEqual({
+        storeInVault: 'ON_SUCCESS',
+        usageType: 'MERCHANT',
+        customerType: 'CONSUMER',
+        usagePattern: 'SUBSCRIPTION_PREPAID',
+        description: 'Monthly plan',
+        permitMultiplePaymentTokens: false,
+      });
+      expect(arg.body.intent).toBe('CAPTURE');
+      expect(arg.body.purchaseUnits[0].invoiceId).toBe('SUB-0001-INIT');
+      expect(arg.body.purchaseUnits[0].referenceId).toBe('SUB-0001-INIT');
+      expect(arg.body.purchaseUnits[0].customId).toBe('MNDT0000000001');
+      expect(arg.body.purchaseUnits[0].amount.value).toBe('19.90');
+      expect(arg.body.purchaseUnits[0].amount.currencyCode).toBe('EUR');
+      expect(arg.paypalRequestId).toBe('setup-SUB-0001-INIT');
+      expect(arg.prefer).toBe('return=representation');
+      const ctx = arg.body.paymentSource.paypal.experienceContext;
+      expect(ctx.returnUrl).toContain('mandate_ref=MNDT0000000001');
+      expect(ctx.cancelUrl).toBe(
+        'https://shop.test/checkout/paypal/mandate/callback?cancel=1&mandate_ref=MNDT0000000001',
+      );
+      expect(ctx.shippingPreference).toBe('NO_SHIPPING');
+      expect(ctx.userAction).toBe('PAY_NOW');
+
+      expect(start.success).toBe(true);
+      expect(start.pending?.providerRef).toBe(ORDER_ID);
+      expect(start.approvalUrl).toBe(`https://www.sandbox.paypal.com/checkoutnow?token=${ORDER_ID}`);
+      expect(start.pending).toEqual({
+        provider: 'paypal',
+        mandateRef: 'MNDT0000000001',
+        orderId: 'SUB-0001-INIT',
+        amount: 19.9,
+        currency: 'EUR',
+        providerRef: ORDER_ID,
+        createdAt: NOW.toISOString(),
+      });
+      // notifyUrl is ignored (no PayPal webhooks)
+      expect(JSON.stringify(arg)).not.toContain('hooks/paypal');
+    });
+
+    it('uses config.customerType', async () => {
+      const business = new PayPalProvider({ clientId: 'id', clientSecret: 'secret', customerType: 'BUSINESS' });
+      await business.createMandate(setupRequest);
+      expect(sdk.createOrder.mock.calls[0][0].body.paymentSource.paypal.attributes.vault.customerType).toBe('BUSINESS');
+    });
+
+    it('falls back to the approve link', async () => {
+      sdk.createOrder.mockResolvedValueOnce({
+        result: { id: ORDER_ID, status: 'CREATED', links: [{ rel: 'approve', href: 'https://paypal.test/approve' }] },
+      });
+      const start = await provider.createMandate(setupRequest);
+      expect(start.approvalUrl).toBe('https://paypal.test/approve');
+    });
+
+    it('returns success: false on an API error without the SDK request in raw', async () => {
+      sdk.createOrder.mockRejectedValueOnce(apiError(422, 'PAYEE_NOT_ENABLED_FOR_VAULTING'));
+      const start = await provider.createMandate(setupRequest);
+      expect(start.success).toBe(false);
+      expect(start.pending).toBeUndefined();
+      expect(JSON.stringify(start)).not.toContain('SECRET-TOKEN');
+    });
+  });
+
+  describe('confirmMandate', () => {
+    function happyPathMocks() {
+      sdk.getOrder.mockResolvedValueOnce({ result: approvedOrder() });
+      sdk.captureOrder.mockResolvedValueOnce({ result: completedOrder() });
+    }
+
+    async function happyPathResult() {
+      happyPathMocks();
+      const out = await provider.confirmMandate(pending, { query: { token: ORDER_ID, PayerID: 'P1' } });
+      vi.clearAllMocks();
+      return out;
+    }
+
+    it('happy path: reads, captures, vaults (criterion 2)', async () => {
+      happyPathMocks();
+      const out = await provider.confirmMandate(pending, { query: { token: ORDER_ID, PayerID: 'P1' } });
+
+      expect(out.success).toBe(true);
+      expect(out.verified).toBe(true);
+      expect(out.terminal).toBe(true);
+      expect(out.mandate?.providerMandateId).toBe('vt_1');
+      expect(out.mandate?.providerData?.customerId).toBe('cus_1');
+      expect(out.mandate).toEqual({
+        provider: 'paypal',
+        mandateRef: 'MNDT0000000001',
+        providerMandateId: 'vt_1',
+        status: 'active',
+        createdAt: NOW.toISOString(),
+        providerData: { customerId: 'cus_1' },
+        unverified: { payerEmail: 'payer@example.com' },
+      });
+      expect(out.firstCharge.status).toBe('succeeded');
+      expect(out.firstCharge.verified).toBe(true);
+      expect(out.firstCharge.chargeRef).toBe('SUB-0001-INIT');
+      expect(out.firstCharge.providerPaymentId).toBe(ORDER_ID);
+      expect(out.firstCharge.amount).toBe(19.9);
+      expect(out.firstCharge.currency).toBe('EUR');
+
+      expect(sdk.getOrder).toHaveBeenCalledTimes(1);
+      expect(sdk.getOrder).toHaveBeenCalledWith({ id: ORDER_ID });
+      expect(sdk.captureOrder).toHaveBeenCalledTimes(1);
+      expect(sdk.getOrder.mock.invocationCallOrder[0]).toBeLessThan(sdk.captureOrder.mock.invocationCallOrder[0]);
+      expect(sdk.captureOrder).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: pending.providerRef,
+          paypalRequestId: 'capture-SUB-0001-INIT',
+          prefer: 'return=representation',
+        }),
+      );
+    });
+
+    it('passes the configurator normalization as a terminal success', async () => {
+      happyPathMocks();
+      const checkout = new CheckoutConfigurator();
+      checkout.registerProvider(provider);
+      const out = await checkout.confirmMandate('paypal', pending, { query: { token: ORDER_ID } });
+      expect(out.success).toBe(true);
+      expect(out.terminal).toBe(true);
+      expect(out.firstCharge.status).toBe('succeeded');
+      expect(out.mandate?.providerMandateId).toBe('vt_1');
+    });
+
+    it('(a) a token for another order is refused without any API call', async () => {
+      const out = await provider.confirmMandate(pending, { query: { token: 'OTHER' } });
+      expect(out.success).toBe(false);
+      expect(out.verified).toBe(false);
+      expect(out.terminal).toBe(false);
+      expect(out.error).toBe('Outcome does not match the pending setup');
+      expect(out.firstCharge.chargeRef).toBe('SUB-0001-INIT');
+      expect(sdk.getOrder).not.toHaveBeenCalled();
+      expect(sdk.captureOrder).not.toHaveBeenCalled();
+    });
+
+    it('(b) an already COMPLETED order is not captured again and equals the happy path', async () => {
+      const happy = await happyPathResult();
+      sdk.getOrder.mockResolvedValueOnce({ result: completedOrder() });
+      const out = await provider.confirmMandate(pending, {});
+      expect(sdk.captureOrder).not.toHaveBeenCalled();
+      expect(out).toEqual(happy);
+    });
+
+    it('(c) ORDER_ALREADY_CAPTURED re-reads the order and equals the happy path', async () => {
+      const happy = await happyPathResult();
+      sdk.getOrder
+        .mockResolvedValueOnce({ result: approvedOrder() })
+        .mockResolvedValueOnce({ result: completedOrder() });
+      sdk.captureOrder.mockRejectedValueOnce(apiError(422, 'ORDER_ALREADY_CAPTURED'));
+      const out = await provider.confirmMandate(pending, { query: { token: ORDER_ID } });
+      expect(sdk.getOrder).toHaveBeenCalledTimes(2);
+      expect(out).toEqual(happy);
+    });
+
+    it('(d) vault APPROVED after capture: MANDATE_NOT_VAULTED with the succeeded first charge', async () => {
+      sdk.getOrder.mockResolvedValueOnce({ result: approvedOrder() });
+      sdk.captureOrder.mockResolvedValueOnce({ result: completedOrder('APPROVED') });
+      const out = await provider.confirmMandate(pending, {});
+      expect(out.success).toBe(false);
+      expect(out.verified).toBe(true);
+      expect(out.terminal).toBe(true);
+      expect(out.error).toBe('MANDATE_NOT_VAULTED');
+      expect(out.mandate).toBeUndefined();
+      expect(out.firstCharge.status).toBe('succeeded');
+    });
+
+    it('(e) an order amount of 9.90 is a terminal failure and is never captured', async () => {
+      sdk.getOrder.mockResolvedValueOnce({
+        result: approvedOrder({ amount: { currencyCode: 'EUR', value: '9.90' } }),
+      });
+      const out = await provider.confirmMandate(pending, {});
+      expect(out.success).toBe(false);
+      expect(out.verified).toBe(true);
+      expect(out.terminal).toBe(true);
+      expect(out.firstCharge.status).toBe('failed');
+      expect(out.error).toBe('Order does not match the pending setup');
+      expect(sdk.captureOrder).not.toHaveBeenCalled();
+    });
+
+    it('(f) a customId of another mandate is a terminal failure and is never captured', async () => {
+      sdk.getOrder.mockResolvedValueOnce({ result: approvedOrder({ customId: 'MNDT9999999999' }) });
+      const out = await provider.confirmMandate(pending, {});
+      expect(out.success).toBe(false);
+      expect(out.verified).toBe(true);
+      expect(out.terminal).toBe(true);
+      expect(out.firstCharge.status).toBe('failed');
+      expect(out.error).toBe('Order does not match the pending setup');
+      expect(sdk.captureOrder).not.toHaveBeenCalled();
+    });
+
+    it('an invoiceId or currency of another order is a terminal failure and is never captured', async () => {
+      sdk.getOrder.mockResolvedValueOnce({ result: approvedOrder({ invoiceId: 'SUB-0002-INIT' }) });
+      expect((await provider.confirmMandate(pending, {})).firstCharge.status).toBe('failed');
+      sdk.getOrder.mockResolvedValueOnce({ result: approvedOrder({ amount: { currencyCode: 'USD', value: '19.90' } }) });
+      expect((await provider.confirmMandate(pending, {})).terminal).toBe(true);
+      expect(sdk.captureOrder).not.toHaveBeenCalled();
+    });
+
+    it('(g) PAYER_ACTION_REQUIRED is verified, non-terminal, never captured', async () => {
+      sdk.getOrder.mockResolvedValueOnce({ result: approvedOrder({}, 'PAYER_ACTION_REQUIRED') });
+      const out = await provider.confirmMandate(pending, {});
+      expect(out.success).toBe(false);
+      expect(out.verified).toBe(true);
+      expect(out.terminal).toBe(false);
+      expect(out.firstCharge).toEqual({
+        status: 'unknown',
+        verified: true,
+        chargeRef: 'SUB-0001-INIT',
+        error: 'ORDER_NOT_APPROVED',
+      });
+      expect(sdk.captureOrder).not.toHaveBeenCalled();
+    });
+
+    it.each(['CREATED', 'SAVED'])('%s is verified and non-terminal', async (status) => {
+      sdk.getOrder.mockResolvedValueOnce({ result: approvedOrder({}, status) });
+      const out = await provider.confirmMandate(pending, {});
+      expect(out.terminal).toBe(false);
+      expect(out.firstCharge.error).toBe('ORDER_NOT_APPROVED');
+      expect(sdk.captureOrder).not.toHaveBeenCalled();
+    });
+
+    it('VOIDED is a terminal failure with a failed first charge', async () => {
+      sdk.getOrder.mockResolvedValueOnce({ result: approvedOrder({}, 'VOIDED') });
+      const out = await provider.confirmMandate(pending, {});
+      expect(out.success).toBe(false);
+      expect(out.verified).toBe(true);
+      expect(out.terminal).toBe(true);
+      expect(out.firstCharge.status).toBe('failed');
+      expect(sdk.captureOrder).not.toHaveBeenCalled();
+    });
+
+    it('(h) a network error on getOrder is non-terminal with an unknown first charge', async () => {
+      sdk.getOrder.mockRejectedValueOnce(new Error('socket hang up'));
+      const out = await provider.confirmMandate(pending, {});
+      expect(out.success).toBe(false);
+      expect(out.terminal).toBe(false);
+      expect(out.firstCharge.status).toBe('unknown');
+      expect(sdk.captureOrder).not.toHaveBeenCalled();
+    });
+
+    it('(i) ApiError 401 on getOrder is non-terminal', async () => {
+      sdk.getOrder.mockRejectedValueOnce(apiError(401));
+      const out = await provider.confirmMandate(pending, {});
+      expect(out.terminal).toBe(false);
+      expect(out.firstCharge.status).toBe('unknown');
+      expect(JSON.stringify(out)).not.toContain('SECRET-TOKEN');
+    });
+
+    it.each([403, 429, 500, 503])('ApiError %i on getOrder is non-terminal', async (status) => {
+      sdk.getOrder.mockRejectedValueOnce(apiError(status));
+      const out = await provider.confirmMandate(pending, {});
+      expect(out.terminal).toBe(false);
+      expect(out.firstCharge.status).toBe('unknown');
+    });
+
+    it('a capture error other than ORDER_ALREADY_CAPTURED is non-terminal and unknown', async () => {
+      sdk.getOrder.mockResolvedValueOnce({ result: approvedOrder() });
+      sdk.captureOrder.mockRejectedValueOnce(apiError(500));
+      const out = await provider.confirmMandate(pending, {});
+      expect(out.terminal).toBe(false);
+      expect(out.firstCharge.status).toBe('unknown');
+      expect(sdk.getOrder).toHaveBeenCalledTimes(1);
+
+      sdk.getOrder.mockResolvedValueOnce({ result: approvedOrder() });
+      sdk.captureOrder.mockRejectedValueOnce(new Error('ETIMEDOUT'));
+      const out2 = await provider.confirmMandate(pending, {});
+      expect(out2.terminal).toBe(false);
+      expect(out2.firstCharge.status).toBe('unknown');
+    });
+
+    it('maps the first capture: PENDING unknown, DECLINED failed, other amount unknown', async () => {
+      sdk.getOrder.mockResolvedValueOnce({ result: completedOrder('VAULTED', 'PENDING') });
+      const pendingCapture = await provider.confirmMandate(pending, {});
+      expect(pendingCapture.success).toBe(true);
+      expect(pendingCapture.terminal).toBe(true);
+      expect(pendingCapture.firstCharge.status).toBe('unknown');
+
+      sdk.getOrder.mockResolvedValueOnce({ result: completedOrder('VAULTED', 'DECLINED') });
+      const declined = await provider.confirmMandate(pending, {});
+      expect(declined.firstCharge.status).toBe('failed');
+      expect(declined.firstCharge.verified).toBe(true);
+
+      sdk.getOrder.mockResolvedValueOnce({ result: completedOrder('VAULTED', 'COMPLETED', '9.90') });
+      const other = await provider.confirmMandate(pending, {});
+      expect(other.firstCharge.status).toBe('unknown');
+      expect(other.firstCharge.error).toBe('Captured amount does not match');
+    });
+
+    it('a missing vault is MANDATE_NOT_VAULTED', async () => {
+      const order = completedOrder();
+      delete (order.paymentSource.paypal.attributes as any).vault;
+      sdk.getOrder.mockResolvedValueOnce({ result: order });
+      const out = await provider.confirmMandate(pending, {});
+      expect(out.success).toBe(false);
+      expect(out.terminal).toBe(true);
+      expect(out.error).toBe('MANDATE_NOT_VAULTED');
+      expect(out.firstCharge.status).toBe('succeeded');
+    });
+  });
+
+  describe('chargeMandate (criterion 4)', () => {
+    it('creates a merchant-initiated order on the vault id', async () => {
+      sdk.createOrder.mockResolvedValueOnce({ result: chargeOrder('COMPLETED', 'COMPLETED') });
+      const result = await provider.chargeMandate(mandate, charge);
+
+      expect(sdk.createOrder).toHaveBeenCalledTimes(1);
+      const arg = sdk.createOrder.mock.calls[0][0];
+      expect(arg.body.paymentSource.paypal).toEqual({
+        vaultId: 'vt_1',
+        storedCredential: { paymentInitiator: 'MERCHANT', usage: 'SUBSEQUENT', usagePattern: 'SUBSCRIPTION_PREPAID' },
+      });
+      expect(arg.paypalRequestId).toBe('SUB-0001-2026-12');
+      expect(arg.body.purchaseUnits[0].invoiceId).toBe('SUB-0001-2026-12');
+      expect(arg.body.purchaseUnits[0].referenceId).toBe('SUB-0001-2026-12');
+      expect(arg.body.purchaseUnits[0].customId).toBe('MNDT0000000001');
+      expect(arg.body.purchaseUnits[0].amount).toEqual({ currencyCode: 'EUR', value: '19.90' });
+      expect(arg.prefer).toBe('return=representation');
+
+      expect(result.status).toBe('succeeded');
+      expect(result.verified).toBe(true);
+      expect(result.chargeRef).toBe('SUB-0001-2026-12');
+      expect(result.providerPaymentId).toBe('PAYPAL-ORD-2');
+      expect(result.amount).toBe(19.9);
+      expect(result.currency).toBe('EUR');
+    });
+
+    it('PAYER_ACTION_REQUIRED gives requires_action', async () => {
+      sdk.createOrder.mockResolvedValueOnce({ result: chargeOrder('PAYER_ACTION_REQUIRED') });
+      const result = await provider.chargeMandate(mandate, charge);
+      expect(result.status).toBe('requires_action');
+      expect(result.verified).toBe(true);
+    });
+
+    it('capture DECLINED gives failed', async () => {
+      sdk.createOrder.mockResolvedValueOnce({ result: chargeOrder('COMPLETED', 'DECLINED') });
+      const result = await provider.chargeMandate(mandate, charge);
+      expect(result.status).toBe('failed');
+      expect(result.verified).toBe(true);
+    });
+
+    it('capture FAILED gives failed, PENDING gives unknown, anything else unknown', async () => {
+      sdk.createOrder.mockResolvedValueOnce({ result: chargeOrder('COMPLETED', 'FAILED') });
+      expect((await provider.chargeMandate(mandate, charge)).status).toBe('failed');
+      sdk.createOrder.mockResolvedValueOnce({ result: chargeOrder('COMPLETED', 'PENDING') });
+      expect((await provider.chargeMandate(mandate, charge)).status).toBe('unknown');
+      sdk.createOrder.mockResolvedValueOnce({ result: chargeOrder('CREATED') });
+      expect((await provider.chargeMandate(mandate, charge)).status).toBe('unknown');
+    });
+
+    it('ApiError 422 DUPLICATE_INVOICE_ID gives unknown with that providerCode', async () => {
+      sdk.createOrder.mockRejectedValueOnce(apiError(422, 'DUPLICATE_INVOICE_ID'));
+      const result = await provider.chargeMandate(mandate, charge);
+      expect(result.status).toBe('unknown');
+      expect(result.providerCode).toBe('DUPLICATE_INVOICE_ID');
+      expect(result.error).toBe('A charge with this chargeRef was already submitted; reconcile it in PayPal');
+      expect(JSON.stringify(result)).not.toContain('SECRET-TOKEN');
+    });
+
+    it('ApiError 500 gives unknown', async () => {
+      sdk.createOrder.mockRejectedValueOnce(apiError(500));
+      const result = await provider.chargeMandate(mandate, charge);
+      expect(result.status).toBe('unknown');
+    });
+
+    it('a network error gives unknown', async () => {
+      sdk.createOrder.mockRejectedValueOnce(new Error('ECONNRESET'));
+      const result = await provider.chargeMandate(mandate, charge);
+      expect(result.status).toBe('unknown');
+      expect(result.verified).toBe(false);
+    });
+
+    it('ApiError 422 PAYMENT_DENIED gives failed with that providerCode', async () => {
+      sdk.createOrder.mockRejectedValueOnce(apiError(422, 'PAYMENT_DENIED'));
+      const result = await provider.chargeMandate(mandate, charge);
+      expect(result.status).toBe('failed');
+      expect(result.verified).toBe(true);
+      expect(result.providerCode).toBe('PAYMENT_DENIED');
+    });
+
+    it.each([401, 429, 403])('ApiError %i gives unknown', async (status) => {
+      sdk.createOrder.mockRejectedValueOnce(apiError(status));
+      const result = await provider.chargeMandate(mandate, charge);
+      expect(result.status).toBe('unknown');
+      expect(result.providerCode).toBe(String(status));
+    });
+
+    it('reads the issue from a JSON body when result is not parsed', async () => {
+      const err = new ApiError(422);
+      err.body = JSON.stringify({ name: 'UNPROCESSABLE_ENTITY', details: [{ issue: 'DUPLICATE_INVOICE_ID' }] });
+      sdk.createOrder.mockRejectedValueOnce(err);
+      const result = await provider.chargeMandate(mandate, charge);
+      expect(result.status).toBe('unknown');
+      expect(result.providerCode).toBe('DUPLICATE_INVOICE_ID');
+    });
+
+    it('through the configurator, a COMPLETED charge is succeeded', async () => {
+      sdk.createOrder.mockResolvedValueOnce({ result: chargeOrder('COMPLETED', 'COMPLETED') });
+      const checkout = new CheckoutConfigurator();
+      checkout.registerProvider(provider);
+      const result = await checkout.chargeMandate('paypal', mandate, charge);
+      expect(result.status).toBe('succeeded');
+      expect(result.providerPaymentId).toBe('PAYPAL-ORD-2');
+    });
+  });
+
+  describe('getMandate and revokeMandate (criterion 5)', () => {
+    it('getMandate maps 200, 404 and 500', async () => {
+      sdk.getPaymentToken.mockResolvedValueOnce({ statusCode: 200, result: { id: 'vt_1' } });
+      expect(await provider.getMandate(mandate)).toEqual({ status: 'active', verified: true });
+      expect(sdk.getPaymentToken).toHaveBeenCalledWith('vt_1');
+
+      sdk.getPaymentToken.mockRejectedValueOnce(apiError(404, 'INVALID_RESOURCE_ID'));
+      expect(await provider.getMandate(mandate)).toMatchObject({ status: 'revoked', verified: true });
+
+      sdk.getPaymentToken.mockRejectedValueOnce(apiError(500));
+      expect(await provider.getMandate(mandate)).toMatchObject({ status: 'unknown', verified: false });
+    });
+
+    it('revokeMandate maps 204, 404 and 500', async () => {
+      sdk.deletePaymentToken.mockResolvedValueOnce({ statusCode: 204, result: undefined });
+      expect((await provider.revokeMandate(mandate)).revokedAtProvider).toBe(true);
+      expect(sdk.deletePaymentToken).toHaveBeenCalledWith('vt_1');
+
+      sdk.deletePaymentToken.mockRejectedValueOnce(apiError(404, 'INVALID_RESOURCE_ID'));
+      expect((await provider.revokeMandate(mandate)).revokedAtProvider).toBe(true);
+
+      sdk.deletePaymentToken.mockRejectedValueOnce(apiError(500));
+      const failed = await provider.revokeMandate(mandate);
+      expect(failed.revokedAtProvider).toBe(false);
+      expect(failed.error).toEqual(expect.any(String));
+    });
+  });
+
+  it('refundPayment still works on the order id of a mandate charge (criterion 6)', async () => {
+    sdk.createOrder.mockResolvedValueOnce({ result: chargeOrder('COMPLETED', 'COMPLETED') });
+    const result = await provider.chargeMandate(mandate, charge);
+    sdk.getOrder.mockResolvedValueOnce({ result: chargeOrder('COMPLETED', 'COMPLETED') });
+    sdk.refundCapturedPayment.mockResolvedValueOnce({ result: { id: 'REFUND-1', status: 'COMPLETED' } });
+
+    const refund = await provider.refundPayment(result.providerPaymentId as string, 19.9);
+
+    expect(sdk.getOrder).toHaveBeenCalledWith({ id: 'PAYPAL-ORD-2' });
+    expect(sdk.refundCapturedPayment).toHaveBeenCalledWith({
+      captureId: 'CAP-2',
+      body: { amount: { value: '19.90', currencyCode: 'EUR' } },
+    });
+    expect(refund.success).toBe(true);
+    expect(refund.paymentId).toBe('REFUND-1');
+  });
+
+  it('package.json declares @paypal/paypal-server-sdk ^2.5.0 (criterion 7)', () => {
+    const pkg = JSON.parse(readFileSync(join(__dirname, '../../../package.json'), 'utf8'));
+    expect(pkg.dependencies['@paypal/paypal-server-sdk']).toBe('^2.5.0');
+  });
+});

@@ -401,6 +401,34 @@ Only `failed` counts towards dunning. Refund a mandate charge with the existing 
 
 Use `checkout.supportsMandates(provider)` to check whether a registered provider implements `IMandateProvider`.
 
+### PayPal (Vault)
+
+`PayPalProvider` implements `IMandateProvider` with **PayPal Vault, saving the PayPal wallet during the first purchase** (Orders v2). It uses no PayPal Subscriptions, billing plans or setup tokens. Requires `@paypal/paypal-server-sdk` `^2.5.0`.
+
+**Prerequisites.**
+- The account must be approved for **reference transactions** ("Save PayPal and Venmo payment methods" in the Payment Preferences). In the sandbox, enable *Vault* under the app's Advanced options. Without it, the setup order is refused or the wallet is not vaulted.
+- Turn on the payment receiving preference **"Block accidental payments"** (one payment per invoice ID). The replay guarantee below depends on it.
+- Optional: `new PayPalProvider({ clientId, clientSecret, customerType: 'BUSINESS' })` (default `'CONSUMER'`) sets the vault customer type.
+
+**Setup.** `createMandate` creates an order for the first charge with `store_in_vault: ON_SUCCESS` (`usage_type: MERCHANT`, `usage_pattern: SUBSCRIPTION_PREPAID`). The order's `invoice_id` and `reference_id` are your `orderId`, its `custom_id` is the `mandateRef`, and its request id is `setup-<orderId>`. `pending.providerRef` is the PayPal order id and `approvalUrl` is its `payer-action` link. `notifyUrl` is ignored: PayPal webhooks (`VAULT.PAYMENT-TOKEN.*`) are not used.
+
+**Confirm.** `confirmMandate` ignores everything in the callback except `token`, which must be `pending.providerRef` (otherwise it is an unverified, non-terminal failure). It re-reads the order with `getOrder` **before** capturing, and checks `custom_id`, `invoice_id`, the amount and the currency against `pending`. An order that does not match is a terminal failure and is **never captured**. Then, by order status:
+- `APPROVED`: captured once, with the request id `capture-<orderId>`. If a concurrent confirm captured it first (`ORDER_ALREADY_CAPTURED`), the order is re-read.
+- `COMPLETED`: already captured. It is used as it is, so a re-confirm with `{}` never captures twice, even after PayPal's 6-hour request-id window.
+- `CREATED`, `SAVED`, `PAYER_ACTION_REQUIRED`: the customer has not approved, or not yet. This is a verified, **non-terminal** failure (`ORDER_NOT_APPROVED`): a cancel link does not end the setup.
+- `VOIDED`: a terminal failure.
+- Any error reading the order (5xx, network, 401, 403, 429), or a capture call that errors with anything other than `ORDER_ALREADY_CAPTURED`: non-terminal, with the first charge `unknown`.
+
+`firstCharge.providerPaymentId` is the **PayPal order id**, which `refundPayment` accepts. A capture still `PENDING` is `unknown`: re-confirm it with `{}` from a job (see [Resolving an unknown first charge](#resolving-an-unknown-first-charge)). `providerMandateId` is the vault payment token id and `providerData.customerId` is the PayPal customer id; the payer email is only a hint under `mandate.unverified`.
+
+**`MANDATE_NOT_VAULTED`.** If the order was captured but PayPal did not report the vault token as `VAULTED` (status `APPROVED`, `CREATED`, or no vault at all), the outcome is terminal with `success: false` and `error: 'MANDATE_NOT_VAULTED'`, and **`firstCharge` still reports the capture**: the customer may have paid. Check `firstCharge.status`. When it is `succeeded`, either refund it with `checkout.refundPayment('paypal', outcome.firstCharge.providerPaymentId)` or keep it as a one-off payment (for example, one paid period with no renewal), and ask the customer to set up a new mandate with a fresh `mandateRef` and `orderId`.
+
+**Charges and replays.** `chargeMandate` creates a merchant-initiated order paid with the vault token (`stored_credential`: `MERCHANT`, `SUBSEQUENT`, `SUBSCRIPTION_PREPAID`), whose request id and `invoice_id` are the `chargeRef`. `providerPaymentId` is the order id. An order that needs the customer (`PAYER_ACTION_REQUIRED`) is `requires_action`; a `DECLINED` or `FAILED` capture and any other 4xx are `failed` (`providerCode` is PayPal's issue, e.g. `PAYMENT_DENIED`); 401, 403 and 429 are `unknown` with `providerCode` `'401'`, `'403'` or `'429'`; 5xx and network errors are `unknown`.
+- **Within 6 hours**, a replay with the same `chargeRef` returns PayPal's original response (PayPal keeps request ids for 6 hours).
+- **After 6 hours**, PayPal refuses the reused invoice id: the result is `unknown` with `providerCode: 'DUPLICATE_INVOICE_ID'` and `'A charge with this chargeRef was already submitted; reconcile it in PayPal'`. It never charges twice, **provided** "Block accidental payments" is on. Reconcile it in the PayPal dashboard by invoice id (= `chargeRef`).
+
+**Status and revocation.** `getMandate` reads the vault token: present is `active`, 404 is `revoked` (both verified), anything else is `unknown` (unverified). `revokeMandate` **deletes the vault payment token** (`DELETE /v3/vault/payment-tokens/{id}`); a token already gone (404) also counts as revoked. Mark your own copy `revoked` whatever it returns: the configurator then refuses to charge it without calling PayPal, and PayPal itself refuses a charge on a deleted token.
+
 ---
 
 ## Security: A Redirect Is Not Proof of Payment

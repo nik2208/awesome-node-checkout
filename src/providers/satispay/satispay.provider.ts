@@ -804,11 +804,10 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
    * original response instead of charging twice. The token id is always `pending.providerRef`;
    * a callback `token_id` only has to match it.
    *
-   * `CANCELED` is terminal (`success: false`, no mandate) but still sends the same first payment
-   * request: a re-confirm may run after an `unknown` first charge, and the customer may have
-   * canceled the authorization since. A canceled token cannot create a payment, so the replay
-   * either returns the original payment (`succeeded`: the customer paid before canceling) or is
-   * refused with a 4xx (`failed`, 'Authorization canceled'); a timeout or a 5xx stays `unknown`.
+   * `CANCELED` is terminal (`success: false`, no mandate) with a verified `failed` first charge
+   * ('Authorization canceled') and makes no payment request (#33). On a re-confirm after an
+   * `unknown` first charge this says nothing about the money: `success` changed, so reconcile the
+   * first payment manually (see "Resolving an unknown first charge" in the README).
    */
   async confirmMandate(
     pending: MandatePendingState,
@@ -847,52 +846,38 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
           },
           raw: read.json,
         };
-      case 'CANCELED': {
-        // Never a verified `failed` without asking: the first payment may already exist
-        const replay = await this.chargeFirst(pending, 'revoked');
-        const firstCharge: ChargeResult =
-          replay.charge.status === 'failed' && replay.charge.verified
-            ? { ...replay.charge, error: 'Authorization canceled' }
-            : replay.charge;
+      case 'CANCELED':
         return {
           success: false,
           verified: true,
           terminal: true,
           error: 'Authorization canceled',
-          firstCharge,
+          firstCharge: {
+            status: 'failed',
+            verified: true,
+            chargeRef: pending.orderId,
+            error: 'Authorization canceled',
+          },
           raw: read.json,
         };
-      }
       case 'ACCEPTED': {
-        const { mandate, charge: firstCharge } = await this.chargeFirst(pending, 'active');
+        const mandate: Mandate = {
+          provider: this.name,
+          mandateRef: pending.mandateRef,
+          providerMandateId: pending.providerRef,
+          status: 'active',
+          createdAt: new Date().toISOString(),
+        };
+        const firstCharge = await this.chargeMandate(mandate, {
+          chargeRef: pending.orderId,
+          amount: pending.amount,
+          currency: 'EUR',
+        });
         return { success: true, verified: true, terminal: true, mandate, firstCharge, raw: read.json };
       }
       default:
         return unverified('Satispay authorization status is not recognised');
     }
-  }
-
-  /**
-   * The setup's first payment: one request for ACCEPTED and CANCELED alike (same body, same
-   * `Idempotency-Key = pending.orderId`), so a replay always matches the original.
-   */
-  private async chargeFirst(
-    pending: MandatePendingState,
-    status: Mandate['status'],
-  ): Promise<{ mandate: Mandate; charge: ChargeResult }> {
-    const mandate: Mandate = {
-      provider: this.name,
-      mandateRef: pending.mandateRef,
-      providerMandateId: pending.providerRef,
-      status,
-      createdAt: new Date().toISOString(),
-    };
-    const charge = await this.chargeMandate(mandate, {
-      chargeRef: pending.orderId,
-      amount: pending.amount,
-      currency: 'EUR',
-    });
-    return { mandate, charge };
   }
 
   /**

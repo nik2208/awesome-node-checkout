@@ -875,4 +875,78 @@ describe('NexiProvider mandates (#31)', () => {
     expect(events[2].payload.orderId).toBe('SUB-0001-2026-12');
     expect(events.every((e) => e.payload.data?.mandateRef === MANDATE_REF)).toBe(true);
   });
+
+  // ---------------------------------------------------------------------------
+  // urlpost must get HTTP 200 (manual pp. 22, 33) — the README onOutcome pattern
+  // ---------------------------------------------------------------------------
+  describe('callback route with the README onOutcome (redirect only GET)', () => {
+    function readmeApp() {
+      const checkout = new CheckoutConfigurator().registerProvider(provider);
+      const events: CheckoutEventName[] = [];
+      for (const name of ['mandate.created', 'mandate.setup_failed', 'charge.succeeded', 'charge.failed'] as const) {
+        checkout.events.on(name, () => {
+          events.push(name);
+        });
+      }
+      const row = { pending: pendingState(), consumed: false };
+      const mandates = new Map<string, Mandate>();
+      const app = express();
+      app.use(express.json());
+      app.use(express.urlencoded({ extended: false }));
+      app.use(
+        '/checkout',
+        createCheckoutRouter(checkout, {
+          buildPaymentRequest: () => null,
+          mandates: {
+            buildMandateRequest: () => setupRequest({ notifyUrl: CALLBACK }),
+            onStarted: () => undefined,
+            loadPending: (_req, { mandateRef }) =>
+              mandateRef === row.pending.mandateRef && !row.consumed ? row.pending : null,
+            onOutcome: (outcome, req, res) => {
+              if (outcome.terminal && !row.consumed) {
+                row.consumed = true;
+                if (outcome.mandate) mandates.set(outcome.mandate.mandateRef, outcome.mandate);
+              }
+              if (req.method === 'GET') {
+                res.redirect(302, outcome.success ? '/app/subscribed' : '/app/failed');
+              }
+            },
+          },
+        }),
+      );
+      return { app, events, mandates };
+    }
+    const path = '/checkout/nexi/mandate/callback?mandate_ref=MNDT0000000001';
+
+    it('answers the urlpost form POST of the OK outcome with HTTP 200, then the browser GET with 404', async () => {
+      const { app, events, mandates } = readmeApp();
+      const { mandate_ref, ...outcome } = okOutcome();
+      expect(outcome.mac).toBe('b30009179e6be7f2af68aebff7182845e2acf905');
+
+      const urlpost = await request(app).post(path).type('form').send(outcome);
+      expect(urlpost.status).toBe(200);
+      expect(urlpost.body).toEqual({ success: true });
+      expect(mandates.get('MNDT0000000001')?.status).toBe('active');
+      expect(events).toEqual(['mandate.created', 'charge.succeeded']);
+
+      // On a terminal that voids on notification failure, the redirect follows the urlpost answer
+      const browser = await request(app).get(`${path}&${new URLSearchParams(outcome)}`);
+      expect(browser.status).toBe(404);
+    });
+
+    it('a KO consumes the setup, so an OK for the same codTrans (multi-attempt terminal) answers 404', async () => {
+      const { app, events, mandates } = readmeApp();
+      const { mandate_ref, ...ok } = okOutcome();
+      const ko = { ...ok, esito: 'KO', codAut: '', mac: 'f7eeec5816848954885a5843445723677977db96' };
+
+      const first = await request(app).post(path).type('form').send(ko);
+      expect(first.status).toBe(200);
+      expect(first.body).toEqual({ success: false });
+
+      const second = await request(app).post(path).type('form').send(ok);
+      expect(second.status).toBe(404);
+      expect(mandates.size).toBe(0);
+      expect(events).toEqual(['mandate.setup_failed', 'charge.failed']);
+    });
+  });
 });

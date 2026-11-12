@@ -845,7 +845,10 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
    * - `esito=OK` with `num_contratto`: active mandate, first charge `succeeded` (terminal). An OK
    *   without `num_contratto` is unverified and non-terminal (no contract may exist).
    * - `esito` `KO`, `ANNULLO` or `ERRORE`: no mandate, first charge `failed` (terminal). Start a
-   *   new setup with a fresh `mandateRef` and `orderId`: a `codTrans` is never reused.
+   *   new setup with a fresh `mandateRef` and `orderId`: a `codTrans` is never reused. This
+   *   requires a terminal that allows a single payment attempt per `codTrans`: on a terminal
+   *   configured for up to 3 attempts (manual, pp. 32-33), a KO then an OK arrive for the same
+   *   `codTrans`, and the OK finds the pending state already consumed.
    * - Any other `esito` (e.g. a pending one) is unverified and non-terminal: it may still turn OK.
    *
    * An empty input (`{}`) has no MAC, so a re-confirm is unverified and non-terminal: Nexi never

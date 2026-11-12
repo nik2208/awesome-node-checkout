@@ -68,6 +68,10 @@ vi.mock('@paypal/paypal-server-sdk', () => {
         },
         PaymentsController: class {
             refundCapturedPayment = mockRefundCapturedPayment;
+        },
+        VaultController: class {
+            getPaymentToken = vi.fn();
+            deletePaymentToken = vi.fn();
         }
     };
 });

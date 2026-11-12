@@ -46,14 +46,15 @@ checkout
     callbackPath: '/checkout/satispay/webhook', // Optional: defaults to /checkout/satispay/webhook
   }));
 
-// Use directly — no HTTP framework needed
+// Use directly — no HTTP framework needed. The amount comes from your own order, never from the client.
+const order = await myOrderService.getOrder('ORD-1234');
 const result = await checkout.createPayment('paypal', {
-  amount: 49.99,
-  currency: 'EUR',
-  description: 'Order #1234',
+  amount: order.totalAmount, // e.g. 49.99: at most as many decimals as the currency allows
+  currency: order.currency,  // e.g. 'EUR'
+  description: `Order #${order.id}`,
   returnUrl: 'https://myapp.com/payment/success',
   cancelUrl: 'https://myapp.com/payment/cancel',
-  orderId: 'ORD-1234',
+  orderId: order.id,
 });
 
 if (result.approvalUrl) {
@@ -81,7 +82,7 @@ app.use(express.urlencoded({ extended: false }));
 app.use(
   '/checkout',
   createCheckoutRouter(checkout, {
-    // Recommended: verify order and compute amount on the server
+    // Required: verify the order and compute the amount on the server
     buildPaymentRequest: async (req, { provider }) => {
       const order = await myOrderService.getOrder(req.body.orderId);
       return {
@@ -99,10 +100,6 @@ app.use(
       onSuccess: (result, req) => `/orders/${result.orderId}?status=success`,
       onFailure: (result, req) => `/orders/${result.orderId}?status=failed&error=${encodeURIComponent(result.error || '')}`,
     },
-    // Optional: gate or disable public access to GET /:provider/:id
-    details: {
-      enabled: false, // or provide middleware: [requireAuth]
-    },
     // Opt-in: mount POST /:provider/refund protected by admin middleware
     refund: {
       middleware: [requireAdminAuth],
@@ -118,13 +115,24 @@ app.use(
       ':provider/webhook',
       ':provider/redirect',
     ],
+    // Optional: report unexpected (500) errors; the client only sees 'Internal server error'
+    onError: (err, req) => logger.error({ err, path: req.path }, 'checkout error'),
   }),
 );
 
 app.listen(3000);
 ```
 
-> **Security Note**: Never trust client-sent amounts directly. Always define `buildPaymentRequest` so the payment amount and order parameters are derived server-side. If `buildPaymentRequest` is omitted, the router will issue a warning at mount time and validate that client bodies contain positive finite amounts and valid currencies.
+> **Security Note**: Never trust client-sent amounts. `buildPaymentRequest` derives the amount and order parameters server-side, and since 2.0.0 it is mandatory: `createCheckoutRouter` throws `CheckoutError('INSECURE_CONFIGURATION')` at mount without it. See [Secure defaults (2.0)](#secure-defaults-20).
+
+To expose payment status to your own front end, mount the details route explicitly and protect it:
+
+```typescript
+createCheckoutRouter(checkout, {
+  buildPaymentRequest,
+  details: { middleware: [requireAuth] }, // GET /checkout/:provider/:id
+});
+```
 
 ### With Fastify (or any other framework)
 
@@ -132,8 +140,17 @@ Use the `CheckoutConfigurator` methods directly in your own routes:
 
 ```typescript
 fastify.post('/checkout/:provider', async (req, reply) => {
-  const result = await checkout.createPayment(req.params.provider, req.body);
-  reply.status(result.success ? 201 : 400).send(result);
+  // Build the request from your own order: never pass req.body to createPayment
+  const order = await myOrderService.getOrder(req.body.orderId);
+  const result = await checkout.createPayment(req.params.provider, {
+    amount: order.totalAmount,
+    currency: order.currency,
+    orderId: order.id,
+    returnUrl: `https://myapp.com/checkout/${req.params.provider}/redirect`,
+    cancelUrl: 'https://myapp.com/payment/cancel',
+  });
+  const { raw, ...safeResult } = result;
+  reply.status(result.success ? 201 : 400).send(safeResult);
 });
 
 // Handle both POST and GET webhooks (e.g. Satispay GET callback vs Nexi/Satispay POST notification)
@@ -165,12 +182,35 @@ A full-featured reference implementation using Express 5, SQLite (`ITransactionS
 
 | Method      | Path                        | Description                                                    |
 |-------------|-----------------------------|----------------------------------------------------------------|
-| POST        | `/:provider`                | Create a payment (server-built or validated)                  |
+| POST        | `/:provider`                | Create a payment (built by `buildPaymentRequest`)              |
 | POST        | `/:provider/execute`        | Execute/capture a payment (supports `onBeforeExecute`)         |
 | GET         | `/:provider/redirect`       | Handle provider redirect callback (supports 302 via `redirect`)|
-| GET         | `/:provider/:id`            | Get payment details (*configurable*: can disable or protect via `details`)|
+| GET         | `/:provider/:id`            | Get payment details (*opt-in*: mounted only when `details` option is set; protect it with `details.middleware`)|
 | POST        | `/:provider/refund`         | Refund a payment (*opt-in*: mounted only when `refund` option is set)|
 | GET / POST  | `/:provider/webhook`        | Handle provider webhook (POST for Nexi/Satispay, GET for Satispay)|
+
+---
+
+## Secure defaults (2.0)
+
+Since 2.0.0 every permissive behaviour of `createCheckoutRouter` is an explicit, named opt-in that shows up in code review.
+
+1. **`buildPaymentRequest` is mandatory.** Without it, `createCheckoutRouter` throws `CheckoutError` with code `INSECURE_CONFIGURATION` at mount. The opt-out is `allowClientPaymentRequest: true`: the client request body becomes the `PaymentRequest`, so **the browser chooses the amount**. Never use it for a shop. It prints one `console.warn` at mount.
+2. **`GET /:provider/:id` is opt-in.** The details route returns `success`, `status`, `amount`, `currency` and `paymentId` for any id it is given (for Nexi, the id is your order code). It is mounted only when `details` is set: `details: { middleware: [requireAuth] }`. `details: {}` mounts it unprotected and prints one `console.warn`. The old `details: { enabled: false }` is deprecated and behaves as omitted.
+3. **Generated order ids are unpredictable.** When `orderId` is omitted, Nexi (`codTrans`) and Satispay (`external_code`) use `ORD-` + 24 random hex chars instead of `ORD-<timestamp>`, so ids cannot be enumerated and do not collide.
+4. **Amounts are exact, in the currency's minor units.** Amounts are checked against the ISO 4217 exponent (0 for JPY, KRW, CLP…; 3 for KWD, BHD, JOD…; 2 otherwise) and never rounded: `19.999 EUR` or `10.5 JPY` fails with `INVALID_AMOUNT` instead of charging a rounded amount. The router answers `400 { success: false, code: 'INVALID_AMOUNT', error }` without calling the provider; a provider called directly returns `{ success: false, status: 'FAILED', error }`. PayPal formats payment and refund amounts with the exponent of the order's currency: it receives `'1000'` for 1000 JPY and `'1.200'` for 1.2 KWD. Nexi and Satispay accept only currencies with 2 decimal places: `createPayment` in JPY, KWD or another 0- or 3-decimal currency (including Nexi numeric codes such as `392`) returns `{ success: false, status: 'FAILED', error }`, because their outcome amounts and refund amounts are in hundredths. A refund `amount` of `0` (or `null`) fails like any invalid amount; only an omitted amount refunds in full.
+5. **500 bodies are generic.** An unexpected error (a throwing `buildPaymentRequest`, `onBeforeExecute`, `redirect.onSuccess`/`onFailure`, event listener, or provider) answers `500 { success: false, error: 'Internal server error' }`. The error goes to `onError(err, req)`, or to `console.error` when `onError` is not set. `exposeErrorMessages: true` restores the message in the body (for development). `CheckoutError` responses (4xx) keep their message and code and are not passed to `onError`.
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `buildPaymentRequest` | — (required) | Server-side `PaymentRequest` |
+| `allowClientPaymentRequest: true` | off | Client body decides the amount (insecure) |
+| `details: { middleware }` | not mounted | Mounts `GET /:provider/:id` |
+| `refund: { middleware }` | not mounted | Mounts `POST /:provider/refund` |
+| `exposeErrorMessages: true` | off | Error messages in 500 bodies |
+| `onError(err, req)` | `console.error` | Receives every 500 error |
+
+**`POST /:provider/execute` stays mounted by default.** Capturing an approved payment only completes the payer's own payment, and since 1.3.0 the outcome is keyed on the provider-authenticated payment id (#27), so a forged `paymentId` cannot confirm another order. Use `execute.middleware` or `execute.onBeforeExecute` to tie the capture to the current session.
 
 ---
 
@@ -182,7 +222,7 @@ Relying solely on front-end browser redirects (`GET /:provider/redirect`) to ful
 - **Amount Mismatch**: Always verify that the captured payment amount matches your order ledger before fulfilling goods or services. In `awesome-node-checkout`, `success: true` strictly requires that a payment is confirmed with a valid amount.
 
 To ensure safe fulfillment:
-1. **Verify Amount & Currency**: `PaymentResult` and `WebhookResult` return `amount` and `currency` extracted directly from the provider. Compare amounts in minor units (cents) or with rounding to prevent floating-point discrepancies:
+1. **Verify Amount & Currency**: `PaymentResult` and `WebhookResult` return `amount` and `currency` extracted directly from the provider. Compare amounts in minor units (cents) or with rounding to prevent floating-point discrepancies. The example below scales by 100, which is exact for currencies with at most 2 decimal places (every Nexi and Satispay payment created through this library); for a PayPal order in a 3-decimal currency such as KWD, scale by 1000:
    ```typescript
    const result = await checkout.handleRedirect(provider, req.query);
    if (result.success) {
@@ -229,7 +269,7 @@ checkout.events
   .on('webhook.received',  ({ provider, paymentId, orderId, status, error, verified, data, raw }) => { /* ... */ });
 ```
 
-An error thrown by a listener propagates to the caller wrapped in a `CheckoutListenerError` (exported): its `message` is the original message (or `String(value)` for non-Error values), `cause` is the original value, untouched (frozen errors are fine), and `event` is the event name. The Express adapter answers `500` with that message.
+An error thrown by a listener propagates to the caller wrapped in a `CheckoutListenerError` (exported): its `message` is the original message (or `String(value)` for non-Error values), `cause` is the original value, untouched (frozen errors are fine), and `event` is the event name. The Express adapter answers `500` with a generic body (the message only with `exposeErrorMessages: true`) and passes the error to `onError`.
 
 Currencies are validated against the ISO 4217 list of active alpha-3 codes (`ISO_4217_ALPHA3_CODES`, plus the mapped Nexi numeric codes such as `978`); shape-only codes like `'XYZ'` or `'ABC'` and non-monetary codes (`XXX`, `XTS`, precious metals) are rejected.
 

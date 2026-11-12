@@ -143,6 +143,7 @@ describe('Issue #25 Acceptance Criteria Verification', () => {
       app.use(
         '/checkout',
         createCheckoutRouter(checkout, {
+          buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }),
           redirect: {
             onSuccess: (res) => {
               onSuccessOrderId = res.orderId;
@@ -171,7 +172,7 @@ describe('Issue #25 Acceptance Criteria Verification', () => {
       checkout.registerProvider(nexi);
 
       const app = express();
-      app.use('/checkout', createCheckoutRouter(checkout));
+      app.use('/checkout', createCheckoutRouter(checkout, { buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }) }));
 
       const query = generateValidNexiRedirectQuery('COD_EXPRESS_2', 'OK', '1000', 'EUR', {
         order_id: 'VICTIM',
@@ -211,6 +212,8 @@ describe('Issue #25 Acceptance Criteria Verification', () => {
             returnUrl: 'https://ex.com/ret',
             cancelUrl: 'https://ex.com/can',
           }),
+          exposeErrorMessages: true,
+          onError: () => {},
         }),
       );
 
@@ -244,6 +247,8 @@ describe('Issue #25 Acceptance Criteria Verification', () => {
             returnUrl: 'https://ex.com/ret',
             cancelUrl: 'https://ex.com/can',
           }),
+          exposeErrorMessages: true,
+          onError: () => {},
         }),
       );
 

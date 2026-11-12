@@ -5,6 +5,8 @@ import { PaymentResult, WebhookResult } from '../../models/payment-result.model'
 import { ITransactionStore } from '../../interfaces/transaction-store.interface';
 import { InMemoryTransactionStore } from '../../stores/in-memory-transaction.store';
 import { parseAmountFromCents, parseNexiCurrency } from '../../utils/parsing.util';
+import { generateOrderId } from '../../utils/ids';
+import { currencyExponent, isInvalidAmountError, toMinorUnits } from '../../utils/money';
 
 export interface SatispayProviderConfig {
   keyId: string;
@@ -316,7 +318,7 @@ export class SatispayProvider extends BasePaymentProvider {
 
   async createPayment(request: PaymentRequest): Promise<PaymentResult> {
     try {
-      const orderId = request.orderId ?? `ORD-${Date.now()}`;
+      const orderId = request.orderId ?? generateOrderId();
       const baseUrl = this.config.serverUrl ?? '';
       const callbackPath = this.config.callbackPath ?? '/checkout/satispay/webhook';
 
@@ -332,10 +334,19 @@ export class SatispayProvider extends BasePaymentProvider {
           status: 'FAILED',
         };
       }
+      // Payment details and refunds are read and sent in hundredths: only 2-decimal currencies
+      // keep create, read-back and refund on the same scale
+      if (currencyExponent(validatedCurrency) !== 2) {
+        return {
+          success: false,
+          error: 'Payment currency is not supported by Satispay: only currencies with 2 decimal places are accepted',
+          status: 'FAILED',
+        };
+      }
 
       const body = {
         flow: 'MATCH_CODE',
-        amount_unit: Math.round(request.amount * 100),
+        amount_unit: toMinorUnits(request.amount, validatedCurrency),
         currency: validatedCurrency,
         external_code: orderId,
         callback_url: callbackUrl,
@@ -361,6 +372,9 @@ export class SatispayProvider extends BasePaymentProvider {
         raw: payment,
       };
     } catch (error) {
+      if (isInvalidAmountError(error)) {
+        return { success: false, error: error.message, status: 'FAILED' };
+      }
       return this.errorResult(error, 'Failed to create Satispay payment');
     }
   }
@@ -425,7 +439,10 @@ export class SatispayProvider extends BasePaymentProvider {
       };
     }
     try {
-      const body = amount ? { amount_unit: Math.round(amount * 100) } : {};
+      // The refund call carries no currency. createPayment accepts only 2-decimal currencies,
+      // so a partial amount is always in hundredths. Only an omitted (undefined) amount means a
+      // full refund, as in PayPal: 0 and null are rejected by toMinorUnits like any invalid amount.
+      const body = amount !== undefined ? { amount_unit: toMinorUnits(amount, 'EUR') } : {};
       const refund = await this.request<Record<string, unknown>>(
         'POST',
         `${this.apiUrl}/payments/${encodeURIComponent(paymentId)}/refunds`,
@@ -439,6 +456,9 @@ export class SatispayProvider extends BasePaymentProvider {
         raw: refund,
       };
     } catch (error) {
+      if (isInvalidAmountError(error)) {
+        return { success: false, error: error.message, status: 'FAILED' };
+      }
       return this.errorResult(error, 'Failed to refund Satispay payment');
     }
   }

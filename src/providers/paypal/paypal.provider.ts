@@ -9,6 +9,7 @@ import { BasePaymentProvider } from '../../abstract/base-payment-provider.abstra
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult } from '../../models/payment-result.model';
 import { parseAmount } from '../../utils/parsing.util';
+import { isInvalidAmountError, toMajorString } from '../../utils/money';
 
 export interface PayPalProviderConfig {
   clientId: string;
@@ -52,6 +53,7 @@ export class PayPalProvider extends BasePaymentProvider {
 
   async createPayment(request: PaymentRequest): Promise<PaymentResult> {
     try {
+      const value = toMajorString(request.amount, request.currency);
       const { result: order } = await this.ordersController.createOrder({
         body: {
           intent: 'CAPTURE' as any,
@@ -59,7 +61,7 @@ export class PayPalProvider extends BasePaymentProvider {
             {
               amount: {
                 currencyCode: request.currency,
-                value: request.amount.toFixed(2),
+                value,
               },
               description: request.description,
             },
@@ -88,6 +90,9 @@ export class PayPalProvider extends BasePaymentProvider {
         raw: order,
       };
     } catch (error) {
+      if (isInvalidAmountError(error)) {
+        return { success: false, error: error.message, status: 'FAILED' };
+      }
       return this.errorResult(error, 'Failed to create PayPal payment');
     }
   }
@@ -218,7 +223,7 @@ export class PayPalProvider extends BasePaymentProvider {
             status: 'REFUND_FAILED',
           };
         }
-        refundBody['amount'] = { value: amount.toFixed(2), currencyCode };
+        refundBody['amount'] = { value: toMajorString(amount, currencyCode), currencyCode };
       }
 
       const { result: refund } = await this.paymentsController.refundCapturedPayment({
@@ -234,6 +239,9 @@ export class PayPalProvider extends BasePaymentProvider {
         raw: refund,
       };
     } catch (error) {
+      if (isInvalidAmountError(error)) {
+        return { success: false, error: error.message, status: 'FAILED' };
+      }
       return this.errorResult(error, 'Failed to refund PayPal payment');
     }
   }

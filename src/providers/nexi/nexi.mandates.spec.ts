@@ -829,7 +829,7 @@ describe('NexiProvider mandates (#31)', () => {
               row.consumed = true;
               if (outcome.mandate) mandates.set(outcome.mandate.mandateRef, outcome.mandate);
             }
-            res.redirect(302, outcome.success ? '/app/subscribed' : '/app/failed');
+            if (req.method === 'GET') res.redirect(302, outcome.success ? '/app/subscribed' : '/app/failed');
           },
         },
       }),

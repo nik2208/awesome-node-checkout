@@ -64,8 +64,9 @@ export interface ExpressMandateOptions {
   /**
    * REQUIRED. Persist the outcome (idempotently: it may be called twice). When `outcome.terminal`
    * is true, atomically consume the pending state and save `outcome.mandate`; never consume it on
-   * a non-terminal outcome. Respond yourself (typically `res.redirect(302, …)` to your UI);
-   * otherwise the route answers `200 { success }`. Consuming closes the route, it does not delete
+   * a non-terminal outcome. Redirect the customer's browser yourself (`req.method === 'GET'`,
+   * typically `res.redirect(302, …)` to your UI); do not respond to a server-to-server POST (Nexi
+   * `urlpost`, which must get HTTP 200), and the route answers `200 { success }`. Consuming closes the route, it does not delete
    * the record: when `outcome.firstCharge.status` is `unknown`, keep the pending state and resolve
    * the charge from a job with `checkout.confirmMandate(provider, pending, {})`, never with
    * `chargeMandate` and the setup's `orderId`.

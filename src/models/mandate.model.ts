@@ -19,7 +19,11 @@ export const CHARGE_REF_PATTERN = /^[A-Za-z0-9-]{2,30}$/;
 export interface MandateSetupRequest {
   /** Fresh for EVERY setup attempt (never reuse one after a failed or abandoned setup). /^[A-Za-z0-9_-]{5,30}$/ (Nexi num_contratto limits). */
   mandateRef: string;
-  /** Order code of the FIRST charge; also its chargeRef. Fresh for every setup attempt. /^[A-Za-z0-9-]{2,30}$/ (no underscore: Nexi codiceTransazione) */
+  /**
+   * Order code of the FIRST charge; also its chargeRef. Fresh for every setup attempt.
+   * /^[A-Za-z0-9-]{2,30}$/ (no underscore: Nexi codiceTransazione). Never pass it to
+   * `chargeMandate`: an `unknown` first charge is resolved by re-running `confirmMandate`.
+   */
   orderId: string;
   /** First charge, major units; validated with toMinorUnits(amount, currency). */
   amount: number;
@@ -38,7 +42,11 @@ export interface MandateSetupRequest {
   notifyUrl?: string;
 }
 
-/** Persist verbatim; pass back to confirmMandate. JSON-serializable. */
+/**
+ * Persist verbatim; pass back to confirmMandate. JSON-serializable. Keep it after a terminal
+ * outcome consumed it while that outcome's `firstCharge` is `unknown`: it is the input of
+ * `confirmMandate(provider, pending, {})`, which resolves the first charge.
+ */
 export interface MandatePendingState {
   provider: string;
   mandateRef: string;
@@ -85,7 +93,9 @@ export interface Mandate {
  * - `failed`: the charge was authoritatively refused. Counts towards dunning; a retry is a NEW
  *   charge with a new `chargeRef`.
  * - `unknown`: timeout, 5xx, unparseable body, merchant-side refusal (401/403/429, auth/MAC
- *   error, rate limit) or an unauthenticated "success". Retry with the SAME `chargeRef`.
+ *   error, rate limit) or an unauthenticated "success". A `chargeMandate` charge: retry with the
+ *   SAME `chargeRef`. The first charge of a setup (`chargeRef = orderId`): re-run
+ *   `confirmMandate(provider, pending, {})`, never `chargeMandate` with the setup's `orderId`.
  * - `requires_action`: the provider needs the customer (e.g. PayPal `PAYER_ACTION_REQUIRED`).
  */
 export type ChargeStatus = 'succeeded' | 'failed' | 'unknown' | 'requires_action';
@@ -127,6 +137,13 @@ export interface MandateSetupOutcome {
    */
   terminal: boolean;
   mandate?: Mandate;
+  /**
+   * The first charge (`chargeRef = orderId`). It can be `unknown` on a terminal outcome, even with
+   * `success: true` (e.g. a PayPal capture still `PENDING`, a Satispay first payment that timed
+   * out). Resolve it by keeping the consumed pending state and re-running
+   * `confirmMandate(provider, pending, {})` from a job, never with `chargeMandate` and the setup's
+   * `orderId` (on PayPal that is a new order: a double charge or `DUPLICATE_INVOICE_ID`).
+   */
   firstCharge: ChargeResult;
   error?: string;
   raw?: unknown;

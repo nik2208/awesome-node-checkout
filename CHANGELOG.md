@@ -23,6 +23,7 @@ Recurring payments (mandates): the core contract, configurator methods and Expre
 
 ### Documentation
 - README: "Recurring payments (mandates)" section (model, configurator guarantees, Express example, single-use pending state, `mandate_ref` rationale, renewal job example, provider prerequisites), mandate rows in the Routes table (including `GET /:provider/mandate` → 405), mandate events (repeats, listener errors). Resolves #30.
+- README and JSDoc: resolving an `unknown` first charge. A terminal setup outcome can report `firstCharge.status === 'unknown'`, even with `success: true` (a PayPal capture still `PENDING`, a Satispay first payment that timed out). The app keeps the consumed pending state and re-runs `checkout.confirmMandate(provider, pending, {})` from a job; it must **never** call `chargeMandate` with the setup's `orderId`, which on PayPal creates a new order (a double charge, or `unknown` forever with `DUPLICATE_INVOICE_ID`). "Retry `unknown` with the same `chargeRef`" now applies explicitly to `chargeMandate` charges only. Providers must keep `confirmMandate(pending, {})` safe to re-run after a terminal outcome (re-read or replay their own idempotency keys, never a second first charge). Listeners dedupe on the event name and `orderId`, since a resolved charge emits `charge.unknown` then `charge.succeeded` or `charge.failed` for the same `orderId`. Resolves #30.
 
 ## [2.0.0] - 2026-11-12
 

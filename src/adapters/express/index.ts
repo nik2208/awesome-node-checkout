@@ -65,7 +65,10 @@ export interface ExpressMandateOptions {
    * REQUIRED. Persist the outcome (idempotently: it may be called twice). When `outcome.terminal`
    * is true, atomically consume the pending state and save `outcome.mandate`; never consume it on
    * a non-terminal outcome. Respond yourself (typically `res.redirect(302, …)` to your UI);
-   * otherwise the route answers `200 { success }`.
+   * otherwise the route answers `200 { success }`. Consuming closes the route, it does not delete
+   * the record: when `outcome.firstCharge.status` is `unknown`, keep the pending state and resolve
+   * the charge from a job with `checkout.confirmMandate(provider, pending, {})`, never with
+   * `chargeMandate` and the setup's `orderId`.
    */
   onOutcome: (outcome: MandateSetupOutcome, req: Request, res: Response) => void | Promise<void>;
 

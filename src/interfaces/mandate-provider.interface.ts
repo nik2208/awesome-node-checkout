@@ -33,7 +33,13 @@ import {
 export interface IMandateProvider {
   /** Starts a setup (customer present). The setup always includes the first charge. */
   createMandate(request: MandateSetupRequest): Promise<MandateSetupStart>;
-  /** Idempotent: may be called twice (redirect + server notification) for the same pending state. */
+  /**
+   * Idempotent: may be called twice (redirect + server notification) for the same pending state.
+   * Must also be safe to call again with an empty `input` (`{}`) at any time, including after a
+   * terminal outcome: apps re-run it from a job to resolve a first charge reported `unknown`. Re-read
+   * the setup server-to-server or replay the same idempotency keys; never start a second first
+   * charge. Without a way to re-read, return an unverified, non-terminal outcome.
+   */
   confirmMandate(pending: MandatePendingState, input: MandateCallbackInput): Promise<MandateSetupOutcome>;
   /** Merchant-initiated charge (customer absent). Idempotent on `charge.chargeRef`. */
   chargeMandate(mandate: Mandate, charge: ChargeRequest): Promise<ChargeResult>;

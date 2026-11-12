@@ -612,6 +612,11 @@ export class CheckoutConfigurator {
    * A throwing listener never rejects this method: the error goes to `config.onListenerError`
    * and the outcome is returned, so `onOutcome` can persist it.
    *
+   * A terminal outcome can carry a first charge reported `unknown` (even with `success: true`).
+   * Resolve it by calling this method again from a job with the persisted (consumed) `pending` and
+   * an empty `input` (`{}`), never with `chargeMandate` and `chargeRef = pending.orderId`. The
+   * re-run is terminal again, so its events repeat.
+   *
    * @throws CheckoutError('INVALID_MANDATE_REQUEST') if `pending.provider` is not `providerName`.
    */
   async confirmMandate(
@@ -746,7 +751,9 @@ export class CheckoutConfigurator {
    * money always returns its result.
    *
    * Retry an `unknown` charge with the SAME `chargeRef`; a dunning retry after `failed` is a new
-   * charge with a NEW `chargeRef`. The library never retries on its own.
+   * charge with a NEW `chargeRef`. The library never retries on its own. Never pass a setup's
+   * `orderId` as `chargeRef`: an `unknown` first charge is resolved with `confirmMandate(provider,
+   * pending, {})`, since this method starts a new charge (on PayPal, a new order).
    */
   async chargeMandate(providerName: string, mandate: Mandate, charge: ChargeRequest): Promise<ChargeResult> {
     const provider = this.getMandateProvider(providerName);

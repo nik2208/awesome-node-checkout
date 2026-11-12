@@ -609,6 +609,57 @@ describe('Mandates: configurator', () => {
     });
   });
 
+  describe('unknown first charge on a terminal outcome', () => {
+    /** The provider's answer to the setup: mandate active, first charge not known yet (PayPal PENDING capture). */
+    const unknownFirstCharge = (pending: MandatePendingState): MandateSetupOutcome => ({
+      success: true,
+      verified: true,
+      terminal: true,
+      mandate: {
+        provider: 'dummy',
+        mandateRef: pending.mandateRef,
+        providerMandateId: VAULT_ID,
+        status: 'active',
+        createdAt: CREATED_AT,
+      },
+      firstCharge: { status: 'unknown', verified: true, chargeRef: pending.orderId, error: 'Capture PENDING' },
+    });
+
+    it('stays terminal with an active mandate and a first charge reported unknown', async () => {
+      provider.nextConfirm = unknownFirstCharge;
+      const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome.success).toBe(true);
+      expect(outcome.terminal).toBe(true);
+      expect(outcome.mandate?.status).toBe('active');
+      expect(outcome.firstCharge.status).toBe('unknown');
+      expect(outcome.firstCharge.chargeRef).toBe('SUB-0001-INIT');
+      expect(events.map((e) => e.name)).toEqual(['mandate.created', 'charge.unknown']);
+    });
+
+    it('is resolved by re-running confirmMandate with the persisted pending and {}, not by chargeMandate', async () => {
+      provider.nextConfirm = unknownFirstCharge;
+      const pending = JSON.parse(JSON.stringify(pendingState())) as MandatePendingState;
+      await checkout.confirmMandate('dummy', pending, {});
+
+      provider.nextConfirm = undefined; // the provider re-reads the setup: the capture completed
+      const resolved = await checkout.confirmMandate('dummy', pending, {});
+      expect(resolved.terminal).toBe(true);
+      expect(resolved.firstCharge.status).toBe('succeeded');
+      expect(resolved.firstCharge.chargeRef).toBe('SUB-0001-INIT');
+      expect(resolved.firstCharge.providerPaymentId).toBe('PAY-FIRST');
+      expect(provider.calls.confirm).toHaveLength(2);
+      expect(provider.calls.confirm[1]).toEqual([pending, {}]);
+      expect(provider.calls.charge).toHaveLength(0);
+
+      // Same orderId, different event name: a listener must dedupe on both
+      const charges = events.filter((e) => e.name.startsWith('charge.'));
+      expect(charges.map((e) => [e.name, e.payload.orderId])).toEqual([
+        ['charge.unknown', 'SUB-0001-INIT'],
+        ['charge.succeeded', 'SUB-0001-INIT'],
+      ]);
+    });
+  });
+
   describe('chargeMandate (AC 5)', () => {
     it('a revoked mandate returns mandateUnusable: true and the provider is not called', async () => {
       const result = await checkout.chargeMandate('dummy', activeMandate({ status: 'revoked' }), charge());
@@ -1109,6 +1160,37 @@ describe('Mandates: Express adapter (AC 6, 7)', () => {
     expect(genuine.headers.location).toBe('/app/subscribed');
     expect(provider.calls.confirm).toHaveLength(2);
     expect(pendings.get('MNDT0000000001')?.consumed).toBe(true);
+  });
+
+  it('unknown first charge: the route stays closed after the terminal outcome, a direct re-confirm resolves it', async () => {
+    const { hooks, pendings, mandates } = referenceStore();
+    const app = makeApp({ buildPaymentRequest, mandates: hooks });
+    await request(app).post('/checkout/dummy/mandate');
+
+    provider.nextConfirm = (pending) => ({
+      success: true,
+      verified: true,
+      terminal: true,
+      mandate: { provider: 'dummy', mandateRef: pending.mandateRef, providerMandateId: VAULT_ID, status: 'active', createdAt: CREATED_AT },
+      firstCharge: { status: 'unknown', verified: true, chargeRef: pending.orderId, error: 'Capture PENDING' },
+    });
+    const first = await request(app).get('/checkout/dummy/mandate/callback').query({ mandate_ref: 'MNDT0000000001' });
+    expect(first.headers.location).toBe('/app/subscribed');
+    expect(pendings.get('MNDT0000000001')?.consumed).toBe(true);
+    expect(mandates.get('MNDT0000000001')?.status).toBe('active');
+
+    provider.nextConfirm = undefined;
+    const replay = await request(app).get('/checkout/dummy/mandate/callback').query({ mandate_ref: 'MNDT0000000001' });
+    expect(replay.status).toBe(404);
+    expect(provider.calls.confirm).toHaveLength(1);
+
+    // The job: the consumed record is kept, and re-confirmed directly
+    const kept = pendings.get('MNDT0000000001')!.pending;
+    const resolved = await checkout.confirmMandate('dummy', kept, {});
+    expect(resolved.firstCharge.status).toBe('succeeded');
+    expect(resolved.firstCharge.chargeRef).toBe('SUB-0001-INIT');
+    expect(provider.calls.confirm).toHaveLength(2);
+    expect(provider.calls.charge).toHaveLength(0);
   });
 
   it('there is no route for charge or revoke', async () => {

@@ -739,10 +739,11 @@ export class CheckoutConfigurator {
    *
    * Validates `chargeRef` (/^[A-Za-z0-9-]{2,30}$/, `INVALID_MANDATE_REQUEST`) and the amount
    * (`INVALID_AMOUNT`). A `revoked` mandate returns `failed` with `mandateUnusable: true` without
-   * calling the provider. A provider that throws gives `unknown`. See `normalizeCharge` for the
-   * rest. Emits `charge.succeeded`, `charge.failed`, `charge.unknown` or `charge.requires_action`;
-   * a throwing listener never rejects this method (the error goes to `config.onListenerError`),
-   * so a charge that moved money always returns its result.
+   * calling the provider. A provider that throws gives `unknown`, with `raw` reduced to the error's
+   * `{ name, message }`. See `normalizeCharge` for the rest. Emits `charge.succeeded`,
+   * `charge.failed`, `charge.unknown` or `charge.requires_action`; a throwing listener never
+   * rejects this method (the error goes to `config.onListenerError`), so a charge that moved
+   * money always returns its result.
    *
    * Retry an `unknown` charge with the SAME `chargeRef`; a dunning retry after `failed` is a new
    * charge with a NEW `chargeRef`. The library never retries on its own.
@@ -772,13 +773,15 @@ export class CheckoutConfigurator {
       try {
         providerResult = await provider.chargeMandate(mandate, charge);
       } catch (err) {
-        // The request may or may not have reached the provider: we do not know
+        // The request may or may not have reached the provider: we do not know.
+        // Only name and message of the thrown value reach `raw` (and the charge.unknown event):
+        // SDK errors carry the request, its headers (bearer token) and its body as own properties
         providerResult = {
           status: 'unknown',
           verified: false,
           chargeRef: charge.chargeRef,
           error: 'Charge outcome unknown: the provider call failed',
-          raw: err,
+          raw: err instanceof Error ? { name: err.name, message: err.message } : undefined,
         };
       }
       result = this.normalizeCharge(providerResult, charge.chargeRef, charge.amount, charge.currency);

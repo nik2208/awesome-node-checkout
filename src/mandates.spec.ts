@@ -668,6 +668,41 @@ describe('Mandates: configurator', () => {
       expect(JSON.stringify(events[0].payload)).not.toContain(VAULT_ID);
     });
 
+    it('a thrown SDK error reaches raw and charge.unknown only as { name, message }', async () => {
+      provider.nextCharge = () => {
+        const err = Object.assign(new Error('Request failed with status 500'), {
+          request: {
+            method: 'POST',
+            headers: { Authorization: 'Bearer A21AAsecretAccessToken' },
+            body: JSON.stringify({ payment_source: { token: { id: VAULT_ID, type: 'BILLING_AGREEMENT' } } }),
+          },
+          headers: { 'paypal-debug-id': 'dbg-1' },
+          body: '{"name":"INTERNAL_SERVER_ERROR"}',
+          statusCode: 500,
+        });
+        throw err;
+      };
+      const result = await checkout.chargeMandate('dummy', activeMandate(), charge());
+      expect(result.status).toBe('unknown');
+      expect(result.raw).toEqual({ name: 'Error', message: 'Request failed with status 500' });
+      expect(events.map((e) => e.name)).toEqual(['charge.unknown']);
+      expect(events[0].payload.raw).toEqual({ name: 'Error', message: 'Request failed with status 500' });
+      const serialized = JSON.stringify(events[0].payload);
+      expect(serialized).not.toContain('A21AAsecretAccessToken');
+      expect(serialized).not.toContain('Authorization');
+      expect(serialized).not.toContain(VAULT_ID);
+    });
+
+    it('a thrown non-Error value gives unknown with no raw', async () => {
+      provider.nextCharge = () => {
+        throw { headers: { Authorization: 'Bearer A21AAsecretAccessToken' } };
+      };
+      const result = await checkout.chargeMandate('dummy', activeMandate(), charge());
+      expect(result.status).toBe('unknown');
+      expect(result.raw).toBeUndefined();
+      expect(JSON.stringify(events[0].payload)).not.toContain('A21AAsecretAccessToken');
+    });
+
     it('a mandate of another provider is rejected with INVALID_MANDATE_REQUEST', async () => {
       const err = await rejection(checkout.chargeMandate('dummy', activeMandate({ provider: 'other' }), charge()));
       expect(err.code).toBe('INVALID_MANDATE_REQUEST');
@@ -807,6 +842,58 @@ describe('Mandates: Express adapter (AC 6, 7)', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  describe('shared middleware calling next(err)', () => {
+    const unauthorized = () => Object.assign(new Error('unauthorized'), { status: 401 });
+
+    it('next(err) stops POST /:provider/mandate: the error reaches Express, onStarted and the provider are not called', async () => {
+      const { hooks } = referenceStore();
+      const onStarted = vi.fn(hooks.onStarted);
+      const app = makeApp({
+        buildPaymentRequest,
+        middleware: [(_q, _s, next) => next(unauthorized())],
+        mandates: { ...hooks, onStarted },
+      });
+      const res = await request(app).post('/checkout/dummy/mandate').send({});
+      expect(res.status).toBe(401);
+      expect(res.body.success).toBeUndefined();
+      expect(onStarted).not.toHaveBeenCalled();
+      expect(provider.calls.create).toHaveLength(0);
+    });
+
+    it('next(err) stops POST /:provider too', async () => {
+      const create = vi.spyOn(provider, 'createPayment');
+      const app = makeApp({ buildPaymentRequest, middleware: [(_q, _s, next) => next(unauthorized())] });
+      expect((await request(app).post('/checkout/dummy').send({})).status).toBe(401);
+      expect(create).not.toHaveBeenCalled();
+    });
+
+    it("next(err) in the second middleware stops the chain; next('route') continues to the next one", async () => {
+      const { hooks } = referenceStore();
+      const second = vi.fn((_q: Request, _s: Response, next: NextFunction) => next(unauthorized()));
+      const app = makeApp({
+        buildPaymentRequest,
+        middleware: [(_q, _s, next) => next('route'), second],
+        mandates: hooks,
+      });
+      expect((await request(app).post('/checkout/dummy/mandate').send({})).status).toBe(401);
+      expect(second).toHaveBeenCalledTimes(1);
+      expect(provider.calls.create).toHaveLength(0);
+    });
+
+    it("next('router') leaves the checkout router (404) without reaching the route", async () => {
+      const { hooks } = referenceStore();
+      const app = makeApp({ buildPaymentRequest, middleware: [(_q, _s, next) => next('router')], mandates: hooks });
+      expect((await request(app).post('/checkout/dummy/mandate').send({})).status).toBe(404);
+      expect(provider.calls.create).toHaveLength(0);
+    });
+
+    it('next() with no argument still reaches the route (201)', async () => {
+      const { hooks } = referenceStore();
+      const app = makeApp({ buildPaymentRequest, middleware: [(_q, _s, next) => next()], mandates: hooks });
+      expect((await request(app).post('/checkout/dummy/mandate').send({})).status).toBe(201);
+    });
   });
 
   it('throws INSECURE_CONFIGURATION when mandates lacks one of the four hooks', () => {

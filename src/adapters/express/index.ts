@@ -284,7 +284,12 @@ export function createCheckoutRouter(
       const handlers = options.middleware!;
       const run = (i: number): void => {
         if (i >= handlers.length) return next();
-        handlers[i](req, res, () => run(i + 1));
+        handlers[i](req, res, (err?: unknown) => {
+          // Same semantics as Express: 'route' continues (as for router.use), 'router' leaves the
+          // router, any other truthy value is an error and never reaches the route
+          if (!err || err === 'route') return run(i + 1);
+          next(err);
+        });
       };
       run(0);
     });

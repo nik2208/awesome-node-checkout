@@ -78,6 +78,55 @@ function chargedAmountMatches(result: ChargeResult, amount: number, currency: st
 }
 
 /**
+ * `pending.amount` / `pending.currency` (returned by the provider) equal the setup request's.
+ * Unlike `chargedAmountMatches`, both fields are required: a missing or invalid one is a mismatch.
+ */
+function pendingAmountMatches(pending: MandatePendingState, request: MandateSetupRequest): boolean {
+  if (typeof pending.currency !== 'string') return false;
+  const currency = pending.currency.trim().toUpperCase();
+  if (currency === '' || currency !== request.currency.trim().toUpperCase()) return false;
+  try {
+    return toMinorUnits(pending.amount, currency) === toMinorUnits(request.amount, currency);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The ids scrubbed from every event of a terminal setup outcome (`mandate.created` or
+ * `mandate.setup_failed`, and the first charge's `charge.*`):
+ * - the mandate's `providerMandateId`, taken from the provider's outcome (a dropped mandate's id
+ *   may still be inside `raw`);
+ * - `pending.providerRef`, which is the providerMandateId itself for Satispay (token id) and can
+ *   reach `raw` or `error` even when the setup failed and no mandate is returned. It is kept when
+ *   it is the app's own `orderId` or `mandateRef` (Nexi `codTrans`), or the verified first
+ *   charge's `providerPaymentId` (the PayPal order id, which refunds the charge), unless it is
+ *   also the providerMandateId.
+ */
+function setupEventSecrets(
+  pending: MandatePendingState,
+  providerOutcome: MandateSetupOutcome | undefined,
+  outcome: MandateSetupOutcome,
+): string[] {
+  const secrets: string[] = [];
+  const providerMandateId =
+    isObject(providerOutcome) && isObject(providerOutcome.mandate)
+      ? providerOutcome.mandate.providerMandateId
+      : undefined;
+  if (isNonEmptyString(providerMandateId)) secrets.push(providerMandateId);
+  const providerRef = pending.providerRef;
+  if (
+    isNonEmptyString(providerRef) &&
+    providerRef !== pending.orderId &&
+    providerRef !== pending.mandateRef &&
+    providerRef !== outcome.firstCharge.providerPaymentId
+  ) {
+    secrets.push(providerRef);
+  }
+  return secrets;
+}
+
+/**
  * Main entry point for awesome-node-checkout.
  *
  * Usage (framework-agnostic):
@@ -395,8 +444,10 @@ export class CheckoutConfigurator {
   }
 
   /**
-   * Event payloads never carry the credential-like `providerMandateId`. Nexi's contract number
-   * is the app's own `mandateRef`, which is not a credential and is part of every payload.
+   * Event payloads never carry the credential-like `providerMandateId`, nor a setup's
+   * `pending.providerRef` (the future Satispay token id): every `secrets` entry is scrubbed from
+   * the whole payload (`raw`, `data`, `error`). Nexi's contract number is the app's own
+   * `mandateRef`, which is not a credential and is part of every payload, so it is never scrubbed.
    *
    * Used only after a mandate provider call has completed (confirm, charge, revoke): an error
    * raised while emitting (a throwing listener) never rejects the caller, because money may
@@ -405,12 +456,11 @@ export class CheckoutConfigurator {
   private async emitMandateEvent(
     event: CheckoutEventName,
     payload: Omit<CheckoutEventPayload, 'timestamp'>,
-    providerMandateId: string | undefined,
+    secrets: readonly (string | undefined)[],
     mandateRef: string,
   ): Promise<void> {
     try {
-      const secret = providerMandateId !== mandateRef ? providerMandateId : undefined;
-      await this.emit(event, redactSecret(payload, secret));
+      await this.emit(event, redactSecret(payload, secrets.filter((s) => s !== mandateRef)));
     } catch (err) {
       await this.reportListenerError(err, event);
     }
@@ -434,7 +484,7 @@ export class CheckoutConfigurator {
     providerName: string,
     mandateRef: string,
     result: ChargeResult,
-    providerMandateId: string | undefined,
+    secrets: readonly (string | undefined)[],
   ): Promise<void> {
     await this.emitMandateEvent(
       CHARGE_EVENTS[result.status],
@@ -454,7 +504,7 @@ export class CheckoutConfigurator {
         },
         raw: result.raw,
       },
-      providerMandateId,
+      secrets,
       mandateRef,
     );
   }
@@ -502,10 +552,10 @@ export class CheckoutConfigurator {
    * Validates the request first and throws `CheckoutError('INVALID_MANDATE_REQUEST')` (or
    * `'INVALID_AMOUNT'` from `toMinorUnits`) without calling the provider. `returnUrl` and
    * `cancelUrl` (and `notifyUrl`, when set) must be absolute http(s) URLs. A successful start whose
-   * `pending` does not match the request (provider, mandateRef, orderId) is returned as
-   * `success: false`. Persist `pending` before sending the customer to `approvalUrl`.
-   * Emits `mandate.setup_started` (`verified: false`) when the start succeeded, with
-   * `pending.providerRef` scrubbed from its `raw` (unless it is the orderId or the mandateRef).
+   * `pending` does not match the request (provider, mandateRef, orderId, amount in minor units,
+   * currency) is returned as `success: false`. Persist `pending` before sending the customer to
+   * `approvalUrl`. Emits `mandate.setup_started` (`verified: false`) when the start succeeded, with
+   * `pending.providerRef` scrubbed from its payload (unless it is the orderId or the mandateRef).
    * A listener error on that event propagates: no money has moved yet.
    *
    * @throws CheckoutError('MANDATES_NOT_SUPPORTED') if the provider does not implement mandates.
@@ -554,11 +604,13 @@ export class CheckoutConfigurator {
       };
     } else {
       const pending = start.pending;
+      // The first charge's amount check in confirmMandate trusts `pending`: bind it to the request
       const matches =
         isObject(pending) &&
         pending.provider === providerName &&
         pending.mandateRef === request.mandateRef &&
-        pending.orderId === request.orderId;
+        pending.orderId === request.orderId &&
+        pendingAmountMatches(pending, request);
       result = matches
         ? { ...start, pending: { ...pending } }
         : {
@@ -572,7 +624,7 @@ export class CheckoutConfigurator {
 
     if (result.success) {
       // `pending.providerRef` may become the credential-like providerMandateId (Satispay token
-      // id): scrub it from the event's copy of `raw`. Not when it is the app's own orderId or
+      // id): scrub it from the event's payload. Not when it is the app's own orderId or
       // mandateRef (Nexi), which are part of every payload anyway.
       const providerRef = result.pending?.providerRef;
       const secret =
@@ -580,15 +632,21 @@ export class CheckoutConfigurator {
           ? providerRef
           : undefined;
       // No money has moved yet: a throwing listener propagates, like every non-mandate event
-      await this.emit('mandate.setup_started', {
-        provider: providerName,
-        orderId: request.orderId,
-        status: 'started',
-        // A setup start reports no outcome: nothing has been authenticated yet
-        verified: false,
-        data: { mandateRef: request.mandateRef },
-        raw: redactSecret(result.raw, secret),
-      });
+      await this.emit(
+        'mandate.setup_started',
+        redactSecret(
+          {
+            provider: providerName,
+            orderId: request.orderId,
+            status: 'started',
+            // A setup start reports no outcome: nothing has been authenticated yet
+            verified: false,
+            data: { mandateRef: request.mandateRef },
+            raw: result.raw,
+          },
+          secret,
+        ),
+      );
     }
     return result;
   }
@@ -642,12 +700,7 @@ export class CheckoutConfigurator {
     const outcome = this.normalizeSetupOutcome(providerName, pending, providerOutcome);
 
     if (outcome.terminal) {
-      // Taken from the provider's outcome: a dropped mandate's id may still be inside `raw`
-      const providerMandateId =
-        isObject(providerOutcome) && isObject(providerOutcome.mandate)
-          ? providerOutcome.mandate.providerMandateId
-          : undefined;
-      const secret = typeof providerMandateId === 'string' ? providerMandateId : undefined;
+      const secrets = setupEventSecrets(pending, providerOutcome, outcome);
       await this.emitMandateEvent(
         outcome.success ? 'mandate.created' : 'mandate.setup_failed',
         {
@@ -659,10 +712,10 @@ export class CheckoutConfigurator {
           data: { mandateRef: pending.mandateRef },
           raw: outcome.raw,
         },
-        secret,
+        secrets,
         pending.mandateRef,
       );
-      await this.emitChargeEvent(providerName, pending.mandateRef, outcome.firstCharge, secret);
+      await this.emitChargeEvent(providerName, pending.mandateRef, outcome.firstCharge, secrets);
     }
     return outcome;
   }
@@ -794,7 +847,7 @@ export class CheckoutConfigurator {
       result = this.normalizeCharge(providerResult, charge.chargeRef, charge.amount, charge.currency);
     }
 
-    await this.emitChargeEvent(providerName, mandate.mandateRef, result, mandate.providerMandateId);
+    await this.emitChargeEvent(providerName, mandate.mandateRef, result, [mandate.providerMandateId]);
     return result;
   }
 
@@ -831,7 +884,7 @@ export class CheckoutConfigurator {
         data: { mandateRef: mandate.mandateRef, revokedAtProvider: result.revokedAtProvider },
         raw: result.raw,
       },
-      mandate.providerMandateId,
+      [mandate.providerMandateId],
       mandate.mandateRef,
     );
     return result;

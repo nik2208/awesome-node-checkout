@@ -386,6 +386,63 @@ describe('Mandates: configurator', () => {
       expect(events).toHaveLength(0);
     });
 
+    it('returns success: false when pending.amount or pending.currency differs from the request', async () => {
+      const startWithPending = (overrides: Record<string, unknown>) => (req: MandateSetupRequest): MandateSetupStart => ({
+        success: true,
+        approvalUrl: 'https://pay.test/approve',
+        pending: { ...pendingState({ mandateRef: req.mandateRef, orderId: req.orderId }), ...overrides } as MandatePendingState,
+      });
+      for (const overrides of [
+        { amount: 9.99 },
+        { amount: 19.91 },
+        { currency: 'USD' },
+        { amount: 1990 }, // minor units by mistake
+      ]) {
+        provider.nextStart = startWithPending(overrides);
+        const start = await checkout.createMandate('dummy', setupRequest());
+        expect(start, JSON.stringify(overrides)).toMatchObject({ success: false, error: 'Mandate setup does not match the request' });
+        expect(start.pending).toBeUndefined();
+        expect(start.approvalUrl).toBeUndefined();
+      }
+      expect(events).toHaveLength(0);
+    });
+
+    it('a missing or invalid pending.amount or pending.currency is a mismatch, never a throw', async () => {
+      for (const overrides of [
+        { amount: undefined },
+        { amount: '19.9' },
+        { amount: Number.NaN },
+        { amount: -19.9 },
+        { amount: 19.999 },
+        { currency: undefined },
+        { currency: '' },
+        { currency: 978 },
+      ]) {
+        provider.nextStart = (req) => ({
+          success: true,
+          approvalUrl: 'https://pay.test/approve',
+          pending: { ...pendingState({ mandateRef: req.mandateRef, orderId: req.orderId }), ...overrides } as MandatePendingState,
+        });
+        const start = await checkout.createMandate('dummy', setupRequest());
+        expect(start.success, JSON.stringify(overrides)).toBe(false);
+        expect(start.pending).toBeUndefined();
+      }
+      expect(events).toHaveLength(0);
+    });
+
+    it('accepts the same amount in another notation and the currency in another case', async () => {
+      // Nexi hardcodes 'EUR' in pending; the request may say 'eur'
+      provider.nextStart = (req) => ({
+        success: true,
+        approvalUrl: 'https://pay.test/approve',
+        pending: pendingState({ mandateRef: req.mandateRef, orderId: req.orderId, amount: 19.90, currency: 'EUR' }),
+      });
+      const start = await checkout.createMandate('dummy', setupRequest({ currency: 'eur' }));
+      expect(start.success).toBe(true);
+      expect(start.pending).toMatchObject({ amount: 19.9, currency: 'EUR' });
+      expect(events.map((e) => e.name)).toEqual(['mandate.setup_started']);
+    });
+
     it('keeps the provider error of a failed start and emits nothing', async () => {
       provider.nextStart = () => ({ success: false, error: 'Nexi mandates support EUR only' });
       const start = await checkout.createMandate('dummy', setupRequest());
@@ -1417,6 +1474,167 @@ describe('Mandates: event payload scrubbing and unverified first charges', () =>
     expect(events[0].payload.raw).toEqual({ codTrans: 'SUB-0001-INIT' });
   });
 
+  describe('pending.providerRef and providerMandateId never reach a setup or first-charge event', () => {
+    /** Satispay-like: the authorization token id is both pending.providerRef and providerMandateId. */
+    const TOKEN = 'tok_SECRET_77';
+    /** PayPal-like: the order id is pending.providerRef, the vault id is providerMandateId. */
+    const ORDER = 'ORDER-SECRET-55';
+
+    /** Every mandate.* and charge.* event recorded so far, as JSON. */
+    const setupEventJson = () =>
+      events.filter((e) => e.name.startsWith('mandate.') || e.name.startsWith('charge.')).map((e) => [e.name, JSON.stringify(e.payload)] as const);
+
+    const leaks = (secret: string) => (payload: unknown) => ({ raw: payload, note: `id ${secret}`, nested: { [secret]: [secret] } });
+
+    const run = async (providerRef: string, confirm: (pending: MandatePendingState) => MandateSetupOutcome) => {
+      provider.nextStart = startWith(providerRef, { id: providerRef, status: 'PENDING', note: `created ${providerRef}` });
+      const start = await checkout.createMandate('dummy', setupRequest());
+      expect(start.success).toBe(true);
+      provider.nextConfirm = confirm;
+      return checkout.confirmMandate('dummy', start.pending!, {});
+    };
+
+    const expectNoSecrets = (expectedNames: string[], secrets: string[]) => {
+      const emitted = setupEventJson();
+      expect(emitted.map(([name]) => name)).toEqual(expectedNames);
+      for (const [name, json] of emitted) {
+        for (const secret of secrets) expect(json, `${name} leaks ${secret}`).not.toContain(secret);
+        // The app's own identities survive the scrubbing
+        expect(json, name).toContain('SUB-0001-INIT');
+        expect(json, name).toContain('MNDT0000000001');
+      }
+    };
+
+    it('Satispay-like success: the token is scrubbed from raw, error and data of every event', async () => {
+      const outcome = await run(TOKEN, (pending) => ({
+        success: true,
+        verified: true,
+        terminal: true,
+        mandate: { provider: 'dummy', mandateRef: pending.mandateRef, providerMandateId: TOKEN, status: 'active', createdAt: CREATED_AT },
+        firstCharge: {
+          status: 'unknown',
+          verified: true,
+          chargeRef: pending.orderId,
+          error: `payment on ${TOKEN} timed out`,
+          providerCode: `T-${TOKEN}`,
+          raw: leaks(TOKEN)({ token: TOKEN }),
+        },
+        error: `first payment on ${TOKEN} unknown`,
+        raw: leaks(TOKEN)({ id: TOKEN, status: 'ACCEPTED' }),
+      }));
+      expect(outcome).toMatchObject({ success: true, terminal: true });
+      // The returned outcome keeps the provider's values
+      expect(outcome.mandate?.providerMandateId).toBe(TOKEN);
+      expect(outcome.firstCharge.error).toContain(TOKEN);
+      expectNoSecrets(['mandate.setup_started', 'mandate.created', 'charge.unknown'], [TOKEN]);
+    });
+
+    it('Satispay-like terminal refusal (no mandate): mandate.setup_failed and charge.failed are scrubbed too', async () => {
+      const outcome = await run(TOKEN, (pending) => ({
+        success: false,
+        verified: true,
+        terminal: true,
+        firstCharge: {
+          status: 'failed',
+          verified: true,
+          chargeRef: pending.orderId,
+          error: `Authorization ${TOKEN} canceled`,
+          providerCode: TOKEN,
+          raw: leaks(TOKEN)({ token: TOKEN }),
+        },
+        error: `Authorization ${TOKEN} canceled`,
+        raw: leaks(TOKEN)({ id: TOKEN, status: 'CANCELED' }),
+      }));
+      expect(outcome).toMatchObject({ success: false, verified: true, terminal: true });
+      expect(outcome.mandate).toBeUndefined();
+      expectNoSecrets(['mandate.setup_started', 'mandate.setup_failed', 'charge.failed'], [TOKEN]);
+      const failed = events.find((e) => e.name === 'mandate.setup_failed')!;
+      expect(failed.payload.error).toBe('Authorization [redacted] canceled');
+      expect(failed.payload.orderId).toBe('SUB-0001-INIT');
+      expect(failed.payload.data).toEqual({ mandateRef: 'MNDT0000000001' });
+      const chargeEvent = events.find((e) => e.name === 'charge.failed')!;
+      expect(chargeEvent.payload.data?.providerCode).toBe('[redacted]');
+    });
+
+    it('PayPal-like: the order id (providerRef) and the vault id (providerMandateId) are both scrubbed', async () => {
+      await run(ORDER, (pending) => ({
+        success: true,
+        verified: true,
+        terminal: true,
+        mandate: { provider: 'dummy', mandateRef: pending.mandateRef, providerMandateId: VAULT_ID, status: 'active', createdAt: CREATED_AT },
+        firstCharge: {
+          status: 'succeeded',
+          verified: true,
+          chargeRef: pending.orderId,
+          providerPaymentId: 'CAPTURE-1',
+          amount: pending.amount,
+          currency: pending.currency,
+          raw: { order: ORDER, vault: VAULT_ID },
+        },
+        raw: { id: ORDER, vault: { id: VAULT_ID } },
+      }));
+      expectNoSecrets(['mandate.setup_started', 'mandate.created', 'charge.succeeded'], [ORDER, VAULT_ID]);
+      expect(events.find((e) => e.name === 'charge.succeeded')!.payload.paymentId).toBe('CAPTURE-1');
+    });
+
+    it('a terminal refusal whose raw carries a dropped mandate id scrubs it and the providerRef', async () => {
+      await run(ORDER, (pending) => ({
+        success: false,
+        verified: true,
+        terminal: true,
+        // A mandate that is not active is dropped from the outcome, but its id is in raw
+        mandate: { provider: 'dummy', mandateRef: pending.mandateRef, providerMandateId: VAULT_ID, status: 'revoked', createdAt: CREATED_AT },
+        firstCharge: { status: 'unknown', verified: true, chargeRef: pending.orderId, error: `capture of ${ORDER} PENDING` },
+        error: 'MANDATE_NOT_VAULTED',
+        raw: { id: ORDER, vault: { id: VAULT_ID, status: 'APPROVED' } },
+      }));
+      expectNoSecrets(['mandate.setup_started', 'mandate.setup_failed', 'charge.unknown'], [ORDER, VAULT_ID]);
+    });
+
+    it('keeps providerRef when it is the first charge paymentId (PayPal order id, used to refund)', async () => {
+      await run(ORDER, (pending) => ({
+        success: true,
+        verified: true,
+        terminal: true,
+        mandate: { provider: 'dummy', mandateRef: pending.mandateRef, providerMandateId: VAULT_ID, status: 'active', createdAt: CREATED_AT },
+        firstCharge: {
+          status: 'succeeded',
+          verified: true,
+          chargeRef: pending.orderId,
+          providerPaymentId: ORDER,
+          amount: pending.amount,
+          currency: pending.currency,
+        },
+        raw: { id: ORDER, vault: { id: VAULT_ID } },
+      }));
+      expectNoSecrets(['mandate.setup_started', 'mandate.created', 'charge.succeeded'], [VAULT_ID]);
+      expect(events.find((e) => e.name === 'charge.succeeded')!.payload.paymentId).toBe(ORDER);
+    });
+
+    it('keeps providerRef when it is the orderId (Nexi codTrans) in every event', async () => {
+      await run('SUB-0001-INIT', (pending) => ({
+        success: true,
+        verified: true,
+        terminal: true,
+        mandate: { provider: 'dummy', mandateRef: pending.mandateRef, providerMandateId: pending.mandateRef, status: 'active', createdAt: CREATED_AT },
+        firstCharge: {
+          status: 'succeeded',
+          verified: true,
+          chargeRef: pending.orderId,
+          providerPaymentId: pending.orderId,
+          amount: pending.amount,
+          currency: pending.currency,
+          raw: { codTrans: pending.orderId },
+        },
+        raw: { codTrans: pending.orderId, num_contratto: pending.mandateRef },
+      }));
+      expectNoSecrets(['mandate.setup_started', 'mandate.created', 'charge.succeeded'], []);
+      const created = events.find((e) => e.name === 'mandate.created')!;
+      expect(created.payload.raw).toEqual({ codTrans: 'SUB-0001-INIT', num_contratto: 'MNDT0000000001' });
+      expect(events.find((e) => e.name === 'charge.succeeded')!.payload.paymentId).toBe('SUB-0001-INIT');
+    });
+  });
+
   it('a binary raw never reaches a charge event', async () => {
     provider.nextCharge = (_m, c) => ({
       status: 'succeeded',
@@ -1510,6 +1728,13 @@ describe('redactSecret', () => {
     expect(out.b[0].c).toBe('x [redacted] y');
     expect(out.d).toBe(3);
     expect(input.a).toBe('tok-1');
+  });
+
+  it('scrubs several secrets, the longer first, and ignores empty ones', () => {
+    const out: any = redactSecret({ a: 'tok-1 and tok-12', b: 'ord-9' }, ['tok-1', undefined, '', 'tok-12', 'ord-9']);
+    expect(out).toEqual({ a: '[redacted] and [redacted]', b: '[redacted]' });
+    const same = { a: 'x' };
+    expect(redactSecret(same, [undefined, ''])).toBe(same);
   });
 
   it('cuts cycles and returns the value unchanged without a secret', () => {

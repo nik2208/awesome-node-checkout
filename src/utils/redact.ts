@@ -3,19 +3,30 @@ const REDACTED = '[redacted]';
 const BINARY = '[binary]';
 
 /**
- * Returns a copy of `value` in which every occurrence of `secret` inside a string (values and
- * keys) is replaced by `'[redacted]'`. Plain objects, arrays and class instances are copied
+ * Returns a copy of `value` in which every occurrence of `secret` (or of each of several secrets)
+ * inside a string (values and keys) is replaced by `'[redacted]'`. Plain objects, arrays and class instances are copied
  * through their own enumerable properties; dates are kept as they are. Binary data (`Buffer`,
  * typed arrays, `DataView`, `ArrayBuffer`) cannot be scrubbed reliably, so it becomes `'[binary]'`.
  * A cycle becomes `'[circular]'` and nesting deeper than 32 levels is dropped. `value` itself is
- * never mutated. Without a secret, `value` is returned as it is (binary data included).
+ * never mutated. Without a secret (`undefined`, `''`, or a list with none), `value` is returned as
+ * it is (binary data included). Longer secrets are replaced first, so a secret that contains
+ * another is never left half visible.
  *
- * Used to keep credential-like ids (the mandate's `providerMandateId`) out of event payloads.
+ * Used to keep credential-like ids (the mandate's `providerMandateId`, a setup's
+ * `pending.providerRef`) out of event payloads.
  */
-export function redactSecret<T>(value: T, secret: string | undefined): T {
-  if (typeof secret !== 'string' || secret === '') return value;
+export function redactSecret<T>(
+  value: T,
+  secret: string | undefined | readonly (string | undefined)[],
+): T {
+  const list = (Array.isArray(secret) ? secret : [secret]) as readonly unknown[];
+  const secrets = [...new Set(list.filter((x): x is string => typeof x === 'string' && x !== ''))].sort(
+    (a, b) => b.length - a.length,
+  );
+  if (secrets.length === 0) return value;
   const ancestors = new Set<object>();
-  const scrubString = (s: string): string => (s.includes(secret) ? s.split(secret).join(REDACTED) : s);
+  const scrubString = (s: string): string =>
+    secrets.reduce((acc, sec) => (acc.includes(sec) ? acc.split(sec).join(REDACTED) : acc), s);
 
   const walk = (v: unknown, depth: number): unknown => {
     if (typeof v === 'string') return scrubString(v);

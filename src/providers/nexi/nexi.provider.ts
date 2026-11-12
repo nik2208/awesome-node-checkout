@@ -45,6 +45,20 @@ export interface NexiProviderConfig {
 /** Nexi XPay paid statuses (`situazioneOrdine` report `stato`, lower-case). */
 const NEXI_PAID_STATUSES = new Set(['autorizzato', 'contabilizzato', 'catturato']);
 
+/**
+ * Replay guard (`situazioneOrdine` report `stato`, trimmed and lower-case; manual v20.4 p. 622).
+ * Money was taken for the code: paid, partly captured, or charged and then (partly) refunded.
+ */
+const NEXI_CHARGED_STATUSES = new Set([
+  ...NEXI_PAID_STATUSES,
+  'contabilizzato parz.',
+  'rimborsato',
+  'rimborsato parz.',
+]);
+
+/** Replay guard: the clear refusals, the only states that make an existing code `failed`. */
+const NEXI_REFUSED_STATUSES = new Set(['negato', 'annullato', 'non creato']);
+
 /** Nexi XPay numeric code of EUR, the only currency `pagamentoRicorrente` accepts. */
 const NEXI_EUR_NUMERIC = '978';
 
@@ -78,7 +92,7 @@ interface NexiOutcomeFields {
 }
 
 type LookupResult = {
-  kind: 'paid' | 'other' | 'absent' | 'error';
+  kind: 'paid' | 'refused' | 'pending' | 'absent' | 'error';
   stato?: string;
   amount?: number;
   currency?: string;
@@ -374,9 +388,15 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
 
   /**
    * Reads `situazioneOrdine` for `codTrans` (same request as `getPaymentDetails`) and classifies
-   * the raw response: `paid` (some entry for `codTrans` is paid), `other` (exists, no entry paid), `absent` (OK with no matching report
-   * entry, or KO "not found" 2/13), `error` (anything else: HTTP, network, timeout, non-JSON, bad
-   * MAC, a missing MAC on OK, no `report` array, any other KO).
+   * the raw response, over every report entry for `codTrans`:
+   * - `paid`: some entry shows the money was taken (`NEXI_CHARGED_STATUSES`: paid, partly captured,
+   *   refunded or partly refunded);
+   * - `pending`: otherwise, some entry is in progress (`In Corso`), has an unrecognised `stato`, or
+   *   has none. Fail safe: such a code may still be charged, so it is never reported as refused;
+   * - `refused`: every entry is a clear refusal (`Negato`, `Annullato`, `Non Creato`);
+   * - `absent`: OK with no matching report entry, or KO "not found" 2/13;
+   * - `error`: anything else (HTTP, network, timeout, non-JSON, bad MAC, a missing MAC on OK, no
+   *   `report` array, any other KO).
    */
   private async lookupTransaction(codTrans: string): Promise<LookupResult> {
     const timeStamp = String(Date.now());
@@ -405,19 +425,24 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
     if (entries.length === 0) return { kind: 'absent' };
 
     // Nexi may list a code more than once (it accepts up to 2 retries of a code after a KO): one
-    // paid entry means the customer was charged, whatever the order of the entries
-    const statoOf = (e: Record<string, unknown>) => (typeof e['stato'] === 'string' ? e['stato'] : undefined);
-    const isPaid = (e: Record<string, unknown>) => {
-      const stato = statoOf(e);
-      return stato !== undefined && NEXI_PAID_STATUSES.has(stato.toLowerCase());
+    // charged entry means the customer was charged, whatever the order of the entries; one entry
+    // that is not final (or not understood) means the code may still be charged
+    const statoOf = (e: Record<string, unknown>) =>
+      typeof e['stato'] === 'string' ? e['stato'] : undefined;
+    const classOf = (e: Record<string, unknown>): 'paid' | 'refused' | 'pending' => {
+      const stato = statoOf(e)?.trim().toLowerCase();
+      if (stato === undefined) return 'pending';
+      if (NEXI_CHARGED_STATUSES.has(stato)) return 'paid';
+      return NEXI_REFUSED_STATUSES.has(stato) ? 'refused' : 'pending';
     };
-    const entry = entries.find(isPaid) ?? entries[0];
+    const kind = (['paid', 'pending'] as const).find((k) => entries.some((e) => classOf(e) === k)) ?? 'refused';
+    const entry = entries.find((e) => classOf(e) === kind) ?? entries[0];
     const stato = statoOf(entry);
     const amount = parseAmountFromCents(entry['importo']);
     const currency = parseNexiCurrency(entry['divisa']);
     return {
-      kind: isPaid(entry) ? 'paid' : 'other',
-      stato,
+      kind,
+      ...(stato !== undefined ? { stato } : {}),
       ...(amount !== undefined ? { amount } : {}),
       ...(currency !== undefined ? { currency } : {}),
     };
@@ -959,10 +984,13 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
    * Merchant-initiated charge with `pagamentoRicorrente` (pp. 188-193), EUR only.
    * `codiceTransazione` is `charge.chargeRef`, so `refundPayment(chargeRef, amount)` refunds it.
    *
-   * Replay guard: `situazioneOrdine` is read first. A paid transaction is returned as
-   * `succeeded` without charging again; an existing unpaid one is `failed` (a dunning retry needs
-   * a new `chargeRef`: Nexi's own retries of a code after a KO are not used); a lookup error is
-   * `unknown` and nothing is charged. A Nexi "transaction already present" (9) is re-read.
+   * Replay guard: `situazioneOrdine` is read first. A transaction that took the money (paid,
+   * partly captured, refunded or partly refunded) is returned as `succeeded` without charging
+   * again, with its `stato` in `raw`; one that only Nexi refused (`Negato`, `Annullato`,
+   * `Non Creato`) is `failed` (a dunning retry needs a new `chargeRef`: Nexi's own retries of a
+   * code after a KO are not used); one still in progress (`In Corso`) or with an unrecognised
+   * `stato` is `unknown`, and so is a lookup error: nothing is charged. A Nexi "transaction
+   * already present" (9) is re-read.
    * Merchant-side errors (credentials, MAC, technical) are `unknown`, never `failed`.
    */
   async chargeMandate(mandate: Mandate, charge: ChargeRequest): Promise<ChargeResult> {
@@ -981,6 +1009,7 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
       providerPaymentId: chargeRef,
       ...(lookup.amount !== undefined ? { amount: lookup.amount } : {}),
       ...(lookup.currency !== undefined ? { currency: lookup.currency } : {}),
+      ...(lookup.stato !== undefined ? { raw: { stato: lookup.stato } } : {}),
     });
 
     try {
@@ -1005,13 +1034,18 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
       // Replay guard: never charge twice for the same chargeRef
       const lookup = await this.lookupTransaction(chargeRef);
       if (lookup.kind === 'paid') return fromLookup(lookup);
-      if (lookup.kind === 'other') {
+      if (lookup.kind === 'refused') {
         return {
           status: 'failed',
           verified: true,
           chargeRef,
           error: `A transaction with this chargeRef already exists: ${lookup.stato ?? 'unknown'}`,
         };
+      }
+      if (lookup.kind === 'pending') {
+        // `In Corso` may still end Autorizzato: a `failed` here would send the app to dunning with a
+        // new chargeRef, charging the customer twice
+        return unknown(`A transaction with this chargeRef is not final at Nexi: ${lookup.stato ?? 'unknown'}`);
       }
       if (lookup.kind !== 'absent') {
         return unknown('Could not check whether this chargeRef was already charged');

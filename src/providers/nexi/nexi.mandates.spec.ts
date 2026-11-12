@@ -616,6 +616,100 @@ describe('NexiProvider mandates (#31)', () => {
       expect(fetchMock()).toHaveBeenCalledTimes(1);
     });
 
+    // Manual v20.4 p. 622, "Possibili valori del campo stato": only a clear refusal is `failed`
+    it.each(['Negato', 'Annullato', 'Non Creato', 'NEGATO'])(
+      'an existing refused chargeRef (%s) is a verified failure and not charged again',
+      async (stato) => {
+        fetchMock().mockResolvedValueOnce(jsonResponse({ ...OK_RESP, report: [{ ...PAID_ENTRY, stato }] }));
+        const result = await provider.chargeMandate(mandate(), charge);
+        expect(result.status).toBe('failed');
+        expect(result.verified).toBe(true);
+        expect(result.error).toBe(`A transaction with this chargeRef already exists: ${stato}`);
+        expect(fetchMock()).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('a chargeRef still in progress at Nexi (In Corso) is unknown and not charged again', async () => {
+      fetchMock().mockResolvedValueOnce(
+        jsonResponse({
+          ...OK_RESP,
+          report: [{ codiceTransazione: 'SUB-0001-2026-12', stato: 'In Corso', importo: 1990, divisa: '978' }],
+        }),
+      );
+      const result = await provider.chargeMandate(mandate(), charge);
+      expect(result.status).toBe('unknown');
+      expect(result.verified).toBe(false);
+      expect(result.error).toBe('A transaction with this chargeRef is not final at Nexi: In Corso');
+      expect(fetchMock()).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ['an unrecognised stato', { ...PAID_ENTRY, stato: 'Sospeso' }, 'Sospeso'],
+      ['a missing stato', { codiceTransazione: CHARGE_REF, importo: 1990, divisa: 'EUR' }, 'unknown'],
+      ['a non-string stato', { ...PAID_ENTRY, stato: 7 }, 'unknown'],
+    ])('%s is unknown, never failed, and not charged again', async (_label, entry, shown) => {
+      fetchMock().mockResolvedValueOnce(jsonResponse({ ...OK_RESP, report: [entry] }));
+      const result = await provider.chargeMandate(mandate(), charge);
+      expect(result.status).toBe('unknown');
+      expect(result.verified).toBe(false);
+      expect(result.error).toBe(`A transaction with this chargeRef is not final at Nexi: ${shown}`);
+      expect(fetchMock()).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['Rimborsato', 'Rimborsato Parz.', 'Contabilizzato Parz.'])(
+      'a chargeRef already charged then refunded or partly captured (%s) is succeeded, with the stato in raw',
+      async (stato) => {
+        fetchMock().mockResolvedValueOnce(jsonResponse({ ...OK_RESP, report: [{ ...PAID_ENTRY, stato }] }));
+        const result = await provider.chargeMandate(mandate(), charge);
+        expect(result.status).toBe('succeeded');
+        expect(result.verified).toBe(true);
+        expect(result.providerPaymentId).toBe('SUB-0001-2026-12');
+        expect(result.raw).toEqual({ stato });
+        expect(fetchMock()).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('several entries: in progress beats a refusal, paid beats in progress, all refused is failed', async () => {
+      const entry = (stato: string) => ({ ...PAID_ENTRY, stato });
+
+      fetchMock().mockResolvedValueOnce(
+        jsonResponse({ ...OK_RESP, report: [entry('Negato'), entry('In Corso')] }),
+      );
+      const pending = await provider.chargeMandate(mandate(), charge);
+      expect(pending.status).toBe('unknown');
+      expect(pending.error).toBe('A transaction with this chargeRef is not final at Nexi: In Corso');
+
+      fetchMock().mockReset();
+      fetchMock().mockResolvedValueOnce(
+        jsonResponse({ ...OK_RESP, report: [entry('In Corso'), entry('Autorizzato')] }),
+      );
+      expect((await provider.chargeMandate(mandate(), charge)).status).toBe('succeeded');
+
+      fetchMock().mockReset();
+      fetchMock().mockResolvedValueOnce(
+        jsonResponse({ ...OK_RESP, report: [entry('Negato'), entry('Negato')] }),
+      );
+      const refused = await provider.chargeMandate(mandate(), charge);
+      expect(refused.status).toBe('failed');
+      expect(refused.verified).toBe(true);
+      expect(fetchMock()).toHaveBeenCalledTimes(1);
+    });
+
+    it('KO 9 re-read: a refunded entry is succeeded, an in-progress one unknown', async () => {
+      fetchMock()
+        .mockResolvedValueOnce(emptyLookup())
+        .mockResolvedValueOnce(ko(9))
+        .mockResolvedValueOnce(jsonResponse({ ...OK_RESP, report: [{ ...PAID_ENTRY, stato: 'Rimborsato' }] }));
+      expect((await provider.chargeMandate(mandate(), charge)).status).toBe('succeeded');
+
+      fetchMock().mockReset();
+      fetchMock()
+        .mockResolvedValueOnce(emptyLookup())
+        .mockResolvedValueOnce(ko(9))
+        .mockResolvedValueOnce(jsonResponse({ ...OK_RESP, report: [{ ...PAID_ENTRY, stato: 'In Corso' }] }));
+      expect((await provider.chargeMandate(mandate(), charge)).status).toBe('unknown');
+    });
+
     it('through the configurator, a paid replay for another amount becomes unknown', async () => {
       const checkout = new CheckoutConfigurator({ emitEvents: false }).registerProvider(provider);
       fetchMock().mockResolvedValueOnce(jsonResponse({ ...OK_RESP, report: [PAID_ENTRY] }));

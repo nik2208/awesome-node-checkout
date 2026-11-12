@@ -4,6 +4,67 @@ import { PaymentResult, WebhookResult } from './models/payment-result.model';
 import { CheckoutConfig } from './models/checkout-config.model';
 import { CheckoutError } from './models/errors';
 import { CheckoutEventBus, CheckoutEventName, CheckoutEventPayload } from './events/checkout-event-bus';
+import { IMandateProvider, isMandateProvider } from './interfaces/mandate-provider.interface';
+import {
+  CHARGE_REF_PATTERN,
+  ChargeRequest,
+  ChargeResult,
+  ChargeStatus,
+  MANDATE_REF_PATTERN,
+  Mandate,
+  MandateCallbackInput,
+  MandatePendingState,
+  MandateRevokeResult,
+  MandateSetupOutcome,
+  MandateSetupRequest,
+  MandateSetupStart,
+  MandateStatusResult,
+} from './models/mandate.model';
+import { toMinorUnits } from './utils/money';
+import { redactSecret } from './utils/redact';
+
+const CHARGE_STATUSES: ReadonlySet<string> = new Set<ChargeStatus>([
+  'succeeded',
+  'failed',
+  'unknown',
+  'requires_action',
+]);
+
+const CHARGE_EVENTS: Record<ChargeStatus, CheckoutEventName> = {
+  succeeded: 'charge.succeeded',
+  failed: 'charge.failed',
+  unknown: 'charge.unknown',
+  requires_action: 'charge.requires_action',
+};
+
+const SETUP_MISMATCH = 'Mandate outcome does not match the pending setup';
+const AMOUNT_MISMATCH = 'Charged amount does not match the request';
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object';
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+/** Same amount in minor units (and same currency, when reported). Only present fields are compared. */
+function chargedAmountMatches(result: ChargeResult, amount: number, currency: string): boolean {
+  if (result.currency != null) {
+    const expected = typeof currency === 'string' ? currency.trim().toUpperCase() : '';
+    if (typeof result.currency !== 'string' || expected === '') return false;
+    if (result.currency.trim().toUpperCase() !== expected) return false;
+  }
+  if (result.amount != null) {
+    try {
+      return toMinorUnits(result.amount, currency) === toMinorUnits(amount, currency);
+    } catch {
+      // An invalid reported amount never matches; never throw after money may have moved
+      return false;
+    }
+  }
+  return true;
+}
 
 /**
  * Main entry point for awesome-node-checkout.
@@ -277,6 +338,427 @@ export class CheckoutConfigurator {
       verified: result.verified === true,
       raw: result.raw,
     });
+    return result;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Recurring payments (mandates)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * True when the provider implements `IMandateProvider`.
+   * @throws CheckoutError('PROVIDER_NOT_FOUND') if the provider is not registered.
+   */
+  supportsMandates(providerName: string): boolean {
+    return isMandateProvider(this.getProvider(providerName));
+  }
+
+  /** Resolves a provider that implements mandates, or throws MANDATES_NOT_SUPPORTED. */
+  private getMandateProvider(providerName: string): IPaymentProvider & IMandateProvider {
+    const provider = this.getProvider(providerName);
+    if (!isMandateProvider(provider)) {
+      throw new CheckoutError(
+        `Provider '${providerName}' does not support recurring payments (mandates)`,
+        'MANDATES_NOT_SUPPORTED',
+        providerName,
+      );
+    }
+    return provider;
+  }
+
+  private invalidMandate(message: string, providerName: string): CheckoutError {
+    return new CheckoutError(message, 'INVALID_MANDATE_REQUEST', providerName);
+  }
+
+  /** A persisted mandate passed back by the app: it must belong to this provider. */
+  private assertMandate(providerName: string, mandate: Mandate): void {
+    if (!isObject(mandate) || mandate.provider !== providerName) {
+      throw this.invalidMandate(`Mandate does not belong to provider '${providerName}'`, providerName);
+    }
+    if (!isNonEmptyString(mandate.mandateRef)) {
+      throw this.invalidMandate('Mandate has no mandateRef', providerName);
+    }
+    if (!isNonEmptyString(mandate.providerMandateId)) {
+      throw this.invalidMandate('Mandate has no providerMandateId', providerName);
+    }
+  }
+
+  /**
+   * Event payloads never carry the credential-like `providerMandateId`. Nexi's contract number
+   * is the app's own `mandateRef`, which is not a credential and is part of every payload.
+   */
+  private async emitMandateEvent(
+    event: CheckoutEventName,
+    payload: Omit<CheckoutEventPayload, 'timestamp'>,
+    providerMandateId: string | undefined,
+    mandateRef: string,
+  ): Promise<void> {
+    const secret = providerMandateId !== mandateRef ? providerMandateId : undefined;
+    await this.emit(event, redactSecret(payload, secret));
+  }
+
+  private async emitChargeEvent(
+    providerName: string,
+    mandateRef: string,
+    result: ChargeResult,
+    providerMandateId: string | undefined,
+  ): Promise<void> {
+    await this.emitMandateEvent(
+      CHARGE_EVENTS[result.status],
+      {
+        provider: providerName,
+        paymentId: result.providerPaymentId,
+        orderId: result.chargeRef,
+        status: result.status,
+        error: result.error,
+        verified: result.verified,
+        data: {
+          mandateRef,
+          amount: result.amount,
+          currency: result.currency,
+          providerCode: result.providerCode,
+          mandateUnusable: result.mandateUnusable,
+        },
+        raw: result.raw,
+      },
+      providerMandateId,
+      mandateRef,
+    );
+  }
+
+  /**
+   * Charge normalization (fail closed). Returns a new object, never mutates the provider's:
+   * - `chargeRef` is always the request's;
+   * - an unknown status becomes `unknown`;
+   * - `succeeded` without `verified: true` becomes `unknown` (never `failed`: an unauthenticated
+   *   "success" means we do not know);
+   * - a verified `succeeded` whose reported amount or currency differs from the request becomes
+   *   `unknown` with error 'Charged amount does not match the request'. Absent fields are not
+   *   compared (Nexi's charge response carries no amount).
+   */
+  private normalizeCharge(
+    result: ChargeResult | undefined,
+    chargeRef: string,
+    amount: number,
+    currency: string,
+  ): ChargeResult {
+    const normalized: ChargeResult = isObject(result)
+      ? { ...result }
+      : { status: 'unknown', verified: false, chargeRef, error: 'Provider returned no charge result' };
+    normalized.chargeRef = chargeRef;
+    normalized.verified = normalized.verified === true;
+    if (!CHARGE_STATUSES.has(normalized.status)) {
+      normalized.status = 'unknown';
+    }
+    if (normalized.status === 'succeeded') {
+      if (!normalized.verified) {
+        normalized.status = 'unknown';
+        normalized.error = normalized.error ?? 'Charge outcome could not be verified';
+      } else if (!chargedAmountMatches(normalized, amount, currency)) {
+        normalized.status = 'unknown';
+        normalized.error = AMOUNT_MISMATCH;
+      }
+    }
+    return normalized;
+  }
+
+  /**
+   * Starts a mandate setup (customer present). The setup always includes the first charge
+   * (`chargeRef = request.orderId`).
+   *
+   * Validates the request first and throws `CheckoutError('INVALID_MANDATE_REQUEST')` (or
+   * `'INVALID_AMOUNT'` from `toMinorUnits`) without calling the provider. A successful start whose
+   * `pending` does not match the request (provider, mandateRef, orderId) is returned as
+   * `success: false`. Persist `pending` before sending the customer to `approvalUrl`.
+   * Emits `mandate.setup_started` (`verified: false`) when the start succeeded.
+   *
+   * @throws CheckoutError('MANDATES_NOT_SUPPORTED') if the provider does not implement mandates.
+   */
+  async createMandate(providerName: string, request: MandateSetupRequest): Promise<MandateSetupStart> {
+    const provider = this.getMandateProvider(providerName);
+    if (!isObject(request)) {
+      throw this.invalidMandate('Invalid mandate setup request', providerName);
+    }
+    if (typeof request.mandateRef !== 'string' || !MANDATE_REF_PATTERN.test(request.mandateRef)) {
+      throw this.invalidMandate('Invalid mandateRef: expected /^[A-Za-z0-9_-]{5,30}$/', providerName);
+    }
+    if (typeof request.orderId !== 'string' || !CHARGE_REF_PATTERN.test(request.orderId)) {
+      throw this.invalidMandate('Invalid orderId: expected /^[A-Za-z0-9-]{2,30}$/', providerName);
+    }
+    if (!isNonEmptyString(request.currency)) {
+      throw this.invalidMandate('currency is required', providerName);
+    }
+    toMinorUnits(request.amount, request.currency);
+    if (
+      typeof request.description !== 'string' ||
+      request.description.length < 1 ||
+      request.description.length > 127
+    ) {
+      throw this.invalidMandate('Invalid description: 1-127 characters are required', providerName);
+    }
+    if (!isNonEmptyString(request.returnUrl) || !isNonEmptyString(request.cancelUrl)) {
+      throw this.invalidMandate('returnUrl and cancelUrl are required', providerName);
+    }
+
+    const start = await provider.createMandate(request);
+    let result: MandateSetupStart;
+    if (!isObject(start) || start.success !== true) {
+      result = {
+        ...(isObject(start) ? start : {}),
+        success: false,
+        approvalUrl: undefined,
+        pending: undefined,
+        error: (isObject(start) ? start.error : undefined) ?? 'Mandate setup could not be started',
+      };
+    } else {
+      const pending = start.pending;
+      const matches =
+        isObject(pending) &&
+        pending.provider === providerName &&
+        pending.mandateRef === request.mandateRef &&
+        pending.orderId === request.orderId;
+      result = matches
+        ? { ...start, pending: { ...pending } }
+        : {
+            ...start,
+            success: false,
+            approvalUrl: undefined,
+            pending: undefined,
+            error: 'Mandate setup does not match the request',
+          };
+    }
+
+    if (result.success) {
+      await this.emit('mandate.setup_started', {
+        provider: providerName,
+        orderId: request.orderId,
+        status: 'started',
+        // A setup start reports no outcome: nothing has been authenticated yet
+        verified: false,
+        data: { mandateRef: request.mandateRef },
+        raw: result.raw,
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Confirms a mandate setup from a provider callback (redirect or server notification), against
+   * the persisted `pending` state. Idempotent: it may be called twice for the same setup.
+   *
+   * Normalization (fail closed):
+   * - an unverified outcome is `success: false`, `terminal: false`, has no `mandate`, and a first
+   *   charge reported `succeeded` becomes `unknown`;
+   * - a verified outcome whose `firstCharge.chargeRef` is not `pending.orderId`, or whose `mandate`
+   *   does not match `pending` (mandateRef, provider), becomes an unverified, non-terminal failure
+   *   'Mandate outcome does not match the pending setup';
+   * - `terminal` is the provider's value AND `verified`; it is always `true` with `success: true`.
+   *
+   * Events are emitted only for terminal outcomes: `mandate.created` (success) or
+   * `mandate.setup_failed`, then `charge.*` for the first charge. A non-terminal outcome emits
+   * nothing, so a forged callback never looks like a failed setup.
+   *
+   * @throws CheckoutError('INVALID_MANDATE_REQUEST') if `pending.provider` is not `providerName`.
+   */
+  async confirmMandate(
+    providerName: string,
+    pending: MandatePendingState,
+    input: MandateCallbackInput = {},
+  ): Promise<MandateSetupOutcome> {
+    const provider = this.getMandateProvider(providerName);
+    if (!isObject(pending) || pending.provider !== providerName) {
+      throw this.invalidMandate(
+        `Pending mandate setup does not belong to provider '${providerName}'`,
+        providerName,
+      );
+    }
+    if (typeof pending.mandateRef !== 'string' || !MANDATE_REF_PATTERN.test(pending.mandateRef)) {
+      throw this.invalidMandate('Invalid pending mandateRef', providerName);
+    }
+    if (typeof pending.orderId !== 'string' || !CHARGE_REF_PATTERN.test(pending.orderId)) {
+      throw this.invalidMandate('Invalid pending orderId', providerName);
+    }
+
+    const providerOutcome = await provider.confirmMandate(pending, input ?? {});
+    const outcome = this.normalizeSetupOutcome(providerName, pending, providerOutcome);
+
+    if (outcome.terminal) {
+      // Taken from the provider's outcome: a dropped mandate's id may still be inside `raw`
+      const providerMandateId =
+        isObject(providerOutcome) && isObject(providerOutcome.mandate)
+          ? providerOutcome.mandate.providerMandateId
+          : undefined;
+      const secret = typeof providerMandateId === 'string' ? providerMandateId : undefined;
+      await this.emitMandateEvent(
+        outcome.success ? 'mandate.created' : 'mandate.setup_failed',
+        {
+          provider: providerName,
+          orderId: pending.orderId,
+          status: outcome.success ? 'active' : 'failed',
+          error: outcome.error,
+          verified: outcome.verified,
+          data: { mandateRef: pending.mandateRef },
+          raw: outcome.raw,
+        },
+        secret,
+        pending.mandateRef,
+      );
+      await this.emitChargeEvent(providerName, pending.mandateRef, outcome.firstCharge, secret);
+    }
+    return outcome;
+  }
+
+  private normalizeSetupOutcome(
+    providerName: string,
+    pending: MandatePendingState,
+    out: MandateSetupOutcome | undefined,
+  ): MandateSetupOutcome {
+    const source: Partial<MandateSetupOutcome> = isObject(out) ? out : {};
+    const providerCharge = isObject(source.firstCharge) ? source.firstCharge : undefined;
+
+    if (source.verified !== true) {
+      const firstCharge: ChargeResult = providerCharge
+        ? { ...providerCharge, chargeRef: pending.orderId, verified: false }
+        : { status: 'unknown', verified: false, chargeRef: pending.orderId };
+      if (!CHARGE_STATUSES.has(firstCharge.status)) firstCharge.status = 'unknown';
+      if (firstCharge.status === 'succeeded') {
+        firstCharge.status = 'unknown';
+        firstCharge.error = firstCharge.error ?? 'Charge outcome could not be verified';
+      }
+      return {
+        ...source,
+        success: false,
+        verified: false,
+        terminal: false,
+        mandate: undefined,
+        firstCharge,
+        error: source.error ?? 'Mandate outcome could not be verified',
+      };
+    }
+
+    const mismatch = (): MandateSetupOutcome => ({
+      success: false,
+      verified: false,
+      terminal: false,
+      firstCharge: { status: 'unknown', verified: false, chargeRef: pending.orderId, error: SETUP_MISMATCH },
+      error: SETUP_MISMATCH,
+      raw: source.raw,
+    });
+
+    if (!providerCharge || providerCharge.chargeRef !== pending.orderId) return mismatch();
+    const mandate = source.mandate;
+    if (mandate !== undefined && mandate !== null) {
+      if (!isObject(mandate) || mandate.mandateRef !== pending.mandateRef || mandate.provider !== providerName) {
+        return mismatch();
+      }
+    }
+    const success = source.success === true;
+    if (
+      success &&
+      (!isObject(mandate) || mandate.status !== 'active' || !isNonEmptyString(mandate.providerMandateId))
+    ) {
+      // success: true means an active mandate: anything else is a provider bug
+      return mismatch();
+    }
+
+    const firstCharge = this.normalizeCharge(providerCharge, pending.orderId, pending.amount, pending.currency);
+    return {
+      ...source,
+      success,
+      verified: true,
+      terminal: success || source.terminal === true,
+      mandate: success && isObject(mandate) ? { ...mandate } : undefined,
+      firstCharge,
+    };
+  }
+
+  /**
+   * Merchant-initiated charge on an active mandate (customer absent). Never mounted as a route.
+   *
+   * Validates `chargeRef` (/^[A-Za-z0-9-]{2,30}$/, `INVALID_MANDATE_REQUEST`) and the amount
+   * (`INVALID_AMOUNT`). A `revoked` mandate returns `failed` with `mandateUnusable: true` without
+   * calling the provider. A provider that throws gives `unknown`. See `normalizeCharge` for the
+   * rest. Emits `charge.succeeded`, `charge.failed`, `charge.unknown` or `charge.requires_action`.
+   *
+   * Retry an `unknown` charge with the SAME `chargeRef`; a dunning retry after `failed` is a new
+   * charge with a NEW `chargeRef`. The library never retries on its own.
+   */
+  async chargeMandate(providerName: string, mandate: Mandate, charge: ChargeRequest): Promise<ChargeResult> {
+    const provider = this.getMandateProvider(providerName);
+    this.assertMandate(providerName, mandate);
+    if (!isObject(charge) || typeof charge.chargeRef !== 'string' || !CHARGE_REF_PATTERN.test(charge.chargeRef)) {
+      throw this.invalidMandate('Invalid chargeRef: expected /^[A-Za-z0-9-]{2,30}$/', providerName);
+    }
+    if (!isNonEmptyString(charge.currency)) {
+      throw this.invalidMandate('currency is required', providerName);
+    }
+    toMinorUnits(charge.amount, charge.currency);
+
+    let result: ChargeResult;
+    if (mandate.status === 'revoked') {
+      result = {
+        status: 'failed',
+        verified: false,
+        chargeRef: charge.chargeRef,
+        error: 'Mandate is revoked',
+        mandateUnusable: true,
+      };
+    } else {
+      let providerResult: ChargeResult | undefined;
+      try {
+        providerResult = await provider.chargeMandate(mandate, charge);
+      } catch (err) {
+        // The request may or may not have reached the provider: we do not know
+        providerResult = {
+          status: 'unknown',
+          verified: false,
+          chargeRef: charge.chargeRef,
+          error: 'Charge outcome unknown: the provider call failed',
+          raw: err,
+        };
+      }
+      result = this.normalizeCharge(providerResult, charge.chargeRef, charge.amount, charge.currency);
+    }
+
+    await this.emitChargeEvent(providerName, mandate.mandateRef, result, mandate.providerMandateId);
+    return result;
+  }
+
+  /** Re-reads the mandate's usability from the provider (`verified: false` when it cannot). */
+  async getMandate(providerName: string, mandate: Mandate): Promise<MandateStatusResult> {
+    const provider = this.getMandateProvider(providerName);
+    this.assertMandate(providerName, mandate);
+    const result = await provider.getMandate(mandate);
+    return { ...result, verified: result?.verified === true };
+  }
+
+  /**
+   * Revokes the mandate at the provider, when the provider supports it, and emits
+   * `mandate.revoked` with `data: { mandateRef, revokedAtProvider }`. Mark your own copy revoked
+   * whatever the provider answers.
+   */
+  async revokeMandate(providerName: string, mandate: Mandate): Promise<MandateRevokeResult> {
+    const provider = this.getMandateProvider(providerName);
+    this.assertMandate(providerName, mandate);
+    const providerResult = await provider.revokeMandate(mandate);
+    const result: MandateRevokeResult = {
+      ...(isObject(providerResult) ? providerResult : {}),
+      revokedAtProvider: isObject(providerResult) && providerResult.revokedAtProvider === true,
+    };
+    await this.emitMandateEvent(
+      'mandate.revoked',
+      {
+        provider: providerName,
+        status: 'revoked',
+        error: result.error,
+        // The revoke result carries no authentication flag
+        verified: false,
+        data: { mandateRef: mandate.mandateRef, revokedAtProvider: result.revokedAtProvider },
+        raw: result.raw,
+      },
+      mandate.providerMandateId,
+      mandate.mandateRef,
+    );
     return result;
   }
 }

@@ -3,7 +3,15 @@ export type CheckoutEventName =
   | 'payment.completed'
   | 'payment.failed'
   | 'payment.refunded'
-  | 'webhook.received';
+  | 'webhook.received'
+  | 'mandate.setup_started'
+  | 'mandate.created'
+  | 'mandate.setup_failed'
+  | 'mandate.revoked'
+  | 'charge.succeeded'
+  | 'charge.failed'
+  | 'charge.unknown'
+  | 'charge.requires_action';
 
 export interface CheckoutEventPayload {
   provider: string;
@@ -18,8 +26,18 @@ export interface CheckoutEventPayload {
    * and for any outcome built from unauthenticated input. When false on
    * `payment.completed` / `payment.failed` / `webhook.received`, `paymentId` and `orderId`
    * are omitted.
+   *
+   * Mandate events: `mandate.setup_started` is always false; `mandate.created`,
+   * `mandate.setup_failed` and the first charge's `charge.*` are emitted only for terminal
+   * (hence verified) setup outcomes; a `charge.*` event carries the charge result's `verified`;
+   * `mandate.revoked` is always false (the revoke result carries no authentication flag).
    */
   verified: boolean;
+  /**
+   * Event-specific data. Mandate and charge events carry `{ mandateRef, ... }` here; for charge
+   * events `paymentId` is the `providerPaymentId` and `orderId` is the `chargeRef`. The
+   * credential-like `providerMandateId` is never part of an event (it is scrubbed from `raw`).
+   */
   data?: any;
   raw?: unknown;
   timestamp: Date;

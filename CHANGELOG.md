@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - Unreleased
+
+Recurring payments (mandates): the core contract, configurator methods and Express routes. The built-in providers implement it in #31 (Nexi), #32 (PayPal) and #33 (Satispay). Resolves #30.
+
+### Added
+- **Mandate models** (`src/models/mandate.model.ts`, exported): `MandateSetupRequest`, `MandatePendingState`, `MandateSetupStart`, `Mandate`, `MandateStatus`, `ChargeRequest`, `ChargeResult`, `ChargeStatus`, `MandateSetupOutcome` (with `terminal`), `MandateCallbackInput`, `MandateStatusResult`, `MandateRevokeResult`, and the patterns `MANDATE_REF_PATTERN` (`/^[A-Za-z0-9_-]{5,30}$/`) and `CHARGE_REF_PATTERN` (`/^[A-Za-z0-9-]{2,30}$/`). All are plain JSON: the app persists them, the library keeps no mandate state in memory. Resolves #30.
+- **`IMandateProvider`** (optional provider capability: `createMandate`, `confirmMandate`, `chargeMandate`, `getMandate`, `revokeMandate`) and **`isMandateProvider`**. `IPaymentProvider` is unchanged, so existing custom providers keep compiling. Resolves #30.
+- **`CheckoutConfigurator`**: `supportsMandates`, `createMandate`, `confirmMandate`, `chargeMandate`, `getMandate`, `revokeMandate`. They validate inputs before calling the provider and normalize outcomes fail closed: an unverified outcome is never a success and never terminal; a verified outcome must match the pending setup (`firstCharge.chargeRef === pending.orderId`, `mandate.mandateRef`, `mandate.provider`); an unverified charge "success" and a verified one for another amount or currency become `unknown`, never `failed`; a revoked mandate is not charged; a provider that throws while charging gives `unknown`. Resolves #30.
+- **Events** `mandate.setup_started`, `mandate.created`, `mandate.setup_failed`, `mandate.revoked`, `charge.succeeded`, `charge.failed`, `charge.unknown`, `charge.requires_action`. Setup events are emitted only for terminal outcomes, so a forged callback never looks like a failed setup. Charge events carry `orderId = chargeRef` and `paymentId = providerPaymentId`; `data.mandateRef` is on every mandate event; the credential-like `providerMandateId` is never part of an event (scrubbed from the event's copy of `raw`). Resolves #30.
+- **`CheckoutErrorCode`** values `MANDATES_NOT_SUPPORTED` (HTTP 422 through the router) and `INVALID_MANDATE_REQUEST`. Resolves #30.
+- **Express Adapter**: `mandates` option (`buildMandateRequest`, `onStarted`, `loadPending`, `onOutcome`, all required, else `INSECURE_CONFIGURATION` at mount; optional `middleware`) mounting `POST /:provider/mandate` and `GET|POST /:provider/mandate/callback`. The callback is always exempt from the shared `middleware`; `onStarted` runs before the response; the response never carries `pending` or `raw`; the pending state is single-use (documented contract of `loadPending` / `onOutcome`). `GET /:provider/mandate` answers 405 instead of reaching the details route. No route exists for charges or revocations. Exported type `ExpressMandateOptions`. Resolves #30.
+- **`appendMandateRef(url, mandateRef)`** (exported): adds or replaces the `mandate_ref` query parameter, keeping the query and the hash. Resolves #30.
+
+### Documentation
+- README: "Recurring payments (mandates)" section (model, configurator guarantees, Express example, single-use pending state, `mandate_ref` rationale, renewal job example, provider prerequisites), mandate rows in the Routes table, mandate events. Resolves #30.
+
 ## [2.0.0] - 2026-11-12
 
 Every permissive default of `createCheckoutRouter` becomes an explicit, named opt-in. Resolves #29.

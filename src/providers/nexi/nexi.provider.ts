@@ -5,6 +5,22 @@ import { currencyExponent, isInvalidAmountError, toMinorUnits } from '../../util
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult, WebhookResult } from '../../models/payment-result.model';
 import { parseAmountFromCents, parseNexiCurrency } from '../../utils/parsing.util';
+import { appendMandateRef } from '../../utils/url';
+import { IMandateProvider } from '../../interfaces/mandate-provider.interface';
+import {
+  CHARGE_REF_PATTERN,
+  ChargeRequest,
+  ChargeResult,
+  MANDATE_REF_PATTERN,
+  Mandate,
+  MandateCallbackInput,
+  MandatePendingState,
+  MandateRevokeResult,
+  MandateSetupOutcome,
+  MandateSetupRequest,
+  MandateSetupStart,
+  MandateStatusResult,
+} from '../../models/mandate.model';
 
 export interface NexiProviderConfig {
   merchantId: string;
@@ -13,21 +29,99 @@ export interface NexiProviderConfig {
   group?: string;
   /** @default 'sandbox' */
   environment?: 'sandbox' | 'production';
+  /**
+   * Timeout of the recurring-payment and contract API calls (`pagamentoRicorrente`,
+   * `situazioneOrdine` replay guard, `dettagliContratto`, `cancellaContratto`), in ms.
+   * @default 30000
+   */
+  timeoutMs?: number;
+  /**
+   * Mandates: contract type sent as `tipo_contratto` at setup (`S` scheduled, `U` unscheduled) and
+   * included in the setup MAC. Only needed when the terminal is enabled for both kinds.
+   */
+  contractType?: 'S' | 'U';
 }
+
+/** Nexi XPay paid statuses (`situazioneOrdine` report `stato`, lower-case). */
+const NEXI_PAID_STATUSES = new Set(['autorizzato', 'contabilizzato', 'catturato']);
+
+/**
+ * Replay guard (`situazioneOrdine` report `stato`, trimmed and lower-case; manual v20.4 p. 622).
+ * Money was taken for the code: paid, partly captured, or charged and then (partly) refunded.
+ */
+const NEXI_CHARGED_STATUSES = new Set([
+  ...NEXI_PAID_STATUSES,
+  'contabilizzato parz.',
+  'rimborsato',
+  'rimborsato parz.',
+]);
+
+/** Replay guard: the clear refusals, the only states that make an existing code `failed`. */
+const NEXI_REFUSED_STATUSES = new Set(['negato', 'annullato', 'non creato']);
+
+/** Nexi XPay numeric code of EUR, the only currency `pagamentoRicorrente` accepts. */
+const NEXI_EUR_NUMERIC = '978';
+
+const EUR_ONLY = 'Nexi mandates support EUR only';
+
+/** `pagamentoRicorrente` `importo`: cents, at most 8 digits (pp. 188-193). */
+const NEXI_RECURRING_MAX_IMPORTO_DIGITS = 8;
+
+/** Hosted-page `esito` values that are a final refusal of the setup. */
+const NEXI_SETUP_REFUSALS = new Set(['KO', 'ANNULLO', 'ERRORE']);
+
+/** Class of a "Tabella Codici errore API Restful" code (Nexi XPay manual v20.4, pp. 883-885). */
+type NexiApiErrorClass = 'merchant' | 'duplicate' | 'notFound' | 'mandateUnusable' | 'declined';
+
+/** Configuration, credentials or technical errors: never the customer's fault. */
+const NEXI_MERCHANT_ERRORS = new Set([1, 3, 4, 5, 7, 12, 50, 97, 98, 99, 100]);
+const NEXI_NOT_FOUND_ERRORS = new Set([2, 13]);
+const NEXI_MANDATE_UNUSABLE_ERRORS = new Set([8, 14, 22]);
+const NEXI_DUPLICATE_ERROR = 9;
+
+/** The 7 fields covered by the hosted-page outcome MAC, plus the MAC itself. */
+interface NexiOutcomeFields {
+  codTrans: string;
+  esito: string;
+  importo: string;
+  divisa: string;
+  dataStr: string;
+  orario: string;
+  codAut: string;
+  mac: unknown;
+}
+
+type LookupResult = {
+  kind: 'paid' | 'refused' | 'pending' | 'absent' | 'error';
+  stato?: string;
+  amount?: number;
+  currency?: string;
+};
+
+/** A parsed JSON response of the XPay REST API, or why there is none. */
+type ApiCallResult =
+  | { ok: true; json: Record<string, unknown> }
+  | { ok: false; error: string };
 
 /**
  * Nexi eCommerce provider.
  * Flow: `redirect` — builds a signed checkout URL, redirects the user to Nexi,
  * then handles the POST-back via `handleRedirect`.
  *
+ * Recurring payments (`IMandateProvider`): the setup is a hosted-page first payment that
+ * registers a contract (`num_contratto` = `mandateRef`, `tipo_servizio=paga_multi`,
+ * `tipo_richiesta=PP`); later charges use `pagamentoRicorrente`; `cancellaContratto` revokes.
+ * EUR only. See "Specifiche tecniche di integrazione con il gateway di pagamento XPay" v20.4.
+ *
  * Note: Nexi XPay mandates SHA-1 for MAC computation. This is a requirement of
  * the Nexi API and cannot be changed on the client side.
  */
-export class NexiProvider extends BasePaymentProvider {
+export class NexiProvider extends BasePaymentProvider implements IMandateProvider {
   readonly name = 'nexi';
   readonly flow = 'redirect' as const;
 
   private readonly apiUrl: string;
+  private readonly timeoutMs: number;
 
   constructor(private readonly config: NexiProviderConfig) {
     super();
@@ -35,6 +129,10 @@ export class NexiProvider extends BasePaymentProvider {
       config.environment === 'production'
         ? 'https://ecommerce.nexi.it'
         : 'https://int-ecommerce.nexi.it';
+    this.timeoutMs =
+      typeof config.timeoutMs === 'number' && Number.isFinite(config.timeoutMs) && config.timeoutMs > 0
+        ? config.timeoutMs
+        : 30000;
   }
 
   /**
@@ -131,6 +229,225 @@ export class NexiProvider extends BasePaymentProvider {
     }
   }
 
+  /**
+   * Extracts the fields of a hosted-page outcome (redirect query or `urlpost` form). Missing
+   * fields are `''`; `codTrans` falls back to `fallbackCodTrans` when given. `mac` is returned as
+   * is, to be checked with `isValidHexMac`.
+   */
+  private extractOutcomeFields(
+    data: Record<string, unknown> | undefined,
+    fallbackCodTrans?: string,
+  ): NexiOutcomeFields {
+    const f = (k: string): string => {
+      const v = data?.[k];
+      return v === undefined || v === null ? '' : String(v);
+    };
+    const rawCodTrans = data?.['codTrans'];
+    return {
+      codTrans:
+        rawCodTrans === undefined || rawCodTrans === null ? (fallbackCodTrans ?? '') : String(rawCodTrans),
+      esito: f('esito'),
+      importo: f('importo'),
+      divisa: f('divisa'),
+      dataStr: f('data'),
+      orario: f('orario'),
+      codAut: f('codAut'),
+      mac: data?.['mac'],
+    };
+  }
+
+  /** True when the 7-field outcome MAC of `fields` is present and valid (constant time). */
+  private outcomeMacValid(fields: NexiOutcomeFields): boolean {
+    const { codTrans, esito, importo, divisa, dataStr, orario, codAut, mac } = fields;
+    return (
+      this.isValidHexMac(mac) &&
+      this.safeVerifyResponseMac(codTrans, esito, importo, divisa, dataStr, orario, codAut, mac)
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Recurring payments (mandates): MACs and API helpers
+  // ---------------------------------------------------------------------------
+
+  /** Constant-time comparison of a hex MAC against the expected SHA-1 hex digest. */
+  private hexMacEquals(expected: string, mac: unknown): boolean {
+    if (!this.isValidHexMac(mac)) return false;
+    try {
+      const expBuf = Buffer.from(expected, 'hex');
+      const macBuf = Buffer.from(mac, 'hex');
+      return expBuf.length === macBuf.length && expBuf.length > 0 && crypto.timingSafeEqual(expBuf, macBuf);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Verifies the standard XPay REST response MAC:
+   * `esito={esito}idOperazione={idOperazione}timeStamp={timeStamp}{macKey}`.
+   */
+  private responseMacValid(json: Record<string, unknown>): boolean {
+    const str = (k: string): string => {
+      const v = json[k];
+      return v === undefined || v === null ? '' : String(v);
+    };
+    const expected = this.sha1(
+      `esito=${str('esito')}idOperazione=${str('idOperazione')}timeStamp=${str('timeStamp')}${this.config.macKey}`,
+    );
+    return this.hexMacEquals(expected, json['mac']);
+  }
+
+  /**
+   * MAC policy of the recurring and contract APIs: a present `mac` must be valid whatever the
+   * `esito`; a missing one is tolerated only on `KO` (an error answer may carry none).
+   */
+  private responseAuthentic(json: Record<string, unknown>): boolean {
+    const mac = json['mac'];
+    if (mac === undefined || mac === null || mac === '') return json['esito'] === 'KO';
+    return this.responseMacValid(json);
+  }
+
+  /**
+   * Classifies a "Tabella Codici errore API Restful" code (pp. 883-885). A missing or
+   * non-numeric code is `merchant`: without a code nothing says the customer is at fault.
+   */
+  private classifyApiError(codice: unknown): NexiApiErrorClass {
+    const code =
+      typeof codice === 'number' || (typeof codice === 'string' && /^\d+$/.test(codice.trim()))
+        ? Number(codice)
+        : NaN;
+    if (!Number.isInteger(code)) return 'merchant';
+    if (NEXI_MERCHANT_ERRORS.has(code)) return 'merchant';
+    if (code === NEXI_DUPLICATE_ERROR) return 'duplicate';
+    if (NEXI_NOT_FOUND_ERRORS.has(code)) return 'notFound';
+    if (NEXI_MANDATE_UNUSABLE_ERRORS.has(code)) return 'mandateUnusable';
+    return 'declined';
+  }
+
+  /** `errore.codice` / `errore.messaggio` of a response, when present. */
+  private apiError(json: Record<string, unknown>): { codice: unknown; messaggio?: string } {
+    const errore = json['errore'];
+    if (errore === null || typeof errore !== 'object') return { codice: undefined };
+    const e = errore as Record<string, unknown>;
+    return {
+      codice: e['codice'],
+      messaggio: typeof e['messaggio'] === 'string' ? e['messaggio'] : undefined,
+    };
+  }
+
+  /**
+   * Computes the MAC of `pagamentoRicorrente` (p. 191). `scadenza` is not sent, so it is in the
+   * string with an empty value, as the manual requires:
+   * `apiKey=…numeroContratto=…codiceTransazione=…importo=…divisa=978scadenza=timeStamp=…{macKey}`.
+   */
+  private generateRecurringMac(
+    numeroContratto: string,
+    codiceTransazione: string,
+    importo: string,
+    timeStamp: string,
+  ): string {
+    return this.sha1(
+      `apiKey=${this.config.merchantId}numeroContratto=${numeroContratto}` +
+        `codiceTransazione=${codiceTransazione}importo=${importo}divisa=${NEXI_EUR_NUMERIC}` +
+        `scadenza=timeStamp=${timeStamp}${this.config.macKey}`,
+    );
+  }
+
+  /**
+   * POSTs a JSON body to an XPay REST endpoint with the configured timeout. Never throws; the
+   * error never contains the response body.
+   */
+  private async postApi(path: string, body: Record<string, string>): Promise<ApiCallResult> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.apiUrl}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (err) {
+      const name = err instanceof Error ? err.name : '';
+      return {
+        ok: false,
+        error: name === 'TimeoutError' || name === 'AbortError' ? 'Nexi API timeout' : 'Nexi API network error',
+      };
+    }
+    if (!response || !response.ok) {
+      return { ok: false, error: `Nexi API error: HTTP ${response?.status}` };
+    }
+    try {
+      const json = (await response.json()) as unknown;
+      if (json === null || typeof json !== 'object' || Array.isArray(json)) {
+        return { ok: false, error: 'Invalid provider response' };
+      }
+      return { ok: true, json: json as Record<string, unknown> };
+    } catch {
+      return { ok: false, error: 'Invalid provider response' };
+    }
+  }
+
+  /**
+   * Reads `situazioneOrdine` for `codTrans` (same request as `getPaymentDetails`) and classifies
+   * the raw response, over every report entry for `codTrans`:
+   * - `paid`: some entry shows the money was taken (`NEXI_CHARGED_STATUSES`: paid, partly captured,
+   *   refunded or partly refunded);
+   * - `pending`: otherwise, some entry is in progress (`In Corso`), has an unrecognised `stato`, or
+   *   has none. Fail safe: such a code may still be charged, so it is never reported as refused;
+   * - `refused`: every entry is a clear refusal (`Negato`, `Annullato`, `Non Creato`);
+   * - `absent`: OK with no matching report entry, or KO "not found" 2/13;
+   * - `error`: anything else (HTTP, network, timeout, non-JSON, bad MAC, a missing MAC on OK, no
+   *   `report` array, any other KO).
+   */
+  private async lookupTransaction(codTrans: string): Promise<LookupResult> {
+    const timeStamp = String(Date.now());
+    const mac = this.generateStatusMac(this.config.merchantId, codTrans, timeStamp);
+    const res = await this.postApi('/ecomm/api/bo/situazioneOrdine', {
+      apiKey: this.config.merchantId,
+      codiceTransazione: codTrans,
+      timeStamp,
+      mac,
+    });
+    if (!res.ok) return { kind: 'error' };
+    const json = res.json;
+    if (!this.responseAuthentic(json)) return { kind: 'error' };
+
+    if (json['esito'] === 'KO') {
+      return this.classifyApiError(this.apiError(json).codice) === 'notFound'
+        ? { kind: 'absent' }
+        : { kind: 'error' };
+    }
+    if (json['esito'] !== 'OK' || !Array.isArray(json['report'])) return { kind: 'error' };
+
+    const entries = (json['report'] as unknown[]).filter(
+      (r): r is Record<string, unknown> =>
+        r !== null && typeof r === 'object' && (r as Record<string, unknown>)['codiceTransazione'] === codTrans,
+    );
+    if (entries.length === 0) return { kind: 'absent' };
+
+    // Nexi may list a code more than once (it accepts up to 2 retries of a code after a KO): one
+    // charged entry means the customer was charged, whatever the order of the entries; one entry
+    // that is not final (or not understood) means the code may still be charged
+    const statoOf = (e: Record<string, unknown>) =>
+      typeof e['stato'] === 'string' ? e['stato'] : undefined;
+    const classOf = (e: Record<string, unknown>): 'paid' | 'refused' | 'pending' => {
+      const stato = statoOf(e)?.trim().toLowerCase();
+      if (stato === undefined) return 'pending';
+      if (NEXI_CHARGED_STATUSES.has(stato)) return 'paid';
+      return NEXI_REFUSED_STATUSES.has(stato) ? 'refused' : 'pending';
+    };
+    const kind = (['paid', 'pending'] as const).find((k) => entries.some((e) => classOf(e) === k)) ?? 'refused';
+    const entry = entries.find((e) => classOf(e) === kind) ?? entries[0];
+    const stato = statoOf(entry);
+    const amount = parseAmountFromCents(entry['importo']);
+    const currency = parseNexiCurrency(entry['divisa']);
+    return {
+      kind,
+      ...(stato !== undefined ? { stato } : {}),
+      ...(amount !== undefined ? { amount } : {}),
+      ...(currency !== undefined ? { currency } : {}),
+    };
+  }
+
   async createPayment(request: PaymentRequest): Promise<PaymentResult> {
     try {
       // Outcome amounts (redirect, webhook, details) and refunds are read and sent in hundredths:
@@ -192,15 +509,9 @@ export class NexiProvider extends BasePaymentProvider {
    */
   async executePayment(paymentId: string, data?: Record<string, string>): Promise<PaymentResult> {
     try {
-      const esito: string = data?.esito ?? '';
       const requestedId = typeof paymentId === 'string' && paymentId !== '' ? paymentId : undefined;
-      const codTrans: string = data?.codTrans ?? requestedId ?? '';
-      const importo: string = data?.importo ?? '';
-      const divisa: string = data?.divisa ?? '';
-      const dataStr: string = (data as any)?.data ?? '';
-      const orario: string = (data as any)?.orario ?? '';
-      const codAut: string = (data as any)?.codAut ?? '';
-      const mac = data?.mac;
+      const fields = this.extractOutcomeFields(data, requestedId);
+      const { codTrans, esito, importo, divisa, mac } = fields;
 
       if (!mac) {
         return {
@@ -212,7 +523,7 @@ export class NexiProvider extends BasePaymentProvider {
         };
       }
 
-      if (!this.isValidHexMac(mac) || !this.safeVerifyResponseMac(codTrans, esito, importo, divisa, dataStr, orario, codAut, mac)) {
+      if (!this.outcomeMacValid(fields)) {
         return {
           success: false,
           verified: false,
@@ -401,7 +712,6 @@ export class NexiProvider extends BasePaymentProvider {
       const amount = parseAmountFromCents(item.importo);
       const currency = parseNexiCurrency(item.divisa);
 
-      const NEXI_PAID_STATUSES = new Set(['autorizzato', 'contabilizzato', 'catturato']);
       const statoStr = typeof stato === 'string' ? stato.toLowerCase() : '';
       const isPaidStatus = NEXI_PAID_STATUSES.has(statoStr);
       const isSuccess = isPaidStatus && amount !== undefined && amount > 0 && !!currency && currency.trim() !== '';
@@ -482,5 +792,421 @@ export class NexiProvider extends BasePaymentProvider {
    */
   async handleRedirect(query: Record<string, string>): Promise<PaymentResult> {
     return this.executePayment(query['codTrans'] ?? '', query);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Recurring payments (mandates) — IMandateProvider
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Starts a contract registration: a hosted-page first payment with `num_contratto` =
+   * `mandateRef`, `tipo_servizio=paga_multi`, `tipo_richiesta=PP` (pp. 59-65), charging the first
+   * period. `codTrans` is `orderId`. EUR only. `mandate_ref` is appended to `url`, `url_back` and
+   * `urlpost`.
+   */
+  async createMandate(request: MandateSetupRequest): Promise<MandateSetupStart> {
+    try {
+      if (request.currency !== 'EUR') {
+        return { success: false, error: EUR_ONLY };
+      }
+      if (!MANDATE_REF_PATTERN.test(request.mandateRef) || !CHARGE_REF_PATTERN.test(request.orderId)) {
+        return { success: false, error: 'Invalid mandateRef or orderId for Nexi' };
+      }
+      const importo = toMinorUnits(request.amount, 'EUR');
+      const codTrans = request.orderId;
+      const contractType = this.config.contractType;
+      const mac =
+        contractType === undefined
+          ? this.generateMac(codTrans, 'EUR', importo)
+          : this.sha1(
+              `codTrans=${codTrans}divisa=EURimporto=${importo}tipo_contratto=${contractType}${this.config.macKey}`,
+            );
+
+      const params: Record<string, string> = {
+        alias: this.config.merchantId,
+        importo: String(importo),
+        divisa: 'EUR',
+        codTrans,
+        url: appendMandateRef(request.returnUrl, request.mandateRef),
+        url_back: appendMandateRef(request.cancelUrl, request.mandateRef),
+        mac,
+        num_contratto: request.mandateRef,
+        tipo_servizio: 'paga_multi',
+        tipo_richiesta: 'PP',
+      };
+      if (contractType !== undefined) params.tipo_contratto = contractType;
+      if (request.notifyUrl) params.urlpost = appendMandateRef(request.notifyUrl, request.mandateRef);
+      if (this.config.group) params.gruppo = this.config.group;
+
+      return {
+        success: true,
+        approvalUrl: `${this.apiUrl}/ecomm/ecomm/DispatcherServlet?${new URLSearchParams(params)}`,
+        pending: {
+          provider: this.name,
+          mandateRef: request.mandateRef,
+          orderId: codTrans,
+          amount: request.amount,
+          currency: 'EUR',
+          providerRef: codTrans,
+          createdAt: new Date().toISOString(),
+        },
+      };
+    } catch (error) {
+      if (isInvalidAmountError(error)) return { success: false, error: error.message };
+      if (error instanceof TypeError) return { success: false, error: 'Invalid returnUrl, cancelUrl or notifyUrl' };
+      return { success: false, error: 'Failed to create Nexi mandate' };
+    }
+  }
+
+  /**
+   * Confirms a setup from the hosted-page outcome: the redirect on `url` (GET query) or the
+   * `urlpost` notification (form POST). Pure function of its inputs, hence idempotent.
+   *
+   * - The 7-field outcome MAC must be valid, and the MAC-covered `codTrans`, `importo` and
+   *   `divisa` must match `pending`; otherwise the outcome is unverified and non-terminal (a forged
+   *   callback never consumes the pending state). The unsigned `num_contratto`, when present, must
+   *   be `pending.mandateRef` (and `tipo_servizio` / `tipo_richiesta`, when present, `paga_multi` /
+   *   `PP`); the contract number used is always `pending.mandateRef`.
+   * - `esito=OK` with `num_contratto`: active mandate, first charge `succeeded` (terminal). An OK
+   *   without `num_contratto` is unverified and non-terminal (no contract may exist).
+   * - `esito` `KO`, `ANNULLO` or `ERRORE`: no mandate, first charge `failed` (terminal). Start a
+   *   new setup with a fresh `mandateRef` and `orderId`: a `codTrans` is never reused. This
+   *   requires a terminal that allows a single payment attempt per `codTrans`: on a terminal
+   *   configured for up to 3 attempts (manual, pp. 32-33), a KO then an OK arrive for the same
+   *   `codTrans`, and the OK finds the pending state already consumed.
+   * - Any other `esito` (e.g. a pending one) is unverified and non-terminal: it may still turn OK.
+   *
+   * An empty input (`{}`) has no MAC, so a re-confirm is unverified and non-terminal: Nexi never
+   * reports a terminal outcome with an `unknown` first charge.
+   */
+  async confirmMandate(pending: MandatePendingState, input: MandateCallbackInput): Promise<MandateSetupOutcome> {
+    const unverified = (error: string): MandateSetupOutcome => ({
+      success: false,
+      verified: false,
+      terminal: false,
+      firstCharge: { status: 'unknown', verified: false, chargeRef: pending.orderId, error },
+      error,
+    });
+    try {
+      const params: Record<string, string> = {};
+      for (const source of [input?.query, input?.body]) {
+        if (source === null || typeof source !== 'object') continue;
+        for (const [k, v] of Object.entries(source)) {
+          if (typeof v === 'string') params[k] = v;
+        }
+      }
+
+      const fields = this.extractOutcomeFields(params);
+      if (!this.outcomeMacValid(fields)) return unverified('Invalid outcome MAC');
+
+      if (fields.codTrans !== pending.orderId) {
+        return unverified('Outcome does not match the pending setup');
+      }
+      if (fields.importo !== String(toMinorUnits(pending.amount, 'EUR')) || fields.divisa !== 'EUR') {
+        return unverified('Outcome amount does not match');
+      }
+      // Not MAC-covered: only tampering indicators, never the source of the contract number
+      if (params['num_contratto'] !== undefined && params['num_contratto'] !== pending.mandateRef) {
+        return unverified('Outcome does not match the pending setup');
+      }
+      if (
+        (params['tipo_servizio'] !== undefined && params['tipo_servizio'] !== 'paga_multi') ||
+        (params['tipo_richiesta'] !== undefined && params['tipo_richiesta'] !== 'PP')
+      ) {
+        return unverified('Outcome does not match the pending setup');
+      }
+
+      if (fields.esito === 'OK') {
+        // Nexi echoes num_contratto on a contract-registering outcome. Without it, the customer may
+        // have stripped the contract parameters from the (unsigned) approvalUrl, so a plain payment
+        // was made and no contract may exist: never report that as an active mandate.
+        if (params['num_contratto'] === undefined) {
+          return unverified('Outcome does not match the pending setup');
+        }
+        const unverifiedHints: NonNullable<Mandate['unverified']> = {};
+        const scadenzaPan = params['scadenza_pan'];
+        if (scadenzaPan !== undefined && /^\d{6}$/.test(scadenzaPan)) unverifiedHints.cardExpiry = scadenzaPan;
+        const pan = params['pan'];
+        if (pan !== undefined && /^[0-9*]{8,19}$/.test(pan)) unverifiedHints.maskedPan = pan;
+
+        const mandate: Mandate = {
+          provider: this.name,
+          mandateRef: pending.mandateRef,
+          providerMandateId: pending.mandateRef,
+          status: 'active',
+          createdAt: new Date().toISOString(),
+          ...(Object.keys(unverifiedHints).length > 0 ? { unverified: unverifiedHints } : {}),
+        };
+        return {
+          success: true,
+          verified: true,
+          terminal: true,
+          mandate,
+          firstCharge: {
+            status: 'succeeded',
+            verified: true,
+            chargeRef: pending.orderId,
+            providerPaymentId: pending.orderId,
+            amount: pending.amount,
+            currency: 'EUR',
+          },
+          raw: params,
+        };
+      }
+
+      if (!NEXI_SETUP_REFUSALS.has(fields.esito)) {
+        // e.g. a pending outcome: the setup may still turn OK, so the pending state must survive
+        return unverified(`Mandate setup outcome ${fields.esito} is not final`);
+      }
+
+      const messaggio = params['messaggio'];
+      const codiceEsito = params['codiceEsito'];
+      return {
+        success: false,
+        verified: true,
+        terminal: true,
+        firstCharge: {
+          status: 'failed',
+          verified: true,
+          chargeRef: pending.orderId,
+          error: messaggio !== undefined && messaggio !== '' ? messaggio : fields.esito,
+          ...(codiceEsito !== undefined ? { providerCode: codiceEsito } : {}),
+        },
+        error: `Mandate setup failed with outcome ${fields.esito}`,
+        raw: params,
+      };
+    } catch {
+      return unverified('Mandate outcome could not be verified');
+    }
+  }
+
+  /**
+   * Merchant-initiated charge with `pagamentoRicorrente` (pp. 188-193), EUR only.
+   * `codiceTransazione` is `charge.chargeRef`, so `refundPayment(chargeRef, amount)` refunds it.
+   *
+   * Replay guard: `situazioneOrdine` is read first. A transaction that took the money (paid,
+   * partly captured, refunded or partly refunded) is returned as `succeeded` without charging
+   * again, with its `stato` in `raw`; one that only Nexi refused (`Negato`, `Annullato`,
+   * `Non Creato`) is `failed` (a dunning retry needs a new `chargeRef`: Nexi's own retries of a
+   * code after a KO are not used); one still in progress (`In Corso`) or with an unrecognised
+   * `stato` is `unknown`, and so is a lookup error: nothing is charged. A Nexi "transaction
+   * already present" (9) is re-read.
+   * Merchant-side errors (credentials, MAC, technical) are `unknown`, never `failed`.
+   */
+  async chargeMandate(mandate: Mandate, charge: ChargeRequest): Promise<ChargeResult> {
+    const chargeRef = charge.chargeRef;
+    const unknown = (error: string, providerCode?: string): ChargeResult => ({
+      status: 'unknown',
+      verified: false,
+      chargeRef,
+      error,
+      ...(providerCode !== undefined ? { providerCode } : {}),
+    });
+    const fromLookup = (lookup: LookupResult): ChargeResult => ({
+      status: 'succeeded',
+      verified: true,
+      chargeRef,
+      providerPaymentId: chargeRef,
+      ...(lookup.amount !== undefined ? { amount: lookup.amount } : {}),
+      ...(lookup.currency !== undefined ? { currency: lookup.currency } : {}),
+      ...(lookup.stato !== undefined ? { raw: { stato: lookup.stato } } : {}),
+    });
+
+    try {
+      if (charge.currency !== 'EUR') {
+        return { status: 'failed', verified: false, chargeRef, error: EUR_ONLY };
+      }
+      if (typeof chargeRef !== 'string' || chargeRef.includes('_')) {
+        return { status: 'failed', verified: false, chargeRef, error: 'Nexi codiceTransazione cannot contain "_"' };
+      }
+      const importo = String(toMinorUnits(charge.amount, 'EUR'));
+      if (importo.length > NEXI_RECURRING_MAX_IMPORTO_DIGITS) {
+        // pagamentoRicorrente takes at most 8 digits of cents (pp. 188-193): Nexi would answer KO 1
+        // (a merchant-side `unknown`), and a retry with the same chargeRef could never succeed
+        return {
+          status: 'failed',
+          verified: false,
+          chargeRef,
+          error: 'Amount exceeds the Nexi recurring limit (8 digits of cents)',
+        };
+      }
+
+      // Replay guard: never charge twice for the same chargeRef
+      const lookup = await this.lookupTransaction(chargeRef);
+      if (lookup.kind === 'paid') return fromLookup(lookup);
+      if (lookup.kind === 'refused') {
+        return {
+          status: 'failed',
+          verified: true,
+          chargeRef,
+          error: `A transaction with this chargeRef already exists: ${lookup.stato ?? 'unknown'}`,
+        };
+      }
+      if (lookup.kind === 'pending') {
+        // `In Corso` may still end Autorizzato: a `failed` here would send the app to dunning with a
+        // new chargeRef, charging the customer twice
+        return unknown(`A transaction with this chargeRef is not final at Nexi: ${lookup.stato ?? 'unknown'}`);
+      }
+      if (lookup.kind !== 'absent') {
+        return unknown('Could not check whether this chargeRef was already charged');
+      }
+
+      const numeroContratto = mandate.providerMandateId;
+      const timeStamp = String(Date.now());
+      const body: Record<string, string> = {
+        apiKey: this.config.merchantId,
+        numeroContratto,
+        codiceTransazione: chargeRef,
+        importo,
+        divisa: NEXI_EUR_NUMERIC,
+        timeStamp,
+        mac: this.generateRecurringMac(numeroContratto, chargeRef, importo, timeStamp),
+      };
+      if (this.config.group) body.codiceGruppo = this.config.group;
+
+      const res = await this.postApi('/ecomm/api/recurring/pagamentoRicorrente', body);
+      if (!res.ok) return unknown(res.error);
+      const json = res.json;
+      if (!this.responseAuthentic(json)) return unknown('Response MAC mismatch');
+
+      if (json['esito'] === 'OK') {
+        const raw: Record<string, unknown> = {};
+        if (json['codiceAutorizzazione'] !== undefined) raw.codiceAutorizzazione = json['codiceAutorizzazione'];
+        const dettagli = json['dettagliCarta'];
+        const expiry =
+          dettagli !== null && typeof dettagli === 'object'
+            ? (dettagli as Record<string, unknown>)['expiry']
+            : undefined;
+        if (typeof expiry === 'string' && /^\d{6}$/.test(expiry)) raw.cardExpiry = expiry;
+        // The response carries no amount: amount and currency are deliberately not set
+        return { status: 'succeeded', verified: true, chargeRef, providerPaymentId: chargeRef, raw };
+      }
+      if (json['esito'] !== 'KO') return unknown('Unexpected Nexi outcome');
+
+      const { codice, messaggio } = this.apiError(json);
+      const providerCode = codice === undefined || codice === null ? undefined : String(codice);
+      const raw = { esito: 'KO', ...(providerCode !== undefined ? { codice: providerCode } : {}) };
+      switch (this.classifyApiError(codice)) {
+        case 'duplicate': {
+          const again = await this.lookupTransaction(chargeRef);
+          if (again.kind === 'paid') return fromLookup(again);
+          return unknown('Transaction already present', providerCode);
+        }
+        case 'merchant':
+          return { ...unknown('Nexi refused the request (merchant-side error)', providerCode), raw };
+        case 'mandateUnusable':
+          return {
+            status: 'failed',
+            verified: true,
+            chargeRef,
+            mandateUnusable: true,
+            error: messaggio ?? 'Mandate is no longer usable',
+            ...(providerCode !== undefined ? { providerCode } : {}),
+            raw,
+          };
+        default:
+          return {
+            status: 'failed',
+            verified: true,
+            chargeRef,
+            error: messaggio ?? 'Payment refused',
+            ...(providerCode !== undefined ? { providerCode } : {}),
+            raw,
+          };
+      }
+    } catch (error) {
+      if (isInvalidAmountError(error)) {
+        return { status: 'failed', verified: false, chargeRef, error: error.message };
+      }
+      return unknown('Charge outcome unknown');
+    }
+  }
+
+  /**
+   * Re-reads the contract with `dettagliContratto` (pp. 851-853). `active` when it is listed and
+   * its first payment is not KO; `revoked` when its first payment is KO or Nexi answers "not
+   * found" or "invalid contract"; otherwise `unknown` (unverified).
+   */
+  async getMandate(mandate: Mandate): Promise<MandateStatusResult> {
+    try {
+      const numeroContratto = mandate.providerMandateId;
+      const timeStamp = String(Date.now());
+      const mac = this.sha1(
+        `apiKey=${this.config.merchantId}numeroContratto=${numeroContratto}codiceFiscale=` +
+          `dataRegistrazioneDa=dataRegistrazioneA=timeStamp=${timeStamp}${this.config.macKey}`,
+      );
+      const res = await this.postApi('/ecomm/api/contratti/dettagliContratto', {
+        apiKey: this.config.merchantId,
+        numeroContratto,
+        codiceFiscale: '',
+        dataRegistrazioneDa: '',
+        dataRegistrazioneA: '',
+        timeStamp,
+        mac,
+      });
+      if (!res.ok) return { status: 'unknown', verified: false };
+      const json = res.json;
+      if (!this.responseAuthentic(json)) return { status: 'unknown', verified: false, raw: json };
+
+      if (json['esito'] === 'OK' && Array.isArray(json['contratti'])) {
+        const entry = (json['contratti'] as unknown[]).find(
+          (c): c is Record<string, unknown> =>
+            c !== null && typeof c === 'object' && (c as Record<string, unknown>)['numeroContratto'] === numeroContratto,
+        );
+        if (entry) {
+          const stato = entry['statoPrimoPag'];
+          const ko = typeof stato === 'string' && stato.toUpperCase() === 'KO';
+          return { status: ko ? 'revoked' : 'active', verified: true, raw: json };
+        }
+      }
+      if (json['esito'] === 'KO') {
+        const kind = this.classifyApiError(this.apiError(json).codice);
+        if (kind === 'notFound' || kind === 'mandateUnusable') {
+          return { status: 'revoked', verified: true, raw: json };
+        }
+      }
+      return { status: 'unknown', verified: false, raw: json };
+    } catch {
+      return { status: 'unknown', verified: false };
+    }
+  }
+
+  /**
+   * Cancels the contract with `cancellaContratto` (pp. 838-840). "Not found" and "invalid
+   * contract" count as revoked: the contract is already gone.
+   */
+  async revokeMandate(mandate: Mandate): Promise<MandateRevokeResult> {
+    try {
+      const numeroContratto = mandate.providerMandateId;
+      const timeStamp = String(Date.now());
+      const mac = this.sha1(
+        `apiKey=${this.config.merchantId}numeroContratto=${numeroContratto}timeStamp=${timeStamp}${this.config.macKey}`,
+      );
+      const res = await this.postApi('/ecomm/api/contratti/cancellaContratto', {
+        apiKey: this.config.merchantId,
+        numeroContratto,
+        timeStamp,
+        mac,
+      });
+      if (!res.ok) return { revokedAtProvider: false, error: res.error };
+      const json = res.json;
+      if (!this.responseAuthentic(json)) {
+        return { revokedAtProvider: false, error: 'Response MAC mismatch', raw: json };
+      }
+      if (json['esito'] === 'OK') return { revokedAtProvider: true, raw: json };
+      if (json['esito'] === 'KO') {
+        const { codice } = this.apiError(json);
+        const kind = this.classifyApiError(codice);
+        if (kind === 'notFound' || kind === 'mandateUnusable') return { revokedAtProvider: true, raw: json };
+        return {
+          revokedAtProvider: false,
+          error: `Nexi refused the cancellation (code ${codice === undefined ? 'missing' : String(codice)})`,
+          raw: json,
+        };
+      }
+      return { revokedAtProvider: false, error: 'Unexpected Nexi outcome', raw: json };
+    } catch {
+      return { revokedAtProvider: false, error: 'Failed to revoke Nexi mandate' };
+    }
   }
 }

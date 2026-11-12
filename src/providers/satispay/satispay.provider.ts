@@ -803,6 +803,12 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
    * confirm (a second callback, or a re-confirm job with `{}`) replays that key and gets Satispay's
    * original response instead of charging twice. The token id is always `pending.providerRef`;
    * a callback `token_id` only has to match it.
+   *
+   * `CANCELED` is terminal (`success: false`, no mandate) but still sends the same first payment
+   * request: a re-confirm may run after an `unknown` first charge, and the customer may have
+   * canceled the authorization since. A canceled token cannot create a payment, so the replay
+   * either returns the original payment (`succeeded`: the customer paid before canceling) or is
+   * refused with a 4xx (`failed`, 'Authorization canceled'); a timeout or a 5xx stays `unknown`.
    */
   async confirmMandate(
     pending: MandatePendingState,
@@ -841,33 +847,24 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
           },
           raw: read.json,
         };
-      case 'CANCELED':
+      case 'CANCELED': {
+        // Never a verified `failed` without asking: the first payment may already exist
+        const replay = await this.chargeFirst(pending, 'revoked');
+        const firstCharge: ChargeResult =
+          replay.charge.status === 'failed' && replay.charge.verified
+            ? { ...replay.charge, error: 'Authorization canceled' }
+            : replay.charge;
         return {
           success: false,
           verified: true,
           terminal: true,
           error: 'Authorization canceled',
-          firstCharge: {
-            status: 'failed',
-            verified: true,
-            chargeRef: pending.orderId,
-            error: 'Authorization canceled',
-          },
+          firstCharge,
           raw: read.json,
         };
+      }
       case 'ACCEPTED': {
-        const mandate: Mandate = {
-          provider: this.name,
-          mandateRef: pending.mandateRef,
-          providerMandateId: pending.providerRef,
-          status: 'active',
-          createdAt: new Date().toISOString(),
-        };
-        const firstCharge = await this.chargeMandate(mandate, {
-          chargeRef: pending.orderId,
-          amount: pending.amount,
-          currency: 'EUR',
-        });
+        const { mandate, charge: firstCharge } = await this.chargeFirst(pending, 'active');
         return { success: true, verified: true, terminal: true, mandate, firstCharge, raw: read.json };
       }
       default:
@@ -876,10 +873,35 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
   }
 
   /**
+   * The setup's first payment: one request for ACCEPTED and CANCELED alike (same body, same
+   * `Idempotency-Key = pending.orderId`), so a replay always matches the original.
+   */
+  private async chargeFirst(
+    pending: MandatePendingState,
+    status: Mandate['status'],
+  ): Promise<{ mandate: Mandate; charge: ChargeResult }> {
+    const mandate: Mandate = {
+      provider: this.name,
+      mandateRef: pending.mandateRef,
+      providerMandateId: pending.providerRef,
+      status,
+      createdAt: new Date().toISOString(),
+    };
+    const charge = await this.chargeMandate(mandate, {
+      chargeRef: pending.orderId,
+      amount: pending.amount,
+      currency: 'EUR',
+    });
+    return { mandate, charge };
+  }
+
+  /**
    * Merchant-initiated `PRE_AUTHORIZED` payment, synchronous: Satispay creates it `ACCEPTED` or
    * answers 4xx without creating a payment. `Idempotency-Key = chargeRef`: the same `chargeRef`
    * gets Satispay's original response (retention not documented: retry `unknown` promptly).
    * `providerPaymentId` is the Satispay payment id, refundable with `refundPayment`.
+   * 408 and 409 are `unknown`, not a refusal: they may answer a concurrent request with the same
+   * key that is still in flight (Satispay documents neither the behaviour nor the status).
    */
   async chargeMandate(mandate: Mandate, charge: ChargeRequest): Promise<ChargeResult> {
     const chargeRef = charge.chargeRef;
@@ -966,6 +988,17 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
         verified: false,
         chargeRef,
         error: `Satispay rejected the request (HTTP ${res.status})`,
+        raw: res.json,
+      };
+    }
+
+    if (res.status === 408 || res.status === 409) {
+      // Possibly a same-key request still in flight: the original may succeed
+      return {
+        status: 'unknown',
+        verified: false,
+        chargeRef,
+        error: `Satispay charge outcome is unknown (HTTP ${res.status})`,
         raw: res.json,
       };
     }

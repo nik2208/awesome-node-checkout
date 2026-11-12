@@ -340,16 +340,52 @@ describe('SatispayProvider mandates (pre-authorized payment tokens)', () => {
     });
 
     it('(c) CANCELED is verified, terminal, with a failed first charge', async () => {
-      routes({ [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'CANCELED' }) });
+      routes({
+        [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'CANCELED' }),
+        // The idempotent first payment request is still sent: a canceled token is refused
+        [`POST ${PAYMENTS}`]: () => resp(400, { code: 172, message: 'Pre authorized payments token is not valid' }),
+      });
       const outcome = await provider.confirmMandate(pending, {});
       expect(outcome.success).toBe(false);
       expect(outcome.verified).toBe(true);
       expect(outcome.terminal).toBe(true);
+      expect(outcome.error).toBe('Authorization canceled');
       expect(outcome.firstCharge.status).toBe('failed');
       expect(outcome.firstCharge.verified).toBe(true);
+      expect(outcome.firstCharge.chargeRef).toBe('SUB-0001-INIT');
       expect(outcome.firstCharge.error).toBe('Authorization canceled');
+      expect(outcome.firstCharge.providerCode).toBe('172');
       expect(outcome.mandate).toBeUndefined();
-      expect(calls().some((c) => c.url === PAYMENTS)).toBe(false);
+
+      const post = calls().find((c) => c.key === `POST ${PAYMENTS}`)!;
+      expect(headersOf(post.init)['Idempotency-Key']).toBe('SUB-0001-INIT');
+      expect(bodyOf(post.init)).toEqual({
+        flow: 'PRE_AUTHORIZED',
+        token: 'tok_1',
+        amount_unit: 1990,
+        currency: 'EUR',
+        external_code: 'SUB-0001-INIT',
+      });
+    });
+
+    it('(c) CANCELED with a 5xx or a timeout on the first payment replay is unknown, never failed', async () => {
+      routes({
+        [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'CANCELED' }),
+        [`POST ${PAYMENTS}`]: () => resp(503, { message: 'down' }),
+      });
+      let outcome = await provider.confirmMandate(pending, {});
+      expect(outcome).toMatchObject({ success: false, verified: true, terminal: true, error: 'Authorization canceled' });
+      expect(outcome.firstCharge).toMatchObject({ status: 'unknown', verified: false, chargeRef: 'SUB-0001-INIT' });
+
+      routes({
+        [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'CANCELED' }),
+        [`POST ${PAYMENTS}`]: () => {
+          throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+        },
+      });
+      outcome = await provider.confirmMandate(pending, {});
+      expect(outcome).toMatchObject({ success: false, verified: true, terminal: true });
+      expect(outcome.firstCharge).toMatchObject({ status: 'unknown', verified: false, chargeRef: 'SUB-0001-INIT' });
     });
 
     it('(d) a 503 on the token GET is non-terminal with an unknown first charge', async () => {
@@ -403,6 +439,140 @@ describe('SatispayProvider mandates (pre-authorized payment tokens)', () => {
       expect(outcome.firstCharge.providerCode).toBe('36');
       expect(outcome.firstCharge.error).toBe('x');
     });
+  });
+
+  describe('re-confirming an unknown first charge after the authorization was canceled', () => {
+    const timeout = () => {
+      throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+    };
+
+    function recordEvents(checkout: CheckoutConfigurator): Array<[string, unknown]> {
+      const events: Array<[string, unknown]> = [];
+      for (const name of [
+        'mandate.created',
+        'mandate.setup_failed',
+        'charge.succeeded',
+        'charge.failed',
+        'charge.unknown',
+      ] as const) {
+        checkout.events.on(name, (payload) => {
+          events.push([name, payload]);
+        });
+      }
+      return events;
+    }
+
+    async function firstRunUnknown(checkout: CheckoutConfigurator) {
+      routes({
+        [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'ACCEPTED' }),
+        [`POST ${PAYMENTS}`]: timeout,
+      });
+      const o1 = await checkout.confirmMandate('satispay', pending, { query: { token_id: 'tok_1' } });
+      expect(o1).toMatchObject({ success: true, verified: true, terminal: true });
+      expect(o1.firstCharge.status).toBe('unknown');
+    }
+
+    it('a replay returning the original payment resolves the first charge as succeeded', async () => {
+      const checkout = new CheckoutConfigurator();
+      checkout.registerProvider(provider);
+      const events = recordEvents(checkout);
+      await firstRunUnknown(checkout);
+
+      routes({
+        [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'CANCELED' }),
+        [`POST ${PAYMENTS}`]: () => resp(200, acceptedPayment),
+      });
+      const o2 = await checkout.confirmMandate('satispay', pending, {});
+      expect(o2.success).toBe(false);
+      expect(o2.verified).toBe(true);
+      expect(o2.terminal).toBe(true);
+      expect(o2.error).toBe('Authorization canceled');
+      expect(o2.mandate).toBeUndefined();
+      expect(o2.firstCharge).toMatchObject({
+        status: 'succeeded',
+        verified: true,
+        chargeRef: 'SUB-0001-INIT',
+        providerPaymentId: 'pay_1',
+        amount: 19.9,
+        currency: 'EUR',
+      });
+
+      // Both runs sent the very same first payment request
+      const posts = calls().filter((c) => c.key === `POST ${PAYMENTS}`);
+      expect(posts).toHaveLength(2);
+      expect(headersOf(posts[0].init)['Idempotency-Key']).toBe('SUB-0001-INIT');
+      expect(headersOf(posts[1].init)['Idempotency-Key']).toBe('SUB-0001-INIT');
+      expect(bodyOf(posts[0].init)).toEqual(bodyOf(posts[1].init));
+
+      expect(events.map(([name]) => name)).toEqual([
+        'mandate.created',
+        'charge.unknown',
+        'mandate.setup_failed',
+        'charge.succeeded',
+      ]);
+      // The token id never reaches an event, also when the setup failed and no mandate is returned
+      for (const [, payload] of events) expect(JSON.stringify(payload)).not.toContain('tok_1');
+    });
+
+    it('a replay refused with a 4xx resolves the first charge as a verified failed', async () => {
+      const checkout = new CheckoutConfigurator();
+      checkout.registerProvider(provider);
+      const events = recordEvents(checkout);
+      await firstRunUnknown(checkout);
+
+      routes({
+        [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'CANCELED' }),
+        [`POST ${PAYMENTS}`]: () => resp(400, { code: 172, message: 'Pre authorized payments token is not valid' }),
+      });
+      const o2 = await checkout.confirmMandate('satispay', pending, {});
+      expect(o2).toMatchObject({ success: false, verified: true, terminal: true, error: 'Authorization canceled' });
+      expect(o2.firstCharge).toMatchObject({
+        status: 'failed',
+        verified: true,
+        chargeRef: 'SUB-0001-INIT',
+        providerCode: '172',
+        error: 'Authorization canceled',
+      });
+      const setupFailed = events.find(([name]) => name === 'mandate.setup_failed')!;
+      expect(setupFailed[1]).toMatchObject({ raw: { id: '[redacted]', status: 'CANCELED' } });
+      for (const [, payload] of events) expect(JSON.stringify(payload)).not.toContain('tok_1');
+    });
+
+    it('a replay that times out again stays unknown', async () => {
+      const checkout = new CheckoutConfigurator();
+      checkout.registerProvider(provider);
+      await firstRunUnknown(checkout);
+
+      routes({
+        [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'CANCELED' }),
+        [`POST ${PAYMENTS}`]: timeout,
+      });
+      const o2 = await checkout.confirmMandate('satispay', pending, {});
+      expect(o2).toMatchObject({ success: false, verified: true, terminal: true });
+      expect(o2.firstCharge).toMatchObject({ status: 'unknown', verified: false, chargeRef: 'SUB-0001-INIT' });
+    });
+  });
+
+  it('two concurrent confirms: a 409 on the duplicate first payment is unknown, never failed', async () => {
+    let post = 0;
+    routes({
+      [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'ACCEPTED' }),
+      [`POST ${PAYMENTS}`]: () => (++post === 1 ? resp(200, acceptedPayment) : resp(409, { code: 0, message: 'conflict' })),
+    });
+    const checkout = new CheckoutConfigurator();
+    checkout.registerProvider(provider);
+    const [a, b] = await Promise.all([
+      checkout.confirmMandate('satispay', pending, { query: { token_id: 'tok_1' } }),
+      checkout.confirmMandate('satispay', pending, {}),
+    ]);
+    // Whichever request reached Satispay second got the 409
+    const [first, second] = a.firstCharge.status === 'succeeded' ? [a, b] : [b, a];
+    expect(first.firstCharge).toMatchObject({ status: 'succeeded', verified: true, providerPaymentId: 'pay_1' });
+    expect(second.success).toBe(true);
+    expect(second.firstCharge).toMatchObject({ status: 'unknown', verified: false, chargeRef: 'SUB-0001-INIT' });
+    expect(calls().filter((c) => c.key === `POST ${PAYMENTS}`)).toHaveLength(2);
+    // No token GET after the 409: only the two setup re-reads
+    expect(calls().filter((c) => c.key === `GET ${TOKENS}/tok_1`)).toHaveLength(2);
   });
 
   // ---------------------------------------------------------------------------
@@ -489,7 +659,7 @@ describe('SatispayProvider mandates (pre-authorized payment tokens)', () => {
       expect(fetchMock()).toHaveBeenCalledTimes(1);
     });
 
-    it.each([401, 403, 429])('%i → unknown, with no token GET', async (status) => {
+    it.each([401, 403, 408, 409, 429])('%i → unknown, with no token GET', async (status) => {
       routes({ [`POST ${PAYMENTS}`]: () => resp(status, { code: 1, message: 'nope' }) });
       const result = await provider.chargeMandate(mandate, charge);
       expect(result.status).toBe('unknown');

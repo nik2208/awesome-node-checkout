@@ -401,6 +401,19 @@ Only `failed` counts towards dunning. Refund a mandate charge with the existing 
 
 Use `checkout.supportsMandates(provider)` to check whether a registered provider implements `IMandateProvider`.
 
+### Satispay
+
+`SatispayProvider` implements `IMandateProvider` with **Automatic Payments (pre-authorized payment tokens), web-redirect flow**: `createMandate` creates an authorization, the customer approves it in Satispay, and every charge (the first one included) is a synchronous `PRE_AUTHORIZED` payment.
+
+- **Prerequisite:** pre-authorized payments (Automatic Payments) must be enabled for your shop by Satispay. Without it, `createMandate` fails.
+- **EUR only.** `createMandate` and `chargeMandate` refuse any other currency without calling Satispay.
+- **`redirect_url` must not be opened in a WebView.** `approvalUrl` is the authorization's `redirect_url`: send the customer there in the browser (or let the Satispay app open it), never inside an embedded WebView.
+- **`cancelUrl` is unused:** Satispay has no cancel redirect. The customer always comes back to `returnUrl` (with `mandate_ref`), and a declined authorization is reported by the re-read as `CANCELED` (terminal, `success: false`, first charge `failed`).
+- **Callback.** The authorization's `callback_url` is `notifyUrl`, or `serverUrl` + `mandateCallbackPath` (default `/checkout/satispay/mandate/callback`) when `notifyUrl` is not set, with `mandate_ref` and `token_id={uuid}` appended. Satispay calls it with an HTTP GET whenever the authorization changes, replacing `{uuid}` with the token id. The callback is unsigned: `confirmMandate` only checks that `token_id`, when present, equals the persisted `pending.providerRef`, then re-reads the token server-to-server. `PENDING` is a verified, **non-terminal** outcome (`error: 'AUTHORIZATION_PENDING'`): keep the pending state and wait for the next callback. `ACCEPTED` activates the mandate and makes the first charge.
+- **Revocation is customer-side only.** Satispay documents no merchant-side revocation, so `revokeMandate` makes no network call and returns `revokedAtProvider: false`: stop charging the mandate and mark your copy revoked. The customer revokes it from the Satispay app; `getMandate` then reads `revoked`, and a later charge fails with `mandateUnusable: true`.
+- **Charges and replay semantics.** Every `PRE_AUTHORIZED` payment carries `Idempotency-Key = chargeRef` (the first charge: `orderId`; the setup itself: `setup-<orderId>`), and a request with the same key gets Satispay's original response, so a retry with the same `chargeRef` never charges twice. Satispay does not document how long it keeps idempotency keys: retry an `unknown` charge **promptly (the same day)**, and resolve older ones manually in the Satispay dashboard (`external_code` = `chargeRef`). A refused charge is a 4xx (`failed`, `providerCode` = Satispay's `code`); 401, 403, 429, 5xx, timeouts and network errors are `unknown`. The payment is created as `ACCEPTED` directly, and `providerPaymentId` is the Satispay payment id, so `refundPayment(provider, providerPaymentId, amount)` refunds a mandate charge.
+- **Config.** `timeoutMs` (default `30000`) bounds every mandate API call; `mandateCallbackPath` changes the default callback path.
+
 ---
 
 ## Security: A Redirect Is Not Proof of Payment

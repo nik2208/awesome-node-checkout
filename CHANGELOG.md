@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-11-12
+
+Every permissive default of `createCheckoutRouter` becomes an explicit, named opt-in. Resolves #29.
+
+### Breaking
+Migration list:
+- **The router throws at mount without `buildPaymentRequest`.** `createCheckoutRouter(checkout)` now throws `CheckoutError` with the new code `INSECURE_CONFIGURATION`. Set `buildPaymentRequest` (server-side amount), or, only where the client may choose the amount, `allowClientPaymentRequest: true` (prints one `console.warn` at mount). The old mount warning `the client body decides the amount; set buildPaymentRequest` is gone.
+- **The details route `GET /:provider/:id` is not mounted by default.** Add `details: { middleware: [...] }` to mount it behind your auth. `details: {}` mounts it unprotected and prints one `console.warn`. `details.enabled` is deprecated: `enabled: false` behaves as omitted (Express 404 instead of the former JSON `'Payment details route is disabled'`).
+- **`amount` values with excess decimals now fail instead of being rounded.** Through the router, an amount with more decimals than the currency allows (`19.999` EUR, `10.5` JPY) answers `400 { success: false, code: 'INVALID_AMOUNT', error }` (new `CheckoutErrorCode`) without calling the provider; `0`, negative and non-finite amounts keep their earlier 400 (`INVALID_PAYMENT_REQUEST` from `buildPaymentRequest`, uncoded on the client-body path). Called directly, Nexi, Satispay and PayPal `createPayment` reject all of these (excess decimals, `0`, negative, non-finite) with `INVALID_AMOUNT` and return `{ success: false, status: 'FAILED', error }`, and so does `refundPayment` for a partial amount with excess decimals or a negative value (an omitted amount still refunds in full). Amounts use the ISO 4217 exponent of the currency (0, 2 or 3), so PayPal now receives `'1000'` for 1000 JPY (previously the rejected `'1000.00'`) and `'1.200'` for 1.2 KWD.
+- **500 response bodies are generic.** Unexpected errors answer `{ success: false, error: 'Internal server error' }`. Set `exposeErrorMessages: true` to get the previous messages (including the `'Invalid provider response'` masking). The error is passed to the new `onError(err, req)` option, or logged with `console.error('[awesome-node-checkout]', err)` when `onError` is not set. `CheckoutError` 4xx responses keep their message and code.
+- **Generated order ids changed format.** Without `orderId`, Nexi `codTrans` and Satispay `external_code` are `ORD-` + 24 random hex chars (28 chars) instead of `ORD-<Date.now()>`.
+
+### Security
+- **Express Adapter**: the client body can no longer decide the amount unless `allowClientPaymentRequest: true` is set explicitly; previously a missing `buildPaymentRequest` only logged a warning and `POST /checkout/paypal {"amount":0.01,…}` created a 0.01 payment. Resolves #29.
+- **Express Adapter**: `GET /:provider/:id` is opt-in, so status, amount and currency of a payment are no longer readable by anyone who knows (or, for Nexi, guesses) a payment id. Resolves #29.
+- **Nexi, Satispay**: generated order ids come from `crypto.randomBytes` (96 bits) instead of a millisecond timestamp: they cannot be enumerated and do not collide across instances or within the same millisecond. Resolves #29.
+- **Nexi, Satispay, PayPal**: amounts are converted to exact minor units for the currency (`toMinorUnits`/`toMajorString`, internal); an excess decimal is rejected instead of silently rounded, and zero/three-decimal currencies are no longer formatted with two decimals. Resolves #29.
+- **Express Adapter**: internal error messages (including those thrown by `buildPaymentRequest`, `onBeforeExecute`, `redirect` handlers and event listeners) no longer reach the client in 500 responses by default. Resolves #29.
+
+### Added
+- `ExpressCheckoutOptions.allowClientPaymentRequest`, `exposeErrorMessages` and `onError`. Resolves #29.
+- `CheckoutErrorCode` values `INSECURE_CONFIGURATION` and `INVALID_AMOUNT`. Resolves #29.
+
+### Unchanged
+- `POST /:provider/execute` stays mounted by default: capturing an approved payment only completes the payer's own payment, and since 1.3.0 the outcome is keyed on the provider-authenticated id (#27). Documented in the README.
+
+### Documentation
+- README: "Secure defaults (2.0)" section, details marked *opt-in* in the Routes table, Quick Start and Express examples always build the request server-side. Resolves #29.
+
 ## [1.3.0] - 2026-09-29
 
 ### Breaking

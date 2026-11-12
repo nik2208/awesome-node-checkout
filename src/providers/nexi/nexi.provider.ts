@@ -1,5 +1,7 @@
 import * as crypto from 'crypto';
 import { BasePaymentProvider } from '../../abstract/base-payment-provider.abstract';
+import { generateOrderId } from '../../utils/ids';
+import { isInvalidAmountError, toMinorUnits } from '../../utils/money';
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult, WebhookResult } from '../../models/payment-result.model';
 import { parseAmountFromCents, parseNexiCurrency } from '../../utils/parsing.util';
@@ -131,8 +133,8 @@ export class NexiProvider extends BasePaymentProvider {
 
   async createPayment(request: PaymentRequest): Promise<PaymentResult> {
     try {
-      const amountCents = Math.round(request.amount * 100);
-      const orderId = request.orderId ?? `ORD-${Date.now()}`;
+      const amountCents = toMinorUnits(request.amount, request.currency);
+      const orderId = request.orderId ?? generateOrderId();
       const mac = this.generateMac(orderId, request.currency, amountCents);
 
       const params: Record<string, string> = {
@@ -162,6 +164,9 @@ export class NexiProvider extends BasePaymentProvider {
         status: 'CREATED',
       };
     } catch (error) {
+      if (isInvalidAmountError(error)) {
+        return { success: false, error: error.message, status: 'FAILED' };
+      }
       return this.errorResult(error, 'Failed to create Nexi payment');
     }
   }
@@ -417,7 +422,8 @@ export class NexiProvider extends BasePaymentProvider {
   async refundPayment(paymentId: string, amount?: number): Promise<PaymentResult> {
     try {
       const timestamp = new Date().toISOString();
-      const importo = amount ? Math.round(amount * 100).toString() : '';
+      // The refund API carries no currency: XPay amounts are in euro cents (exponent 2)
+      const importo = amount ? toMinorUnits(amount, 'EUR').toString() : '';
       const mac = this.generateRefundMac(this.config.merchantId, paymentId, importo, timestamp);
 
       const params: Record<string, string> = {
@@ -449,6 +455,9 @@ export class NexiProvider extends BasePaymentProvider {
         raw: result,
       };
     } catch (error) {
+      if (isInvalidAmountError(error)) {
+        return { success: false, error: error.message, status: 'FAILED' };
+      }
       return this.errorResult(error, 'Failed to refund Nexi payment');
     }
   }

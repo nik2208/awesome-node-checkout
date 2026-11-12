@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import express, { Express, Request, Response, NextFunction } from 'express';
 import request from 'supertest';
 import * as crypto from 'crypto';
@@ -7,6 +7,8 @@ import { CheckoutConfigurator } from '../../checkout-configurator';
 import { CheckoutError } from '../../models/errors';
 import { PaymentRequest } from '../../models/payment-request.model';
 import { NexiProvider } from '../../providers/nexi/nexi.provider';
+import { BasePaymentProvider } from '../../abstract/base-payment-provider.abstract';
+import { PaymentResult, WebhookResult } from '../../models/payment-result.model';
 
 describe('Express Adapter (createCheckoutRouter)', () => {
     let app: Express;
@@ -14,7 +16,10 @@ describe('Express Adapter (createCheckoutRouter)', () => {
 
     beforeEach(() => {
         vi.clearAllMocks();
-        
+        // Mount-time warnings and the default 500 logger are expected noise here
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+
         checkout = new CheckoutConfigurator({ emitEvents: false });
         
         vi.spyOn(checkout, 'createPayment').mockResolvedValue({
@@ -38,8 +43,12 @@ describe('Express Adapter (createCheckoutRouter)', () => {
 
         app = express();
         app.use(express.json());
-        // Default router without options
-        app.use('/payments', createCheckoutRouter(checkout));
+        // Client-body router with the details route: covers the opt-in paths on purpose
+        app.use('/payments', createCheckoutRouter(checkout, { allowClientPaymentRequest: true, details: {} }));
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
     });
 
     it('POST /:provider - should map to createPayment and return 201 on success', async () => {
@@ -145,24 +154,6 @@ describe('Express Adapter (createCheckoutRouter)', () => {
     });
 
     describe('Security & buildPaymentRequest (Issues #3 and #12)', () => {
-        it('should warn at mount time when buildPaymentRequest is not set', () => {
-            const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-            createCheckoutRouter(checkout);
-            expect(warnSpy).toHaveBeenCalledWith(
-                expect.stringContaining('the client body decides the amount; set buildPaymentRequest')
-            );
-            warnSpy.mockRestore();
-        });
-
-        it('should NOT warn at mount time when buildPaymentRequest is provided', () => {
-            const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-            createCheckoutRouter(checkout, {
-                buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: '', cancelUrl: '' })
-            });
-            expect(warnSpy).not.toHaveBeenCalled();
-            warnSpy.mockRestore();
-        });
-
         it('should pass req and ctx to buildPaymentRequest and use server-side values', async () => {
             const secureApp = express();
             secureApp.use(express.json());
@@ -268,7 +259,8 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             secureApp.use('/payments', createCheckoutRouter(checkout, {
                 buildPaymentRequest: () => {
                     throw new Error('Database connection failed');
-                }
+                },
+                exposeErrorMessages: true,
             }));
 
             const response = await request(secureApp)
@@ -317,6 +309,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             redirectApp.use(express.json());
 
             redirectApp.use('/payments', createCheckoutRouter(checkout, {
+                buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }),
                 redirect: {
                     onSuccess: (result, req) => `https://shop.test/success?paymentId=${result.paymentId}&ref=${req.query.ref}`,
                     onFailure: (result) => `https://shop.test/fail?status=${result.status}`,
@@ -341,6 +334,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             redirectApp.use(express.json());
 
             redirectApp.use('/payments', createCheckoutRouter(checkout, {
+                buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }),
                 redirect: {
                     onSuccess: (result) => `https://shop.test/success?paymentId=${result.paymentId}`,
                     onFailure: (result) => `https://shop.test/fail?status=${result.status}`,
@@ -356,16 +350,16 @@ describe('Express Adapter (createCheckoutRouter)', () => {
     });
 
     describe('Details Route Configuration (Issue #12)', () => {
-        it('should return 404 when details.enabled is false', async () => {
+        it('should return 404 when details.enabled is false (deprecated, same as omitted)', async () => {
             const noDetailsApp = express();
             noDetailsApp.use(express.json());
             noDetailsApp.use('/payments', createCheckoutRouter(checkout, {
+                buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }),
                 details: { enabled: false },
             }));
 
             const response = await request(noDetailsApp).get('/payments/dummy/PAY-123');
             expect(response.status).toBe(404);
-            expect(response.body.error).toContain('disabled');
             expect(checkout.getPaymentDetails).not.toHaveBeenCalled();
         });
 
@@ -381,6 +375,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             };
 
             detailsApp.use('/payments', createCheckoutRouter(checkout, {
+                buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }),
                 details: { middleware: [authGuard] },
             }));
 
@@ -410,6 +405,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             const refundApp = express();
             refundApp.use(express.json());
             refundApp.use('/payments', createCheckoutRouter(checkout, {
+                buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }),
                 refund: {}
             }));
 
@@ -431,6 +427,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             };
 
             refundApp.use('/payments', createCheckoutRouter(checkout, {
+                buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }),
                 refund: {
                     middleware: [adminGuard]
                 }
@@ -452,6 +449,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             const passGuard = vi.fn((req: Request, res: Response, next: NextFunction) => next());
 
             refundApp.use('/payments', createCheckoutRouter(checkout, {
+                buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }),
                 refund: {
                     middleware: [passGuard]
                 }
@@ -477,6 +475,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             });
 
             execApp.use('/payments', createCheckoutRouter(checkout, {
+                buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }),
                 execute: { onBeforeExecute }
             }));
 
@@ -498,6 +497,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             });
 
             execApp.use('/payments', createCheckoutRouter(checkout, {
+                buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }),
                 execute: { onBeforeExecute }
             }));
 
@@ -519,6 +519,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             };
 
             execApp.use('/payments', createCheckoutRouter(checkout, {
+                buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }),
                 execute: {
                     middleware: [execGuard]
                 }
@@ -573,13 +574,27 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             expect(response.body.code).toBe('WEBHOOK_NOT_SUPPORTED');
         });
 
-        it('should return 500 for unhandled generic Errors', async () => {
+        it('should return a generic 500 for unhandled generic Errors', async () => {
             vi.spyOn(checkout, 'executePayment').mockImplementation(() => {
                 throw new Error('Database crash');
             });
 
             const response = await request(app).post('/payments/dummy/execute').send({ paymentId: '1' });
-            
+
+            expect(response.status).toBe(500);
+            expect(response.body).toEqual({ success: false, error: 'Internal server error' });
+        });
+
+        it('should return the message of unhandled generic Errors with exposeErrorMessages', async () => {
+            vi.spyOn(checkout, 'executePayment').mockImplementation(() => {
+                throw new Error('Database crash');
+            });
+            const exposingApp = express();
+            exposingApp.use(express.json());
+            exposingApp.use('/payments', createCheckoutRouter(checkout, { buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }), exposeErrorMessages: true }));
+
+            const response = await request(exposingApp).post('/payments/dummy/execute').send({ paymentId: '1' });
+
             expect(response.status).toBe(500);
             expect(response.body.error).toBe('Database crash');
         });
@@ -623,6 +638,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             };
 
             secureApp.use('/checkout', createCheckoutRouter(checkout, {
+                buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }),
                 middleware: [authMiddleware],
                 publicPaths: [':provider/webhook', ':provider/redirect'],
                 execute: {
@@ -672,7 +688,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
 
             const nexiApp = express();
             nexiApp.use(express.json());
-            nexiApp.use('/payments', createCheckoutRouter(realCheckout));
+            nexiApp.use('/payments', createCheckoutRouter(realCheckout, { buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }) }));
 
             const res = await request(nexiApp).get('/payments/nexi/redirect?codTrans=ORD-42&esito=OK');
             expect(res.status).toBe(400);
@@ -686,7 +702,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
 
             const nexiApp = express();
             nexiApp.use(express.urlencoded({ extended: false }));
-            nexiApp.use('/payments', createCheckoutRouter(realCheckout));
+            nexiApp.use('/payments', createCheckoutRouter(realCheckout, { buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }) }));
 
             const codTrans = 'ORD-001';
             const esito = 'OK';
@@ -719,7 +735,7 @@ describe('Express Adapter (createCheckoutRouter)', () => {
 
         it('should handle HEAD /payments/:provider/webhook without errors', async () => {
             const headApp = express();
-            headApp.use('/payments', createCheckoutRouter(checkout));
+            headApp.use('/payments', createCheckoutRouter(checkout, { buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }) }));
 
             const res = await request(headApp)
                 .head('/payments/dummy/webhook?payment_id=dummy-123');
@@ -731,14 +747,328 @@ describe('Express Adapter (createCheckoutRouter)', () => {
             vi.spyOn(checkout, 'getPaymentDetails').mockImplementation(() => {
                 throw new SyntaxError('Unexpected token < in JSON at position 0: <html><body>Error body</body></html>');
             });
+            const exposingApp = express();
+            exposingApp.use('/payments', createCheckoutRouter(checkout, {
+                buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }),
+                details: {},
+                exposeErrorMessages: true,
+            }));
 
-            const res = await request(app).get('/payments/dummy/err-id');
+            const res = await request(exposingApp).get('/payments/dummy/err-id');
 
             expect(res.status).toBe(500);
             expect(res.body.success).toBe(false);
             expect(res.body.error).toBe('Invalid provider response');
             expect(res.body.error).not.toContain('<html>');
             expect(res.body.error).not.toContain('Error body');
+        });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #29 — secure defaults (2.0.0)
+// ---------------------------------------------------------------------------
+
+class DummyProvider extends BasePaymentProvider {
+    name = 'dummy';
+    flow = 'redirect' as const;
+
+    async createPayment(req: PaymentRequest): Promise<PaymentResult> {
+        return { success: true, paymentId: 'dummy-123', status: 'CREATED', raw: req };
+    }
+    async executePayment(id: string, data?: any): Promise<PaymentResult> {
+        return { success: true, verified: true, paymentId: id, status: 'COMPLETED', raw: data };
+    }
+    async getPaymentDetails(id: string): Promise<PaymentResult> {
+        return { success: true, paymentId: id, status: 'DETAILS', raw: {} };
+    }
+    async refundPayment(id: string, amount?: number): Promise<PaymentResult> {
+        return { success: true, paymentId: id, status: 'REFUNDED', raw: { amount } };
+    }
+    async handleWebhook(body?: any, _headers: Record<string, string> = {}, query?: Record<string, string>): Promise<WebhookResult> {
+        return { success: true, verified: true, paymentId: 'dummy-123', status: 'WEBHOOK', raw: body ?? query };
+    }
+    async handleRedirect(query: Record<string, any>): Promise<PaymentResult> {
+        return { success: true, verified: true, paymentId: query.id, status: 'REDIRECT', raw: query };
+    }
+}
+
+describe('Secure defaults (Issue #29)', () => {
+    let c: CheckoutConfigurator;
+    let dummy: DummyProvider;
+    let warnSpy: ReturnType<typeof vi.spyOn>;
+    let errorSpy: ReturnType<typeof vi.spyOn>;
+
+    const buildPaymentRequest = (): PaymentRequest => ({
+        amount: 19.99,
+        currency: 'EUR',
+        orderId: 'ord-1',
+        returnUrl: 'https://shop.test/return',
+        cancelUrl: 'https://shop.test/cancel',
+    });
+
+    const deny403 = (_req: Request, res: Response) => {
+        res.status(403).json({ error: 'Forbidden' });
+    };
+    const pass = (_req: Request, _res: Response, next: NextFunction) => next();
+
+    function mount(options: Parameters<typeof createCheckoutRouter>[1]): Express {
+        const app = express();
+        app.use(express.json());
+        app.use('/checkout', createCheckoutRouter(c, options));
+        return app;
+    }
+
+    beforeEach(() => {
+        c = new CheckoutConfigurator({ emitEvents: false });
+        dummy = new DummyProvider();
+        c.registerProvider(dummy);
+        warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    describe('1-2. buildPaymentRequest is mandatory', () => {
+        it('createCheckoutRouter(c) throws CheckoutError INSECURE_CONFIGURATION', () => {
+            let thrown: unknown;
+            try {
+                createCheckoutRouter(c);
+            } catch (err) {
+                thrown = err;
+            }
+            expect(thrown).toBeInstanceOf(CheckoutError);
+            expect((thrown as CheckoutError).code).toBe('INSECURE_CONFIGURATION');
+            expect((thrown as CheckoutError).message).toContain('buildPaymentRequest');
+            expect((thrown as CheckoutError).message).toContain('allowClientPaymentRequest: true');
+        });
+
+        it('throws for options without a builder, and for a non-true allowClientPaymentRequest', () => {
+            expect(() => createCheckoutRouter(c, {})).toThrow(CheckoutError);
+            expect(() => createCheckoutRouter(c, { details: {}, refund: {} })).toThrow(CheckoutError);
+            expect(() => createCheckoutRouter(c, { allowClientPaymentRequest: 'yes' as any })).toThrow(CheckoutError);
+        });
+
+        it('allowClientPaymentRequest: true does not throw and warns exactly once', () => {
+            expect(() => createCheckoutRouter(c, { allowClientPaymentRequest: true })).not.toThrow();
+            expect(warnSpy).toHaveBeenCalledTimes(1);
+            expect(warnSpy.mock.calls[0][0]).toContain('allowClientPaymentRequest');
+        });
+
+        it('allowClientPaymentRequest: true keeps the client-body path and its validation', async () => {
+            const createSpy = vi.spyOn(dummy, 'createPayment');
+            const app = mount({ allowClientPaymentRequest: true });
+
+            const ok = await request(app).post('/checkout/dummy').send({ amount: 10, currency: 'EUR', returnUrl: 'r', cancelUrl: 'c' });
+            expect(ok.status).toBe(201);
+            expect(createSpy).toHaveBeenCalledWith(expect.objectContaining({ amount: 10, currency: 'EUR' }));
+
+            const bad = await request(app).post('/checkout/dummy').send({ amount: -1, currency: 'EUR' });
+            expect(bad.status).toBe(400);
+            expect(createSpy).toHaveBeenCalledTimes(1);
+        });
+
+        it('with buildPaymentRequest set, console.warn is never called at mount', () => {
+            createCheckoutRouter(c, { buildPaymentRequest });
+            createCheckoutRouter(c, { buildPaymentRequest, allowClientPaymentRequest: true });
+            createCheckoutRouter(c, { buildPaymentRequest, details: { middleware: [pass] }, refund: {} });
+            expect(warnSpy).not.toHaveBeenCalled();
+        });
+
+        it('with buildPaymentRequest set, the client body never reaches the provider', async () => {
+            const createSpy = vi.spyOn(dummy, 'createPayment');
+            const app = mount({ buildPaymentRequest });
+            const res = await request(app)
+                .post('/checkout/dummy')
+                .send({ amount: 0.01, currency: 'EUR', orderId: 'ord-19-99' });
+            expect(res.status).toBe(201);
+            expect(createSpy).toHaveBeenCalledWith(buildPaymentRequest());
+        });
+    });
+
+    describe('3-4. details route is opt-in', () => {
+        it('without details, GET /checkout/dummy/any-id answers 404 and getPaymentDetails is not called', async () => {
+            const detailsSpy = vi.spyOn(dummy, 'getPaymentDetails');
+            const res = await request(mount({ buildPaymentRequest })).get('/checkout/dummy/any-id');
+            expect(res.status).toBe(404);
+            expect(res.body.paymentId).toBeUndefined();
+            expect(detailsSpy).not.toHaveBeenCalled();
+        });
+
+        it('with details: { middleware: [deny403] } it answers 403', async () => {
+            const detailsSpy = vi.spyOn(dummy, 'getPaymentDetails');
+            const res = await request(mount({ buildPaymentRequest, details: { middleware: [deny403] } })).get('/checkout/dummy/any-id');
+            expect(res.status).toBe(403);
+            expect(detailsSpy).not.toHaveBeenCalled();
+        });
+
+        it('with a passing middleware it answers 200 as before', async () => {
+            const detailsSpy = vi.spyOn(dummy, 'getPaymentDetails');
+            const res = await request(mount({ buildPaymentRequest, details: { middleware: [pass] } })).get('/checkout/dummy/any-id');
+            expect(res.status).toBe(200);
+            expect(res.body).toEqual({ success: true, paymentId: 'any-id', status: 'DETAILS' });
+            expect(detailsSpy).toHaveBeenCalledWith('any-id');
+            expect(warnSpy).not.toHaveBeenCalled();
+        });
+
+        it.each([
+            ['details omitted', {}],
+            ['details mounted', { details: { middleware: [pass] } }],
+            ['details mounted without middleware', { details: {} }],
+        ])('GET /checkout/dummy/redirect?id=x reaches handleRedirect, not details (%s)', async (_label, extra) => {
+            const redirectSpy = vi.spyOn(dummy, 'handleRedirect');
+            const detailsSpy = vi.spyOn(dummy, 'getPaymentDetails');
+            const res = await request(mount({ buildPaymentRequest, ...extra })).get('/checkout/dummy/redirect?id=x');
+            expect(res.status).toBe(200);
+            expect(res.body).toMatchObject({ success: true, paymentId: 'x', status: 'REDIRECT' });
+            expect(redirectSpy).toHaveBeenCalledWith({ id: 'x' });
+            expect(detailsSpy).not.toHaveBeenCalled();
+        });
+
+        it('details: {} without middleware mounts the route and warns once', async () => {
+            const app = mount({ buildPaymentRequest, details: {} });
+            expect(warnSpy).toHaveBeenCalledTimes(1);
+            expect(warnSpy.mock.calls[0][0]).toBe(
+                '[awesome-node-checkout] details route mounted without middleware: payment status and amount are readable by anyone who knows a payment id',
+            );
+            const res = await request(app).get('/checkout/dummy/any-id');
+            expect(res.status).toBe(200);
+            expect(res.body.paymentId).toBe('any-id');
+        });
+
+        it('details: { enabled: false } compiles and the route answers 404', async () => {
+            const detailsSpy = vi.spyOn(dummy, 'getPaymentDetails');
+            const app = mount({ buildPaymentRequest, details: { enabled: false } });
+            const res = await request(app).get('/checkout/dummy/any-id');
+            expect(res.status).toBe(404);
+            expect(detailsSpy).not.toHaveBeenCalled();
+            expect(warnSpy).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('9. INVALID_AMOUNT through the router', () => {
+        it('buildPaymentRequest returning amount 19.999 answers 400 INVALID_AMOUNT and the provider is not called', async () => {
+            const createSpy = vi.spyOn(dummy, 'createPayment');
+            const app = mount({ buildPaymentRequest: () => ({ ...buildPaymentRequest(), amount: 19.999 }) });
+            const res = await request(app).post('/checkout/dummy').send({});
+            expect(res.status).toBe(400);
+            expect(res.body).toMatchObject({ success: false, code: 'INVALID_AMOUNT' });
+            expect(res.body.error).toContain('amount');
+            expect(createSpy).not.toHaveBeenCalled();
+        });
+
+        it('buildPaymentRequest returning a JPY amount with decimals answers 400 INVALID_AMOUNT', async () => {
+            const createSpy = vi.spyOn(dummy, 'createPayment');
+            const app = mount({ buildPaymentRequest: () => ({ ...buildPaymentRequest(), amount: 10.5, currency: 'JPY' }) });
+            const res = await request(app).post('/checkout/dummy').send({});
+            expect(res.status).toBe(400);
+            expect(res.body.code).toBe('INVALID_AMOUNT');
+            expect(createSpy).not.toHaveBeenCalled();
+        });
+
+        it('the client-body path (allowClientPaymentRequest) answers 400 INVALID_AMOUNT for excess decimals', async () => {
+            const createSpy = vi.spyOn(dummy, 'createPayment');
+            const app = mount({ allowClientPaymentRequest: true });
+            const res = await request(app).post('/checkout/dummy').send({ amount: 19.999, currency: 'EUR' });
+            expect(res.status).toBe(400);
+            expect(res.body).toMatchObject({ success: false, code: 'INVALID_AMOUNT' });
+            expect(createSpy).not.toHaveBeenCalled();
+        });
+
+        it('a valid 19.99 EUR passes through unchanged', async () => {
+            const createSpy = vi.spyOn(dummy, 'createPayment');
+            const res = await request(mount({ buildPaymentRequest })).post('/checkout/dummy').send({});
+            expect(res.status).toBe(201);
+            expect(createSpy).toHaveBeenCalledWith(expect.objectContaining({ amount: 19.99 }));
+        });
+    });
+
+    describe('10. generic 500 bodies, exposeErrorMessages and onError', () => {
+        it('a buildPaymentRequest throwing Error("secret detail") gives a generic body and calls onError once', async () => {
+            const secret = new Error('secret detail');
+            const onError = vi.fn();
+            const app = mount({ buildPaymentRequest: () => { throw secret; }, onError });
+            const res = await request(app).post('/checkout/dummy').send({});
+            expect(res.status).toBe(500);
+            expect(res.body).toEqual({ success: false, error: 'Internal server error' });
+            expect(JSON.stringify(res.body)).not.toContain('secret detail');
+            expect(onError).toHaveBeenCalledTimes(1);
+            expect(onError.mock.calls[0][0]).toBe(secret);
+            expect(onError.mock.calls[0][1]).toHaveProperty('method', 'POST');
+            expect(errorSpy).not.toHaveBeenCalled();
+        });
+
+        it('without onError the error is logged with console.error', async () => {
+            const secret = new Error('secret detail');
+            const res = await request(mount({ buildPaymentRequest: () => { throw secret; } })).post('/checkout/dummy').send({});
+            expect(res.status).toBe(500);
+            expect(res.body.error).toBe('Internal server error');
+            expect(errorSpy).toHaveBeenCalledTimes(1);
+            expect(errorSpy).toHaveBeenCalledWith('[awesome-node-checkout]', secret);
+        });
+
+        it('with exposeErrorMessages: true the message is returned', async () => {
+            const onError = vi.fn();
+            const app = mount({ buildPaymentRequest: () => { throw new Error('secret detail'); }, exposeErrorMessages: true, onError });
+            const res = await request(app).post('/checkout/dummy').send({});
+            expect(res.status).toBe(500);
+            expect(res.body).toEqual({ success: false, error: 'secret detail' });
+            expect(onError).toHaveBeenCalledTimes(1);
+        });
+
+        it('a CheckoutError from the hook keeps its 4xx status, message and code', async () => {
+            const onError = vi.fn();
+            const app = mount({
+                buildPaymentRequest: () => { throw new CheckoutError('Order not found', 'TRANSACTION_NOT_FOUND'); },
+                onError,
+            });
+            const res = await request(app).post('/checkout/dummy').send({});
+            expect(res.status).toBe(400);
+            expect(res.body).toEqual({ success: false, error: 'Order not found', code: 'TRANSACTION_NOT_FOUND' });
+            expect(onError).not.toHaveBeenCalled();
+        });
+
+        it('onBeforeExecute and redirect hooks throwing generic errors are masked too', async () => {
+            const onError = vi.fn();
+            const app = mount({
+                buildPaymentRequest,
+                onError,
+                execute: { onBeforeExecute: () => { throw new Error('Mongo timeout at db-3.internal:27017'); } },
+                redirect: {
+                    onSuccess: () => { throw new Error('redirect secret'); },
+                    onFailure: () => '/fail',
+                },
+            });
+            const exec = await request(app).post('/checkout/dummy/execute').send({ paymentId: 'p1' });
+            expect(exec.status).toBe(500);
+            expect(exec.body).toEqual({ success: false, error: 'Internal server error' });
+
+            const redir = await request(app).get('/checkout/dummy/redirect?id=x');
+            expect(redir.status).toBe(500);
+            expect(redir.body).toEqual({ success: false, error: 'Internal server error' });
+            expect(onError).toHaveBeenCalledTimes(2);
+        });
+
+        it('a throwing onError does not prevent the generic response', async () => {
+            const app = mount({
+                buildPaymentRequest: () => { throw new Error('secret detail'); },
+                onError: () => { throw new Error('logger down'); },
+            });
+            const res = await request(app).post('/checkout/dummy').send({});
+            expect(res.status).toBe(500);
+            expect(res.body).toEqual({ success: false, error: 'Internal server error' });
+        });
+    });
+
+    describe('11. POST /:provider/execute stays mounted by default', () => {
+        it('captures through the provider with only buildPaymentRequest set', async () => {
+            const execSpy = vi.spyOn(dummy, 'executePayment');
+            const res = await request(mount({ buildPaymentRequest })).post('/checkout/dummy/execute').send({ paymentId: 'p1', data: { a: 1 } });
+            expect(res.status).toBe(200);
+            expect(res.body).toMatchObject({ success: true, verified: true, paymentId: 'p1', status: 'COMPLETED' });
+            expect(execSpy).toHaveBeenCalledWith('p1', { a: 1 });
         });
     });
 });

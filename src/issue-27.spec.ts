@@ -62,6 +62,9 @@ function buildApp(checkout: CheckoutConfigurator): Express {
         returnUrl: 'https://r',
         cancelUrl: 'https://c',
       }),
+      // The frozen-listener-error tests assert the 500 message
+      exposeErrorMessages: true,
+      onError: () => {},
     }),
   );
   return app;

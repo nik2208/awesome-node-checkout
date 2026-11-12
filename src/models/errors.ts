@@ -4,7 +4,9 @@ export type CheckoutErrorCode =
   | 'PAYMENT_FAILED'
   | 'WEBHOOK_NOT_SUPPORTED'
   | 'REDIRECT_NOT_SUPPORTED'
-  | 'TRANSACTION_NOT_FOUND';
+  | 'TRANSACTION_NOT_FOUND'
+  | 'INSECURE_CONFIGURATION'
+  | 'INVALID_AMOUNT';
 
 export class CheckoutError extends Error {
   constructor(

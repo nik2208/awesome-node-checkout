@@ -64,7 +64,7 @@ describe('NexiProvider', () => {
     const result = await provider.createPayment(req);
 
     expect(result.success).toBe(true);
-    expect(result.paymentId).toMatch(/^ORD-\d+$/);
+    expect(result.paymentId).toMatch(/^ORD-[0-9a-f]{24}$/);
   });
 
   it('should include gruppo when group is configured', async () => {

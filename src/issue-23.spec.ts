@@ -315,6 +315,8 @@ describe('Issue #23 Acceptance Criteria Verification', () => {
           buildPaymentRequest: async () => {
             throw new Error('Consumer JSON validation error: field X is invalid');
           },
+          exposeErrorMessages: true,
+          onError: () => {},
         }),
       );
 
@@ -329,7 +331,15 @@ describe('Issue #23 Acceptance Criteria Verification', () => {
       const configurator = new CheckoutConfigurator();
       const app = express();
       app.use(express.json());
-      app.use('/payments', createCheckoutRouter(configurator));
+      app.use(
+        '/payments',
+        createCheckoutRouter(configurator, {
+          buildPaymentRequest: () => ({ amount: 10, currency: 'EUR', returnUrl: 'https://r', cancelUrl: 'https://c' }),
+          details: {},
+          exposeErrorMessages: true,
+          onError: () => {},
+        }),
+      );
 
       vi.spyOn(configurator, 'getPaymentDetails').mockImplementation(() => {
         throw new SyntaxError('Unexpected token < in JSON at position 0: <html><body>Upstream error</body></html>');

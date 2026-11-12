@@ -4,6 +4,7 @@ import { CheckoutError } from '../../models/errors';
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult } from '../../models/payment-result.model';
 import { CheckoutListenerError } from '../../events/checkout-event-bus';
+import { isInvalidAmountError, toMinorUnits } from '../../utils/money';
 
 export interface PaymentRequestContext {
   provider: string;
@@ -28,11 +29,22 @@ export interface ExpressCheckoutOptions {
    * Builds the PaymentRequest on the server (amount from your own order), ignoring the client body.
    * If the hook sends an HTTP response directly (e.g. via `ctx.res.status(403)...`),
    * returning `null` or `undefined` halts further adapter processing without error.
+   *
+   * Required: `createCheckoutRouter` throws `CheckoutError('INSECURE_CONFIGURATION')` at mount
+   * when it is missing, unless `allowClientPaymentRequest: true` is set.
    */
   buildPaymentRequest?: (
     req: Request,
     ctx: PaymentRequestContext,
   ) => PaymentRequest | null | undefined | Promise<PaymentRequest | null | undefined>;
+
+  /**
+   * **Insecure.** Without `buildPaymentRequest`, sends the client request body to the provider
+   * as the PaymentRequest: the browser chooses the amount, the currency and the order id.
+   * Never use this for a shop or for anything with a price; it exists for donations-style
+   * flows and tests. Ignored when `buildPaymentRequest` is set.
+   */
+  allowClientPaymentRequest?: true;
 
   /**
    * When configured, GET /:provider/redirect responds with a 302 redirect
@@ -45,9 +57,15 @@ export interface ExpressCheckoutOptions {
 
   /**
    * Configuration for GET /:provider/:id (getPaymentDetails).
-   * Default: enabled: true. Set enabled: false to return 404.
+   * If omitted, the details route is NOT mounted (returns 404), like `refund`.
+   * The route returns status, amount and currency for any payment id it is given:
+   * protect it with `middleware` (a console warning is printed at mount when it has none).
    */
   details?: {
+    /**
+     * @deprecated Since 2.0.0 the route is mounted only when `details` is set.
+     * `enabled: false` behaves as if `details` were omitted; any other value is ignored.
+     */
     enabled?: boolean;
     middleware?: RequestHandler[];
   };
@@ -67,6 +85,22 @@ export interface ExpressCheckoutOptions {
     middleware?: RequestHandler[];
     onBeforeExecute?: (req: Request, paymentId: string) => void | Promise<void>;
   };
+
+  /**
+   * When `true`, 500 responses carry the error message (masked to 'Invalid provider response'
+   * for provider parse errors). Default `false`: 500 bodies are always
+   * `{ success: false, error: 'Internal server error' }`. `CheckoutError` 4xx responses keep
+   * their message and code either way.
+   */
+  exposeErrorMessages?: boolean;
+
+  /**
+   * Called with the original error (and the request) for every error answered with a 500,
+   * whatever `exposeErrorMessages` says. Not called for 4xx `CheckoutError` responses, which are
+   * client-triggerable (e.g. an unknown provider name). When omitted, the error is logged with
+   * `console.error('[awesome-node-checkout]', err)`.
+   */
+  onError?: (err: unknown, req: Request) => void;
 }
 
 /**
@@ -103,8 +137,11 @@ export function isPathPublic(reqPath: string, publicPaths: (string | string[])[]
  * GET    /:provider/webhook      → handleWebhook
  * POST   /:provider/webhook      → handleWebhook
  * GET    /:provider/redirect     → handleRedirect  (must come before /:provider/:id)
- * GET    /:provider/:id          → getPaymentDetails
+ * GET    /:provider/:id          → getPaymentDetails (only if options.details is configured)
  * ```
+ *
+ * Throws `CheckoutError('INSECURE_CONFIGURATION')` when neither `buildPaymentRequest` nor
+ * `allowClientPaymentRequest: true` is set.
  *
  * Usage:
  * ```typescript
@@ -127,13 +164,19 @@ export function createCheckoutRouter(
   checkout: CheckoutConfigurator,
   options: ExpressCheckoutOptions = {},
 ): Router {
-  const router = Router();
-
-  if (!options.buildPaymentRequest) {
-    console.warn(
-      '[awesome-node-checkout] createCheckoutRouter: the client body decides the amount; set buildPaymentRequest',
+  if (!options.buildPaymentRequest && options.allowClientPaymentRequest !== true) {
+    throw new CheckoutError(
+      'createCheckoutRouter: set buildPaymentRequest (server-side amount) or allowClientPaymentRequest: true',
+      'INSECURE_CONFIGURATION',
     );
   }
+  if (!options.buildPaymentRequest) {
+    console.warn('[awesome-node-checkout] allowClientPaymentRequest: the client body decides the amount');
+  }
+
+  const router = Router();
+  const sendError = (req: Request, res: Response, err: unknown, isProvider = true): void =>
+    sendErrorResponse(req, res, options, err, isProvider);
 
   // Apply shared middleware (skipping public paths by segment match)
   if (options.middleware?.length) {
@@ -163,7 +206,7 @@ export function createCheckoutRouter(
             res,
           });
         } catch (consumerErr) {
-          sendError(res, consumerErr, false);
+          sendError(req, res, consumerErr, false);
           return;
         }
 
@@ -210,11 +253,19 @@ export function createCheckoutRouter(
         }
         paymentRequest = body;
       }
+      // Exact minor units: an amount with more decimals than the currency allows is rejected,
+      // never rounded
+      try {
+        toMinorUnits(paymentRequest.amount, paymentRequest.currency);
+      } catch (amountErr) {
+        if (!isInvalidAmountError(amountErr)) throw amountErr;
+        return res.status(400).json({ success: false, code: 'INVALID_AMOUNT', error: amountErr.message });
+      }
       const result = await checkout.createPayment(provider, paymentRequest);
       const { raw, ...safeResult } = result;
       res.status(result.success ? 201 : 400).json(safeResult);
     } catch (err) {
-      sendError(res, err, true);
+      sendError(req, res, err, true);
     }
   });
 
@@ -230,7 +281,7 @@ export function createCheckoutRouter(
         try {
           await options.execute.onBeforeExecute(req, paymentId);
         } catch (consumerErr) {
-          sendError(res, consumerErr, false);
+          sendError(req, res, consumerErr, false);
           return;
         }
       }
@@ -238,7 +289,7 @@ export function createCheckoutRouter(
       const { raw, ...safeResult } = result;
       res.status(result.success ? 200 : 400).json(safeResult);
     } catch (err) {
-      sendError(res, err, true);
+      sendError(req, res, err, true);
     }
   });
 
@@ -255,7 +306,7 @@ export function createCheckoutRouter(
         const { raw, ...safeResult } = result;
         res.status(result.success ? 200 : 400).json(safeResult);
       } catch (err) {
-        sendError(res, err, true);
+        sendError(req, res, err, true);
       }
     });
   }
@@ -278,7 +329,7 @@ export function createCheckoutRouter(
       const { raw, ...safeResult } = result;
       res.status(result.success ? 200 : 400).json(safeResult);
     } catch (err) {
-      sendError(res, err, true);
+      sendError(req, res, err, true);
     }
   };
 
@@ -297,7 +348,7 @@ export function createCheckoutRouter(
         req.query as Record<string, string>,
       );
     } catch (err) {
-      sendError(res, err, true);
+      sendError(req, res, err, true);
       return;
     }
     if (options.redirect) {
@@ -307,7 +358,7 @@ export function createCheckoutRouter(
           ? options.redirect.onSuccess(result, req)
           : options.redirect.onFailure(result, req);
       } catch (consumerErr) {
-        sendError(res, consumerErr, false);
+        sendError(req, res, consumerErr, false);
         return;
       }
       return res.redirect(302, targetUrl);
@@ -316,23 +367,27 @@ export function createCheckoutRouter(
     res.status(result.success ? 200 : 400).json(safeResult);
   });
 
-  // ---- GET /:provider/:id — get payment details ----------------------------
-  const detailsHandlers: RequestHandler[] = [];
-  if (options.details?.middleware?.length) {
-    detailsHandlers.push(...options.details.middleware);
+  // ---- GET /:provider/:id — get payment details (opt-in) -------------------
+  // Registered after /:provider/redirect and /:provider/webhook so that those win.
+  if (options.details && options.details.enabled !== false) {
+    const detailsHandlers: RequestHandler[] = [];
+    if (options.details.middleware?.length) {
+      detailsHandlers.push(...options.details.middleware);
+    } else {
+      console.warn(
+        '[awesome-node-checkout] details route mounted without middleware: payment status and amount are readable by anyone who knows a payment id',
+      );
+    }
+    router.get('/:provider/:id', ...detailsHandlers, async (req: Request, res: Response) => {
+      try {
+        const result = await checkout.getPaymentDetails(String(req.params.provider), String(req.params.id));
+        const { raw, ...safeResult } = result;
+        res.status(result.success ? 200 : 404).json(safeResult);
+      } catch (err) {
+        sendError(req, res, err, true);
+      }
+    });
   }
-  router.get('/:provider/:id', ...detailsHandlers, async (req: Request, res: Response) => {
-    if (options.details?.enabled === false) {
-      return res.status(404).json({ success: false, error: 'Payment details route is disabled' });
-    }
-    try {
-      const result = await checkout.getPaymentDetails(String(req.params.provider), String(req.params.id));
-      const { raw, ...safeResult } = result;
-      res.status(result.success ? 200 : 404).json(safeResult);
-    } catch (err) {
-      sendError(res, err, true);
-    }
-  });
 
   return router;
 }
@@ -341,14 +396,21 @@ export function createCheckoutRouter(
 // Helpers
 // ---------------------------------------------------------------------------
 
-function sendError(res: Response, err: unknown, isProvider = true): void {
-  if (res.headersSent) return;
+function sendErrorResponse(
+  req: Request,
+  res: Response,
+  options: ExpressCheckoutOptions,
+  originalErr: unknown,
+  isProvider = true,
+): void {
+  let err = originalErr;
   const isListenerError = err instanceof CheckoutListenerError;
   if (err instanceof CheckoutListenerError && err.cause instanceof CheckoutError) {
     // A listener that throws a CheckoutError keeps its status mapping
     err = err.cause;
   }
   if (err instanceof CheckoutError) {
+    if (res.headersSent) return;
     const statusMap: Record<string, number> = {
       PROVIDER_NOT_FOUND: 404,
       WEBHOOK_NOT_SUPPORTED: 422,
@@ -356,11 +418,26 @@ function sendError(res: Response, err: unknown, isProvider = true): void {
     };
     const status = statusMap[err.code] ?? 400;
     res.status(status).json({ success: false, error: err.message, code: err.code });
-  } else {
-    let message = err instanceof Error ? err.message : String(err ?? 'Internal server error');
+    return;
+  }
+
+  // Unexpected error (500): report it to the app, never to the client unless asked to
+  try {
+    if (options.onError) {
+      options.onError(originalErr, req);
+    } else {
+      console.error('[awesome-node-checkout]', originalErr);
+    }
+  } catch {
+    // A throwing onError must not prevent the response
+  }
+  if (res.headersSent) return;
+  let message = 'Internal server error';
+  if (options.exposeErrorMessages === true) {
+    message = err instanceof Error ? err.message : String(err ?? 'Internal server error');
     if (!isListenerError && isProvider && (err instanceof SyntaxError || /JSON|Unexpected token/i.test(message))) {
       message = 'Invalid provider response';
     }
-    res.status(500).json({ success: false, error: message });
   }
+  res.status(500).json({ success: false, error: message });
 }

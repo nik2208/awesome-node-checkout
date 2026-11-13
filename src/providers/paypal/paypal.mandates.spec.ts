@@ -478,6 +478,70 @@ describe('PayPalProvider mandates (Vault)', () => {
       const other = await provider.confirmMandate(pending, {});
       expect(other.firstCharge.status).toBe('unknown');
       expect(other.firstCharge.error).toBe('Captured amount does not match');
+      // Since 2.2.0 (#43): the stable code, and what was captured, so that the order can be refunded
+      expect(other.firstCharge).toEqual({
+        status: 'unknown',
+        verified: true,
+        chargeRef: 'SUB-0001-INIT',
+        errorCode: 'AMOUNT_MISMATCH',
+        error: 'Captured amount does not match',
+        providerPaymentId: 'PAYPAL-ORD-1',
+        amount: 9.9,
+        currency: 'EUR',
+      });
+      // Still a terminal success with the vaulted mandate, as in 2.1.0
+      expect(other.success).toBe(true);
+      expect(other.terminal).toBe(true);
+      expect(other.mandate?.providerMandateId).toBe('vt_1');
+    });
+
+    it('a captured amount mismatch keeps its fields through the configurator, and charge.unknown has data.errorCode (#43)', async () => {
+      sdk.getOrder.mockResolvedValueOnce({ result: completedOrder('VAULTED', 'COMPLETED', '9.90') });
+      const checkout = new CheckoutConfigurator();
+      checkout.registerProvider(provider);
+      const events: Array<{ event: string; payload: any }> = [];
+      for (const event of ['mandate.created', 'mandate.setup_failed', 'charge.succeeded', 'charge.unknown'] as const) {
+        checkout.events.on(event, (payload: unknown) => {
+          events.push({ event, payload });
+        });
+      }
+      const out = await checkout.confirmMandate('paypal', pending, {});
+      expect(out.success).toBe(true);
+      expect(out.terminal).toBe(true);
+      expect(out.mandate?.providerMandateId).toBe('vt_1');
+      expect(out.firstCharge).toMatchObject({
+        status: 'unknown',
+        verified: true,
+        chargeRef: 'SUB-0001-INIT',
+        errorCode: 'AMOUNT_MISMATCH',
+        error: 'Captured amount does not match',
+        providerPaymentId: 'PAYPAL-ORD-1',
+        amount: 9.9,
+        currency: 'EUR',
+      });
+      expect(events.map((e) => e.event)).toEqual(['mandate.created', 'charge.unknown']);
+      const unknown = events[1].payload;
+      expect(unknown.data.errorCode).toBe('AMOUNT_MISMATCH');
+      expect(unknown.data).toMatchObject({ amount: 9.9, currency: 'EUR' });
+      // The order id is the refundable id of the captured money: it is no longer scrubbed from the events
+      expect(unknown.paymentId).toBe('PAYPAL-ORD-1');
+      expect(JSON.stringify(events)).not.toContain('vt_1');
+    });
+
+    it('a COMPLETED capture without an amount is AMOUNT_MISMATCH, never a throw (#43)', async () => {
+      const order: any = completedOrder('VAULTED', 'COMPLETED');
+      delete order.purchaseUnits[0].payments.captures[0].amount;
+      sdk.getOrder.mockResolvedValueOnce({ result: order });
+      const out = await provider.confirmMandate(pending, {});
+      expect(out.success).toBe(true);
+      expect(out.firstCharge).toEqual({
+        status: 'unknown',
+        verified: true,
+        chargeRef: 'SUB-0001-INIT',
+        errorCode: 'AMOUNT_MISMATCH',
+        error: 'Captured amount does not match',
+        providerPaymentId: 'PAYPAL-ORD-1',
+      });
     });
 
     it('MANDATE_NOT_VAULTED never emits the vault token id (outcome and mandate.setup_failed)', async () => {
@@ -738,6 +802,63 @@ describe('PayPalProvider mandates (Vault)', () => {
     });
     expect(refund.success).toBe(true);
     expect(refund.paymentId).toBe('REFUND-1');
+  });
+
+  describe('refund idempotency key (#44)', () => {
+    it('declares supportsRefundIdempotency', () => {
+      expect(provider.supportsRefundIdempotency).toBe(true);
+    });
+
+    it("sends the key as paypalRequestId: { captureId: 'CAP-2', paypalRequestId, body }", async () => {
+      sdk.getOrder.mockResolvedValueOnce({ result: chargeOrder('COMPLETED', 'COMPLETED') });
+      sdk.refundCapturedPayment.mockResolvedValueOnce({ result: { id: 'REFUND-1', status: 'COMPLETED' } });
+
+      const refund = await provider.refundPayment('PAYPAL-ORD-2', 19.9, { idempotencyKey: 'refund-SUB-0001-R1' });
+
+      expect(sdk.refundCapturedPayment).toHaveBeenCalledTimes(1);
+      expect(sdk.refundCapturedPayment).toHaveBeenCalledWith({
+        captureId: 'CAP-2',
+        paypalRequestId: 'refund-SUB-0001-R1',
+        body: { amount: { value: '19.90', currencyCode: 'EUR' } },
+      });
+      expect(refund).toMatchObject({ success: true, verified: true, paymentId: 'REFUND-1', status: 'COMPLETED' });
+    });
+
+    it('through the configurator, the key reaches PayPal unchanged', async () => {
+      sdk.getOrder.mockResolvedValueOnce({ result: chargeOrder('COMPLETED', 'COMPLETED') });
+      sdk.refundCapturedPayment.mockResolvedValueOnce({ result: { id: 'REFUND-1', status: 'COMPLETED' } });
+      const checkout = new CheckoutConfigurator();
+      checkout.registerProvider(provider);
+
+      const refund = await checkout.refundPayment('paypal', 'PAYPAL-ORD-2', 19.9, { idempotencyKey: 'refund-SUB-0001-R1' });
+
+      expect(sdk.refundCapturedPayment).toHaveBeenCalledWith({
+        captureId: 'CAP-2',
+        paypalRequestId: 'refund-SUB-0001-R1',
+        body: { amount: { value: '19.90', currencyCode: 'EUR' } },
+      });
+      expect(refund.success).toBe(true);
+    });
+
+    it('without options, or with options but no key, the call has no paypalRequestId key at all', async () => {
+      for (const args of [[], [{}]] as const) {
+        sdk.getOrder.mockResolvedValueOnce({ result: chargeOrder('COMPLETED', 'COMPLETED') });
+        sdk.refundCapturedPayment.mockResolvedValueOnce({ result: { id: 'REFUND-1', status: 'COMPLETED' } });
+        await provider.refundPayment('PAYPAL-ORD-2', 19.9, ...args);
+        const arg = sdk.refundCapturedPayment.mock.calls.at(-1)?.[0];
+        expect(Object.keys(arg).sort()).toEqual(['body', 'captureId']);
+      }
+    });
+
+    it('called directly with a key that does not match REFUND_IDEMPOTENCY_KEY_PATTERN, refuses without any request', async () => {
+      for (const idempotencyKey of ['', 'short', 'has space 1', 'x'.repeat(65), 123 as unknown as string]) {
+        const refund = await provider.refundPayment('PAYPAL-ORD-2', 19.9, { idempotencyKey });
+        expect(refund).toMatchObject({ success: false, status: 'REFUND_FAILED' });
+        expect(refund.verified).not.toBe(true);
+      }
+      expect(sdk.getOrder).not.toHaveBeenCalled();
+      expect(sdk.refundCapturedPayment).not.toHaveBeenCalled();
+    });
   });
 
   it('package.json declares @paypal/paypal-server-sdk ^2.5.0 (criterion 7)', () => {

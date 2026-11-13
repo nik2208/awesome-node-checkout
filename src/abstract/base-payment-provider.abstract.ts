@@ -1,6 +1,7 @@
 import { IPaymentProvider, PaymentFlow } from '../interfaces/payment-provider.interface';
 import { PaymentRequest } from '../models/payment-request.model';
 import { PaymentResult } from '../models/payment-result.model';
+import { RefundOptions } from '../models/refund.model';
 
 /**
  * Convenience base class for building custom payment providers.
@@ -22,7 +23,8 @@ export abstract class BasePaymentProvider implements IPaymentProvider {
   abstract createPayment(request: PaymentRequest): Promise<PaymentResult>;
   abstract executePayment(paymentId: string, data?: Record<string, string>): Promise<PaymentResult>;
   abstract getPaymentDetails(paymentId: string): Promise<PaymentResult>;
-  abstract refundPayment(paymentId: string, amount?: number): Promise<PaymentResult>;
+  /** `options` since 2.2.0: a subclass written for 2.1 may keep `refundPayment(paymentId, amount?)`. */
+  abstract refundPayment(paymentId: string, amount?: number, options?: RefundOptions): Promise<PaymentResult>;
 
   /**
    * Helper to produce a normalized error PaymentResult.
@@ -35,4 +37,35 @@ export abstract class BasePaymentProvider implements IPaymentProvider {
     }
     return { success: false, error: message };
   }
+}
+
+/**
+ * Compile-time check only (`npm run typecheck`): ambient and not exported, so it emits no code and no declaration.
+ * A subclass written for 2.1, with the two-parameter `refundPayment`, must keep compiling in every 2.x release.
+ */
+declare class SubclassWrittenFor21 extends BasePaymentProvider {
+  readonly name: string;
+  readonly flow: PaymentFlow;
+  createPayment(request: PaymentRequest): Promise<PaymentResult>;
+  executePayment(paymentId: string, data?: Record<string, string>): Promise<PaymentResult>;
+  getPaymentDetails(paymentId: string): Promise<PaymentResult>;
+  refundPayment(paymentId: string, amount?: number): Promise<PaymentResult>;
+}
+
+/**
+ * Compile-time check only, as above. A subclass written for 2.1 whose `refundPayment` already declared a third
+ * parameter of another type does not compile against the 2.2 signature as it is (TS2416): it compiles again once that
+ * parameter also accepts `RefundOptions` (README "Custom Provider").
+ */
+declare class SubclassWithItsOwnThirdParameter extends BasePaymentProvider {
+  readonly name: string;
+  readonly flow: PaymentFlow;
+  createPayment(request: PaymentRequest): Promise<PaymentResult>;
+  executePayment(paymentId: string, data?: Record<string, string>): Promise<PaymentResult>;
+  getPaymentDetails(paymentId: string): Promise<PaymentResult>;
+  refundPayment(
+    paymentId: string,
+    amount?: number,
+    reason?: 'duplicate' | 'fraudulent' | RefundOptions,
+  ): Promise<PaymentResult>;
 }

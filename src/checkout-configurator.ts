@@ -8,6 +8,7 @@ import { IMandateProvider, isMandateProvider } from './interfaces/mandate-provid
 import { isChargeLookupProvider } from './interfaces/charge-lookup-provider.interface';
 import {
   CHARGE_REF_PATTERN,
+  ChargeErrorCode,
   ChargeLookupOptions,
   ChargeLookupResult,
   ChargeLookupStatus,
@@ -24,6 +25,7 @@ import {
   MandateSetupStart,
   MandateStatusResult,
 } from './models/mandate.model';
+import { RefundOptions, isRefundIdempotencyKey } from './models/refund.model';
 import { toMinorUnits } from './utils/money';
 import { redactSecret } from './utils/redact';
 
@@ -33,6 +35,9 @@ const CHARGE_STATUSES: ReadonlySet<string> = new Set<ChargeStatus>([
   'unknown',
   'requires_action',
 ]);
+
+/** Since 2.2.0. Every `ChargeErrorCode`: any other `errorCode` a provider sets is dropped. */
+const CHARGE_ERROR_CODES: ReadonlySet<unknown> = new Set<ChargeErrorCode>(['AMOUNT_MISMATCH']);
 
 const CHARGE_EVENTS: Record<ChargeStatus, CheckoutEventName> = {
   succeeded: 'charge.succeeded',
@@ -375,14 +380,33 @@ export class CheckoutConfigurator {
     return provider.getPaymentDetails(paymentId);
   }
 
-  /** Issue a full or partial refund */
+  /**
+   * Issue a full (`amount` omitted) or partial refund.
+   *
+   * `options.idempotencyKey` (since 2.2.0, see `RefundOptions`) makes a retry of the same refund safe while the
+   * provider keeps the key. The options are validated first, without calling the provider and without emitting an
+   * event (fail closed: a refund asked to be idempotent is never sent without its key):
+   * - `options` that are not an object, or a key that is not a string matching `REFUND_IDEMPOTENCY_KEY_PATTERN` →
+   *   `CheckoutError('INVALID_REFUND_REQUEST')`;
+   * - a key on a provider whose `supportsRefundIdempotency` is not `true` (Nexi, a provider written for 2.1) →
+   *   `CheckoutError('REFUND_IDEMPOTENCY_NOT_SUPPORTED')` (HTTP 422 through the router).
+   * Without `options` (or with `null`) the provider is called with `(paymentId, amount)`, exactly as in 2.1; with
+   * them, with `(paymentId, amount, { idempotencyKey })` (the known field only). A provider whose
+   * `supportsRefundIdempotency` is not `true` always gets `(paymentId, amount)`: options without a key are not passed
+   * on to it, since its own third parameter, if any, may mean something else. Emits `payment.refunded`, unchanged.
+   */
   async refundPayment(
     providerName: string,
     paymentId: string,
     amount?: number,
+    options?: RefundOptions,
   ): Promise<PaymentResult> {
     const provider = this.getProvider(providerName);
-    const result = await provider.refundPayment(paymentId, amount);
+    const providerOptions = this.refundOptions(providerName, provider, options);
+    const result =
+      providerOptions === undefined
+        ? await provider.refundPayment(paymentId, amount)
+        : await provider.refundPayment(paymentId, amount, providerOptions);
     const orderId = this.paymentOrders.get(paymentId);
     if (orderId && !result.orderId) {
       result.orderId = orderId;
@@ -397,6 +421,40 @@ export class CheckoutConfigurator {
       raw: result.raw,
     });
     return result;
+  }
+
+  /**
+   * Since 2.2.0. Validates the options of `refundPayment` and returns a copy with the known field only, or undefined
+   * when the provider is called without options: no options, or options without a key for a provider whose
+   * `supportsRefundIdempotency` is not `true` (a provider written for 2.1 gets the 2.1 call, whatever its own third
+   * parameter). The key is read once: the provider gets exactly the value that was checked.
+   */
+  private refundOptions(
+    providerName: string,
+    provider: IPaymentProvider,
+    options: RefundOptions | undefined,
+  ): RefundOptions | undefined {
+    if (options === undefined || options === null) return undefined;
+    if (typeof options !== 'object') {
+      throw new CheckoutError('Invalid refund options', 'INVALID_REFUND_REQUEST', providerName);
+    }
+    const idempotencyKey: unknown = options.idempotencyKey;
+    if (idempotencyKey === undefined) return provider.supportsRefundIdempotency === true ? {} : undefined;
+    if (!isRefundIdempotencyKey(idempotencyKey)) {
+      throw new CheckoutError(
+        'Invalid idempotencyKey: expected /^[A-Za-z0-9_-]{8,64}$/',
+        'INVALID_REFUND_REQUEST',
+        providerName,
+      );
+    }
+    if (provider.supportsRefundIdempotency !== true) {
+      throw new CheckoutError(
+        `Provider '${providerName}' does not support refund idempotency keys`,
+        'REFUND_IDEMPOTENCY_NOT_SUPPORTED',
+        providerName,
+      );
+    }
+    return { idempotencyKey };
   }
 
   /**
@@ -567,6 +625,8 @@ export class CheckoutConfigurator {
           mandateUnusable: result.mandateUnusable,
           // Since 2.2.0: a refunded or partly captured charge (only on verified results)
           providerState: result.providerState,
+          // Since 2.2.0: the stable reason (e.g. 'AMOUNT_MISMATCH': never retry such a charge)
+          errorCode: result.errorCode,
         },
         raw: result.raw,
       },
@@ -582,11 +642,15 @@ export class CheckoutConfigurator {
    * - `succeeded` without `verified: true` becomes `unknown` (never `failed`: an unauthenticated
    *   "success" means we do not know);
    * - a verified `succeeded` whose reported amount or currency differs from the request becomes
-   *   `unknown` with error 'Charged amount does not match the request'. Absent fields are not
-   *   compared (Nexi's charge response carries no amount). `providerState` and `providerStatus`
-   *   survive that check: the state is the more specific fact;
+   *   `unknown` with error 'Charged amount does not match the request' and (since 2.2.0)
+   *   `errorCode: 'AMOUNT_MISMATCH'`. Absent fields are not compared (Nexi's charge response
+   *   carries no amount). `providerState` and `providerStatus` survive that check: the state is
+   *   the more specific fact;
    * - `providerState` and `providerStatus` (since 2.2.0) are dropped from any result that is not
-   *   `verified: true` (an unauthenticated state is not a fact), and never change `status`.
+   *   `verified: true` (an unauthenticated state is not a fact), and never change `status`;
+   * - `errorCode` (since 2.2.0): a final `succeeded` never carries one, nor does an unverified
+   *   "success" turned `unknown`; on any other status a provider's code is kept only when it is a
+   *   known `ChargeErrorCode`.
    */
   private normalizeCharge(
     result: ChargeResult | undefined,
@@ -606,6 +670,9 @@ export class CheckoutConfigurator {
     if (!CHARGE_STATUSES.has(normalized.status)) {
       normalized.status = 'unknown';
     }
+    if (normalized.status === 'succeeded' || !CHARGE_ERROR_CODES.has(normalized.errorCode)) {
+      delete normalized.errorCode;
+    }
     if (normalized.status === 'succeeded') {
       if (!normalized.verified) {
         normalized.status = 'unknown';
@@ -613,6 +680,7 @@ export class CheckoutConfigurator {
       } else if (!chargedAmountMatches(normalized, amount, currency)) {
         normalized.status = 'unknown';
         normalized.error = AMOUNT_MISMATCH;
+        normalized.errorCode = 'AMOUNT_MISMATCH';
       }
     }
     return normalized;
@@ -802,8 +870,8 @@ export class CheckoutConfigurator {
     const providerCharge = isObject(source.firstCharge) ? source.firstCharge : undefined;
 
     if (source.verified !== true) {
-      // Like normalizeOutcome: an unauthenticated callback provides no identities, no amounts and no
-      // provider state (since 2.2.0)
+      // Like normalizeOutcome: an unauthenticated callback provides no identities, no amounts, no
+      // provider state and no error code (since 2.2.0)
       const firstCharge: ChargeResult = providerCharge
         ? {
             ...providerCharge,
@@ -816,6 +884,7 @@ export class CheckoutConfigurator {
         : { status: 'unknown', verified: false, chargeRef: pending.orderId };
       delete firstCharge.providerState;
       delete firstCharge.providerStatus;
+      delete firstCharge.errorCode;
       if (!CHARGE_STATUSES.has(firstCharge.status)) firstCharge.status = 'unknown';
       if (firstCharge.status === 'succeeded') {
         firstCharge.status = 'unknown';
@@ -879,10 +948,12 @@ export class CheckoutConfigurator {
    * rejects this method (the error goes to `config.onListenerError`), so a charge that moved
    * money always returns its result.
    *
-   * Retry an `unknown` charge with the SAME `chargeRef`; a dunning retry after `failed` is a new
-   * charge with a NEW `chargeRef`. The library never retries on its own. Never pass a setup's
-   * `orderId` as `chargeRef`: an `unknown` first charge is resolved with `confirmMandate(provider,
-   * pending, {})`, since this method starts a new charge (on PayPal, a new order).
+   * Retry an `unknown` charge with the SAME `chargeRef`, except one with `errorCode:
+   * 'AMOUNT_MISMATCH'` (since 2.2.0): a retry gets the same answer, so review it instead. A
+   * dunning retry after `failed` is a new charge with a NEW `chargeRef`. The library never retries
+   * on its own. Never pass a setup's `orderId` as `chargeRef`: an `unknown` first charge is
+   * resolved with `confirmMandate(provider, pending, {})`, since this method starts a new charge
+   * (on PayPal, a new order).
    */
   async chargeMandate(providerName: string, mandate: Mandate, charge: ChargeRequest): Promise<ChargeResult> {
     const provider = this.getMandateProvider(providerName);

@@ -4,6 +4,7 @@ import { generateOrderId } from '../../utils/ids';
 import { currencyExponent, isInvalidAmountError, toMinorUnits } from '../../utils/money';
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult, WebhookResult } from '../../models/payment-result.model';
+import { RefundOptions } from '../../models/refund.model';
 import { parseAmountFromCents, parseNexiCurrency } from '../../utils/parsing.util';
 import { appendMandateRef } from '../../utils/url';
 import { IMandateProvider } from '../../interfaces/mandate-provider.interface';
@@ -908,7 +909,15 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
     }
   }
 
-  async refundPayment(paymentId: string, amount?: number): Promise<PaymentResult> {
+  /**
+   * Storno of `paymentId` (`codTrans`), in full (`amount` omitted) or in part. The storno API has no idempotency key,
+   * so `supportsRefundIdempotency` is unset and the configurator refuses a key (`REFUND_IDEMPOTENCY_NOT_SUPPORTED`).
+   * Called directly with one (since 2.2.0), it returns `REFUND_FAILED` without any request.
+   */
+  async refundPayment(paymentId: string, amount?: number, options?: RefundOptions): Promise<PaymentResult> {
+    if (options?.idempotencyKey !== undefined) {
+      return { success: false, status: 'REFUND_FAILED', error: 'Nexi refunds do not support an idempotency key' };
+    }
     try {
       const timestamp = new Date().toISOString();
       // The refund API carries no currency. createPayment accepts only 2-decimal currencies,

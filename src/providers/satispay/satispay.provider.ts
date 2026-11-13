@@ -2,6 +2,7 @@ import * as crypto from 'crypto';
 import { BasePaymentProvider } from '../../abstract/base-payment-provider.abstract';
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult, WebhookResult } from '../../models/payment-result.model';
+import { RefundOptions, isRefundIdempotencyKey } from '../../models/refund.model';
 import { ITransactionStore } from '../../interfaces/transaction-store.interface';
 import { InMemoryTransactionStore } from '../../stores/in-memory-transaction.store';
 import { parseAmountFromCents, parseNexiCurrency } from '../../utils/parsing.util';
@@ -42,6 +43,12 @@ const PROTECTED_HEADERS = new Set(['host', 'date', 'digest', 'authorization']);
 const REVOKE_UNSUPPORTED =
   'Satispay does not document a merchant-side revocation; stop charging this mandate. ' +
   'The customer can revoke it from the Satispay app.';
+
+/**
+ * Since 2.2.0. The 4xx answers to a refund that say nothing about it: merchant-side (401, 403,
+ * 429) or a same-key request still in flight (408, 409). Any other 4xx is a refusal.
+ */
+const REFUND_UNKNOWN_4XX: ReadonlySet<number> = new Set([401, 403, 408, 409, 429]);
 
 export interface SatispayProviderConfig {
   keyId: string;
@@ -86,7 +93,13 @@ export interface SatispayProviderConfig {
   /**
    * Timeout of the mandate API calls (`createMandate`, `confirmMandate`, `chargeMandate`,
    * `getMandate`) in milliseconds. A timeout is reported as `unknown`, never `failed`.
-   * @default 30000
+   *
+   * Since 2.2.0 it also bounds `refundPayment` (its payment read and its refund request), but
+   * only when it is set: refunds have no default timeout, as in 2.1. A refund that times out
+   * without an idempotency key cannot be retried safely, so a default would turn slow successes
+   * into apparent failures. A refund that times out is an unknown outcome (`success: false`
+   * without `verified`): retry it only with the same `RefundOptions.idempotencyKey`.
+   * @default 30000 (mandate calls); no timeout (refunds)
    */
   timeoutMs?: number;
   /**
@@ -110,6 +123,11 @@ export interface SatispayProviderConfig {
 export class SatispayProvider extends BasePaymentProvider implements IMandateProvider {
   readonly name = 'satispay';
   readonly flow = 'webhook' as const;
+  /**
+   * Since 2.2.0: `refundPayment` sends `options.idempotencyKey` as `Idempotency-Key` (retention not documented by
+   * Satispay: retry promptly).
+   */
+  readonly supportsRefundIdempotency = true;
 
   private readonly apiUrl: string;
   private readonly transactionStore: ITransactionStore;
@@ -365,15 +383,21 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
 
   /**
    * Signed request that never throws and keeps the HTTP status and the parsed body, for the
-   * mandate methods (which must tell 4xx from 5xx from a timeout). `extraHeaders` are merged after
-   * the signature headers but can never override `Host`, `Date`, `Digest` or `Authorization`
-   * (case-insensitively). `request()` keeps its throwing behaviour for the one-off payment flow.
+   * mandate methods and (since 2.2.0) the refunds, which must tell 4xx from 5xx from a timeout.
+   * `extraHeaders` are merged after the signature headers but can never override `Host`, `Date`,
+   * `Digest` or `Authorization` (case-insensitively). `request()` keeps its throwing behaviour for
+   * the one-off payment flow.
+   *
+   * `options.timeoutMs` (since 2.2.0): omitted `options` give the mandate timeout,
+   * `config.timeoutMs ?? 30000`; `{ timeoutMs: undefined }` gives no timeout (no `signal`), which
+   * is what a refund without a configured `timeoutMs` passes.
    */
   private async send(
     method: string,
     url: string,
     body?: unknown,
     extraHeaders: Record<string, string> = {},
+    options: { timeoutMs?: number } = { timeoutMs: this.config.timeoutMs ?? 30000 },
   ): Promise<SatispaySendResult> {
     try {
       const parsed = new URL(url);
@@ -388,11 +412,12 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
         headers[name] = value;
       }
 
+      const { timeoutMs } = options;
       const response = await fetch(url, {
         method,
         headers,
         body: body ? JSON.stringify(body) : undefined,
-        signal: AbortSignal.timeout(this.config.timeoutMs ?? 30000),
+        ...(timeoutMs !== undefined ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
       });
 
       let text: string;
@@ -537,7 +562,26 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
     }
   }
 
-  async refundPayment(paymentId: string, amount?: number): Promise<PaymentResult> {
+  /**
+   * Refunds the payment `paymentId` with the documented flow (since 2.2.0): a new payment
+   * `POST /payments` with `flow: 'REFUND'`, `parent_payment_uid: paymentId`, `amount_unit` and
+   * `currency: 'EUR'`, and `options.idempotencyKey` as `Idempotency-Key`.
+   *
+   * - `amount_unit` is required: a full refund (`amount` omitted) first reads the payment
+   *   (`GET /payments/{id}`). Unless that read is a 2xx for this id, `ACCEPTED`, with an integer
+   *   `amount_unit > 0`, the result is `REFUND_FAILED` and nothing is sent. After an earlier
+   *   partial refund, a full refund of the original amount is refused (4xx): pass the remaining
+   *   amount explicitly.
+   * - `success: true` (verified) only for a 2xx `ACCEPTED` refund with an id and a `type` absent
+   *   or `REFUND_TO_BUSINESS`. Any other 2xx, a network error or a timeout, and HTTP 401, 403,
+   *   408, 409, 429 or 5xx are an unknown outcome (`success: false` without `verified`: the
+   *   refund may exist). Any other 4xx is an authenticated refusal (`verified: true`,
+   *   `REFUND_FAILED`): nothing was refunded.
+   * - Bounded by `config.timeoutMs` only when it is set (no default timeout, as in 2.1).
+   * - A key that does not match `REFUND_IDEMPOTENCY_KEY_PATTERN` is refused (`REFUND_FAILED`)
+   *   without any request.
+   */
+  async refundPayment(paymentId: string, amount?: number, options?: RefundOptions): Promise<PaymentResult> {
     if (!this.isValidPaymentId(paymentId)) {
       return {
         success: false,
@@ -546,29 +590,106 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
         error: 'Invalid payment ID format',
       };
     }
-    try {
-      // The refund call carries no currency. createPayment accepts only 2-decimal currencies,
-      // so a partial amount is always in hundredths. Only an omitted (undefined) amount means a
-      // full refund, as in PayPal: 0 and null are rejected by toMinorUnits like any invalid amount.
-      const body = amount !== undefined ? { amount_unit: toMinorUnits(amount, 'EUR') } : {};
-      const refund = await this.request<Record<string, unknown>>(
-        'POST',
-        `${this.apiUrl}/payments/${encodeURIComponent(paymentId)}/refunds`,
-        body,
-      );
-      return {
-        success: true,
-        verified: true,
-        paymentId: refund['id'] as string,
-        status: refund['status'] as string,
-        raw: refund,
-      };
-    } catch (error) {
-      if (isInvalidAmountError(error)) {
-        return { success: false, error: error.message, status: 'FAILED' };
-      }
-      return this.errorResult(error, 'Failed to refund Satispay payment');
+    const idempotencyKey = options?.idempotencyKey;
+    if (idempotencyKey !== undefined && !isRefundIdempotencyKey(idempotencyKey)) {
+      return { success: false, paymentId, status: 'REFUND_FAILED', error: 'Invalid refund idempotency key' };
     }
+    // As configured: unset means no timeout, as the 2.1 refund (request()) had none
+    const timeout = { timeoutMs: this.config.timeoutMs };
+
+    let amountUnit: number;
+    if (amount !== undefined) {
+      // createPayment accepts only 2-decimal currencies, so an amount is always in hundredths.
+      // Only an omitted (undefined) amount means a full refund, as in PayPal: 0 and null are
+      // rejected by toMinorUnits like any invalid amount.
+      try {
+        amountUnit = toMinorUnits(amount, 'EUR');
+      } catch (error) {
+        if (isInvalidAmountError(error)) {
+          return { success: false, error: error.message, status: 'FAILED' };
+        }
+        return this.errorResult(error, 'Failed to refund Satispay payment');
+      }
+    } else {
+      const read = await this.send(
+        'GET',
+        `${this.apiUrl}/payments/${encodeURIComponent(paymentId)}`,
+        undefined,
+        {},
+        timeout,
+      );
+      const unit = read.json?.['amount_unit'];
+      if (
+        !read.ok ||
+        read.json?.['id'] !== paymentId ||
+        read.json['status'] !== 'ACCEPTED' ||
+        typeof unit !== 'number' ||
+        !Number.isInteger(unit) ||
+        unit <= 0
+      ) {
+        return {
+          success: false,
+          status: 'REFUND_FAILED',
+          error: 'Satispay payment could not be read: no refund was sent',
+        };
+      }
+      amountUnit = unit;
+    }
+
+    const res = await this.send(
+      'POST',
+      `${this.apiUrl}/payments`,
+      { flow: 'REFUND', parent_payment_uid: paymentId, amount_unit: amountUnit, currency: 'EUR' },
+      idempotencyKey !== undefined ? { 'Idempotency-Key': idempotencyKey } : {},
+      timeout,
+    );
+    return this.mapRefund(res);
+  }
+
+  /** The answer to a `flow: 'REFUND'` payment, mapped as documented on `refundPayment`. */
+  private mapRefund(res: SatispaySendResult): PaymentResult {
+    if (res.networkError) {
+      // The refund may exist: no `verified`
+      return { success: false, error: 'Satispay refund outcome unknown (network error or timeout)' };
+    }
+    const json = res.json;
+    if (res.ok) {
+      const status = typeof json?.['status'] === 'string' ? json['status'] : undefined;
+      const id = json?.['id'];
+      const type = json?.['type'];
+      if (status === 'ACCEPTED' && typeof id === 'string' && id !== '' && (type === undefined || type === 'REFUND_TO_BUSINESS')) {
+        const refunded = parseAmountFromCents(json?.['amount_unit']);
+        const currency = json?.['currency'];
+        return {
+          success: true,
+          // Authenticated server-to-server response, as in getPaymentDetails
+          verified: true,
+          paymentId: id,
+          status: 'ACCEPTED',
+          ...(refunded !== undefined ? { amount: refunded } : {}),
+          ...(typeof currency === 'string' ? { currency } : {}),
+          raw: json,
+        };
+      }
+      // Not final, another type, no id or no JSON: uncertain
+      const reported = status ?? 'UNKNOWN';
+      return { success: false, status: reported, error: `Satispay refund is ${reported}`, raw: json };
+    }
+    const http = res.status;
+    if (http >= 400 && http < 500 && !REFUND_UNKNOWN_4XX.has(http)) {
+      // An authenticated refusal: nothing was refunded
+      const message = json?.['message'];
+      return {
+        success: false,
+        verified: true,
+        status: 'REFUND_FAILED',
+        error: typeof message === 'string' ? message : 'Satispay refused the refund',
+        raw: json,
+      };
+    }
+    // Merchant-side (401, 403, 429), a same-key request still in flight (408, 409), 5xx, or any
+    // other status: the refund may exist
+    return { success: false, error: `Satispay refund outcome unknown (HTTP ${http})`, raw: json };
   }
 
   /**

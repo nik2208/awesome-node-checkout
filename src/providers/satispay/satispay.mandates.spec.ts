@@ -828,18 +828,219 @@ describe('SatispayProvider mandates (pre-authorized payment tokens)', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 7. refundPayment regression
+  // 7. refundPayment: the documented flow, a checked outcome, the idempotency key (#44)
   // ---------------------------------------------------------------------------
 
-  it("refundPayment('pay_1', 19.9) posts to …/payments/pay_1/refunds", async () => {
-    routes({
-      [`POST ${PAYMENTS}/pay_1/refunds`]: () => resp(200, { id: 'ref_1', status: 'ACCEPTED' }),
+  describe('refundPayment (#44)', () => {
+    const refund = { id: 'ref_1', type: 'REFUND_TO_BUSINESS', status: 'ACCEPTED', amount_unit: 1990, currency: 'EUR' };
+    const payment = { id: 'pay_1', status: 'ACCEPTED', amount_unit: 1990, currency: 'EUR' };
+
+    it('declares supportsRefundIdempotency', () => {
+      expect(provider.supportsRefundIdempotency).toBe(true);
     });
-    const result = await provider.refundPayment('pay_1', 19.9);
-    expect(result.success).toBe(true);
-    const [{ url, init }] = calls();
-    expect(url).toBe('https://staging.authservices.satispay.com/g_business/v1/payments/pay_1/refunds');
-    expect(init.method).toBe('POST');
-    expect(bodyOf(init)).toEqual({ amount_unit: 1990 });
+
+    it("refundPayment('pay_1', 19.9) makes exactly one signed POST /payments with flow REFUND and no Idempotency-Key", async () => {
+      routes({ [`POST ${PAYMENTS}`]: () => resp(200, refund) });
+
+      const result = await provider.refundPayment('pay_1', 19.9);
+
+      expect(fetchMock()).toHaveBeenCalledTimes(1);
+      const [{ url, init }] = calls();
+      expect(url).toBe('https://staging.authservices.satispay.com/g_business/v1/payments');
+      expect(init.method).toBe('POST');
+      expect(bodyOf(init)).toEqual({ flow: 'REFUND', parent_payment_uid: 'pay_1', amount_unit: 1990, currency: 'EUR' });
+      expect(Object.keys(headersOf(init)).map((h) => h.toLowerCase())).not.toContain('idempotency-key');
+      expect(verifySignature(url, init, validFakePublicKey)).toBe(true);
+      expect(result).toMatchObject({
+        success: true,
+        verified: true,
+        paymentId: 'ref_1',
+        status: 'ACCEPTED',
+        amount: 19.9,
+        currency: 'EUR',
+      });
+      expect(result.raw).toEqual(refund);
+    });
+
+    it('with { idempotencyKey } the POST carries Idempotency-Key, and Digest and Authorization still sign the body', async () => {
+      routes({ [`POST ${PAYMENTS}`]: () => resp(200, refund) });
+
+      const result = await provider.refundPayment('pay_1', 19.9, { idempotencyKey: 'refund-SUB-0001-R1' });
+
+      const [{ url, init }] = calls();
+      const headers = headersOf(init);
+      expect(headers['Idempotency-Key']).toBe('refund-SUB-0001-R1');
+      expect(headers['Digest']).toBe(
+        'SHA-256=' + crypto.createHash('sha256').update(String(init.body)).digest('base64'),
+      );
+      expect(headers['Authorization']).toContain('headers="(request-target) host date digest"');
+      expect(verifySignature(url, init, validFakePublicKey)).toBe(true);
+      expect(bodyOf(init)).toEqual({ flow: 'REFUND', parent_payment_uid: 'pay_1', amount_unit: 1990, currency: 'EUR' });
+      expect(result.success).toBe(true);
+    });
+
+    it("200 { id: 'ref_1', status: 'PENDING' } is not a success, and not verified", async () => {
+      routes({ [`POST ${PAYMENTS}`]: () => resp(200, { id: 'ref_1', status: 'PENDING' }) });
+      const result = await provider.refundPayment('pay_1', 19.9);
+      expect(result).toMatchObject({ success: false, status: 'PENDING', error: 'Satispay refund is PENDING' });
+      expect(result.verified).not.toBe(true);
+    });
+
+    it("200 with type: 'TO_BUSINESS', with no id, or with no JSON is not a success, and not verified", async () => {
+      for (const body of [{ ...refund, type: 'TO_BUSINESS' }, { ...refund, id: '' }, { status: 'ACCEPTED' }, 'not json']) {
+        routes({ [`POST ${PAYMENTS}`]: () => resp(200, body) });
+        const result = await provider.refundPayment('pay_1', 19.9);
+        expect(result.success).toBe(false);
+        expect(result.verified).not.toBe(true);
+      }
+      routes({ [`POST ${PAYMENTS}`]: () => resp(200, 'not json') });
+      expect(await provider.refundPayment('pay_1', 19.9)).toMatchObject({
+        success: false,
+        status: 'UNKNOWN',
+        error: 'Satispay refund is UNKNOWN',
+      });
+    });
+
+    it("400 { code: 36, message } is an authenticated refusal: { success: false, verified: true, status: 'REFUND_FAILED', error }", async () => {
+      routes({ [`POST ${PAYMENTS}`]: () => resp(400, { code: 36, message: 'Refund amount exceeds the payment' }) });
+      const result = await provider.refundPayment('pay_1', 19.9);
+      expect(result).toMatchObject({
+        success: false,
+        verified: true,
+        status: 'REFUND_FAILED',
+        error: 'Refund amount exceeds the payment',
+      });
+    });
+
+    it("a 4xx refusal without a message is 'Satispay refused the refund'", async () => {
+      routes({ [`POST ${PAYMENTS}`]: () => resp(422, { code: 99 }) });
+      expect(await provider.refundPayment('pay_1', 19.9)).toMatchObject({
+        success: false,
+        verified: true,
+        status: 'REFUND_FAILED',
+        error: 'Satispay refused the refund',
+      });
+    });
+
+    it.each([401, 403, 408, 409, 429, 500, 503])('HTTP %i is an unknown outcome: success false, not verified', async (status) => {
+      routes({ [`POST ${PAYMENTS}`]: () => resp(status, { message: 'busy' }) });
+      const result = await provider.refundPayment('pay_1', 19.9);
+      expect(result).toMatchObject({ success: false, error: `Satispay refund outcome unknown (HTTP ${status})` });
+      expect(result.verified).not.toBe(true);
+    });
+
+    it('a network error or a timeout is an unknown outcome: success false, not verified', async () => {
+      for (const failure of [
+        new TypeError('fetch failed'),
+        Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }),
+      ]) {
+        fetchMock().mockRejectedValueOnce(failure);
+        const result = await provider.refundPayment('pay_1', 19.9);
+        expect(result).toEqual({ success: false, error: 'Satispay refund outcome unknown (network error or timeout)' });
+      }
+    });
+
+    it("full refund: refundPayment('pay_1') reads the payment, then refunds its amount_unit", async () => {
+      routes({
+        [`GET ${PAYMENTS}/pay_1`]: () => resp(200, payment),
+        [`POST ${PAYMENTS}`]: () => resp(200, refund),
+      });
+
+      const result = await provider.refundPayment('pay_1');
+
+      expect(calls().map((c) => c.key)).toEqual([`GET ${PAYMENTS}/pay_1`, `POST ${PAYMENTS}`]);
+      expect(verifySignature(calls()[0].url, calls()[0].init, validFakePublicKey)).toBe(true);
+      expect(bodyOf(calls()[1].init)).toEqual({
+        flow: 'REFUND',
+        parent_payment_uid: 'pay_1',
+        amount_unit: 1990,
+        currency: 'EUR',
+      });
+      expect(result).toMatchObject({ success: true, verified: true, paymentId: 'ref_1', amount: 19.9 });
+    });
+
+    it.each([
+      ['404', () => resp(404, { code: 404 })],
+      ['503', () => resp(503, { message: 'down' })],
+      ["id: 'pay_2'", () => resp(200, { ...payment, id: 'pay_2' })],
+      ["status: 'CANCELED'", () => resp(200, { ...payment, status: 'CANCELED' })],
+      ['amount_unit: 0', () => resp(200, { ...payment, amount_unit: 0 })],
+      ["amount_unit: '1990'", () => resp(200, { ...payment, amount_unit: '1990' })],
+    ])('full refund: a read answering %s sends no refund', async (_label, read) => {
+      routes({ [`GET ${PAYMENTS}/pay_1`]: read, [`POST ${PAYMENTS}`]: () => resp(200, refund) });
+      const result = await provider.refundPayment('pay_1');
+      expect(result).toEqual({
+        success: false,
+        status: 'REFUND_FAILED',
+        error: 'Satispay payment could not be read: no refund was sent',
+      });
+      expect(calls().map((c) => c.key)).toEqual([`GET ${PAYMENTS}/pay_1`]);
+    });
+
+    it('full refund: a read that times out sends no refund', async () => {
+      routes({
+        [`GET ${PAYMENTS}/pay_1`]: () => {
+          throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+        },
+      });
+      expect(await provider.refundPayment('pay_1')).toMatchObject({ success: false, status: 'REFUND_FAILED' });
+      expect(calls()).toHaveLength(1);
+    });
+
+    it('timeout: no signal without config.timeoutMs; an AbortSignal of config.timeoutMs with it', async () => {
+      const timeout = vi.spyOn(AbortSignal, 'timeout');
+      routes({
+        [`GET ${PAYMENTS}/pay_1`]: () => resp(200, payment),
+        [`POST ${PAYMENTS}`]: () => resp(200, refund),
+      });
+
+      await provider.refundPayment('pay_1', 19.9);
+      await provider.refundPayment('pay_1');
+      expect(calls()).toHaveLength(3);
+      for (const { init } of calls()) expect(init.signal).toBeUndefined();
+      expect(timeout).not.toHaveBeenCalled();
+
+      const bounded = new SatispayProvider({ keyId: 'test-key', privateKey: validFakePrivateKey, timeoutMs: 5000 });
+      await bounded.refundPayment('pay_1', 19.9);
+      await bounded.refundPayment('pay_1');
+      expect(calls()).toHaveLength(6);
+      for (const { init } of calls().slice(3)) expect(init.signal).toBeDefined();
+      expect(timeout.mock.calls).toEqual([[5000], [5000], [5000]]);
+      timeout.mockRestore();
+    });
+
+    it('called directly with a key that does not match REFUND_IDEMPOTENCY_KEY_PATTERN, refuses without any request', async () => {
+      for (const idempotencyKey of ['', 'short', 'has space 1', 'x'.repeat(65), 123 as unknown as string]) {
+        const result = await provider.refundPayment('pay_1', 19.9, { idempotencyKey });
+        expect(result).toMatchObject({ success: false, status: 'REFUND_FAILED' });
+        expect(result.verified).not.toBe(true);
+      }
+      expect(fetchMock()).not.toHaveBeenCalled();
+    });
+
+    it('an invalid payment id or amount still fails without any request, as in 2.1', async () => {
+      expect(await provider.refundPayment('pay/1', 19.9)).toMatchObject({
+        success: false,
+        status: 'REFUND_FAILED',
+        error: 'Invalid payment ID format',
+      });
+      expect(await provider.refundPayment('pay_1', 19.999)).toMatchObject({ success: false, status: 'FAILED' });
+      expect(fetchMock()).not.toHaveBeenCalled();
+    });
+
+    it('through the configurator, the key reaches Satispay and payment.refunded is verified for ACCEPTED', async () => {
+      routes({ [`POST ${PAYMENTS}`]: () => resp(200, refund) });
+      const checkout = new CheckoutConfigurator();
+      checkout.registerProvider(provider);
+      const events: any[] = [];
+      checkout.events.on('payment.refunded', (payload) => {
+        events.push(payload);
+      });
+      const result = await checkout.refundPayment('satispay', 'pay_1', 19.9, { idempotencyKey: 'refund-SUB-0001-R1' });
+      expect(result.success).toBe(true);
+      expect(headersOf(calls()[0].init)['Idempotency-Key']).toBe('refund-SUB-0001-R1');
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ provider: 'satispay', paymentId: 'pay_1', status: 'ACCEPTED', verified: true });
+    });
   });
 });

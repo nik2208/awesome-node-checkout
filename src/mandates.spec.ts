@@ -650,6 +650,10 @@ describe('Mandates: configurator', () => {
       expect(outcome.success).toBe(true);
       expect(outcome.firstCharge).toMatchObject({ status: 'unknown', error: 'Charged amount does not match the request' });
       expect(events.map((e) => e.name)).toEqual(['mandate.created', 'charge.unknown']);
+      // Since 2.2.0 (#43): the stable code, on the result and in the charge.unknown event
+      expect(outcome.firstCharge.errorCode).toBe('AMOUNT_MISMATCH');
+      expect(outcome.firstCharge).toMatchObject({ amount: 9.9, currency: 'EUR' });
+      expect(events[1].payload.data.errorCode).toBe('AMOUNT_MISMATCH');
     });
 
     it('never mutates the object returned by the provider', async () => {
@@ -742,6 +746,14 @@ describe('Mandates: configurator', () => {
       const result = await checkout.chargeMandate('dummy', activeMandate(), charge({ amount: 19.99 }));
       expect(result.status).toBe('unknown');
       expect(result.error).toBe('Charged amount does not match the request');
+      // Since 2.2.0 (#43): the stable code, with the amount and currency the provider reported
+      expect(result).toMatchObject({
+        status: 'unknown',
+        errorCode: 'AMOUNT_MISMATCH',
+        error: 'Charged amount does not match the request',
+        amount: 9.99,
+        currency: 'EUR',
+      });
     });
 
     it('a verified succeeded in another currency becomes unknown; absent amount and currency are not compared', async () => {
@@ -847,6 +859,113 @@ describe('Mandates: configurator', () => {
       await checkout.chargeMandate('dummy', activeMandate({ status: 'revoked' }), charge());
       expect(events.map((e) => e.name)).toEqual(['charge.failed']);
       expect(events[0].payload).toMatchObject({ orderId: 'SUB-0001-2026-12', verified: false, data: { mandateUnusable: true } });
+    });
+  });
+
+  describe('errorCode (#43)', () => {
+    it("19.99 'USD' for a 19.99 EUR request is AMOUNT_MISMATCH, in the result and in charge.unknown", async () => {
+      provider.nextCharge = (_m, c) => ({ status: 'succeeded', verified: true, chargeRef: c.chargeRef, amount: 19.99, currency: 'USD' });
+      const result = await checkout.chargeMandate('dummy', activeMandate(), charge({ amount: 19.99 }));
+      expect(result).toMatchObject({
+        status: 'unknown',
+        errorCode: 'AMOUNT_MISMATCH',
+        error: 'Charged amount does not match the request',
+        amount: 19.99,
+        currency: 'USD',
+      });
+      expect(events.map((e) => e.name)).toEqual(['charge.unknown']);
+      expect(events[0].payload.data.errorCode).toBe('AMOUNT_MISMATCH');
+    });
+
+    it("19.99 'eur' is succeeded, with no errorCode key", async () => {
+      provider.nextCharge = (_m, c) => ({ status: 'succeeded', verified: true, chargeRef: c.chargeRef, amount: 19.99, currency: 'eur' });
+      const result = await checkout.chargeMandate('dummy', activeMandate(), charge({ amount: 19.99 }));
+      expect(result.status).toBe('succeeded');
+      expect(result).not.toHaveProperty('errorCode');
+      expect(events[0].payload.data.errorCode).toBeUndefined();
+    });
+
+    it("an unverified succeeded is unknown with 'Charge outcome could not be verified' and no errorCode", async () => {
+      provider.nextCharge = (_m, c) => ({ status: 'succeeded', verified: false, chargeRef: c.chargeRef, amount: 9.99, currency: 'EUR' });
+      const result = await checkout.chargeMandate('dummy', activeMandate(), charge({ amount: 19.99 }));
+      expect(result.status).toBe('unknown');
+      expect(result.error).toBe('Charge outcome could not be verified');
+      expect(result).not.toHaveProperty('errorCode');
+    });
+
+    it('a provider-set errorCode on an unverified succeeded is dropped too', async () => {
+      provider.nextCharge = (_m, c) =>
+        ({ status: 'succeeded', verified: false, chargeRef: c.chargeRef, errorCode: 'AMOUNT_MISMATCH' }) as ChargeResult;
+      const result = await checkout.chargeMandate('dummy', activeMandate(), charge());
+      expect(result.status).toBe('unknown');
+      expect(result).not.toHaveProperty('errorCode');
+    });
+
+    it("a verified succeeded with matching money and errorCode: 'AMOUNT_MISMATCH' is succeeded, with no errorCode", async () => {
+      provider.nextCharge = (_m, c) =>
+        ({
+          status: 'succeeded',
+          verified: true,
+          chargeRef: c.chargeRef,
+          amount: 19.99,
+          currency: 'EUR',
+          errorCode: 'AMOUNT_MISMATCH',
+        }) as ChargeResult;
+      const result = await checkout.chargeMandate('dummy', activeMandate(), charge({ amount: 19.99 }));
+      expect(result.status).toBe('succeeded');
+      expect(result).not.toHaveProperty('errorCode');
+      expect(events.map((e) => e.name)).toEqual(['charge.succeeded']);
+      expect(events[0].payload.data.errorCode).toBeUndefined();
+    });
+
+    it("a failed with errorCode: 'SOMETHING' has no errorCode", async () => {
+      provider.nextCharge = (_m, c) =>
+        ({ status: 'failed', verified: true, chargeRef: c.chargeRef, error: 'declined', errorCode: 'SOMETHING' }) as unknown as ChargeResult;
+      const result = await checkout.chargeMandate('dummy', activeMandate(), charge());
+      expect(result.status).toBe('failed');
+      expect(result).not.toHaveProperty('errorCode');
+      expect(events[0].payload.data.errorCode).toBeUndefined();
+    });
+
+    it("a failed with errorCode: 'AMOUNT_MISMATCH' keeps it", async () => {
+      provider.nextCharge = (_m, c) =>
+        ({ status: 'failed', verified: true, chargeRef: c.chargeRef, error: 'declined', errorCode: 'AMOUNT_MISMATCH' }) as ChargeResult;
+      const result = await checkout.chargeMandate('dummy', activeMandate(), charge());
+      expect(result.status).toBe('failed');
+      expect(result.errorCode).toBe('AMOUNT_MISMATCH');
+      expect(events[0].payload.data.errorCode).toBe('AMOUNT_MISMATCH');
+    });
+
+    it('never mutates the object returned by the provider', async () => {
+      const scripted = Object.freeze({
+        status: 'succeeded' as const,
+        verified: true,
+        chargeRef: 'SUB-0001-2026-12',
+        amount: 19.99,
+        currency: 'EUR',
+        errorCode: 'AMOUNT_MISMATCH' as const,
+      });
+      provider.nextCharge = () => scripted;
+      const result = await checkout.chargeMandate('dummy', activeMandate(), charge({ amount: 19.99 }));
+      expect(result).not.toHaveProperty('errorCode');
+      expect(scripted.errorCode).toBe('AMOUNT_MISMATCH');
+    });
+
+    it('an unverified setup outcome drops the first charge errorCode, known or not', async () => {
+      for (const errorCode of ['AMOUNT_MISMATCH', 'SOMETHING']) {
+        provider.nextConfirm = (pending) =>
+          ({
+            success: true,
+            verified: false,
+            terminal: true,
+            firstCharge: { status: 'unknown', verified: true, chargeRef: pending.orderId, errorCode },
+          }) as unknown as MandateSetupOutcome;
+        const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+        expect(outcome.terminal).toBe(false);
+        expect(outcome.firstCharge.status).toBe('unknown');
+        expect(outcome.firstCharge).not.toHaveProperty('errorCode');
+      }
+      expect(events).toHaveLength(0);
     });
   });
 

@@ -1,3 +1,5 @@
+import type { ProviderErrorCode } from './payment-result.model';
+
 /**
  * Recurring payments (mandates).
  *
@@ -65,6 +67,11 @@ export interface MandateSetupStart {
   approvalUrl?: string;
   pending?: MandatePendingState;
   error?: string;
+  /**
+   * Since 2.3.0. Set by a built-in provider when it could not authenticate (see `ProviderErrorCode`). Only with
+   * `success: false`.
+   */
+  errorCode?: ProviderErrorCode;
   raw?: unknown;
 }
 
@@ -144,7 +151,8 @@ export interface ChargeResult {
   error?: string;
   /**
    * Since 2.2.0. Stable, machine-readable reason set by the library (see `ChargeErrorCode`). Never on a `succeeded`
-   * result. An unknown code is treated like no code.
+   * result. An unknown code is treated like no code. Since 2.3.0 it can also be a `ProviderErrorCode`: the charge was
+   * not authenticated to the provider, so it is `unknown`, never `failed` (retry with the same `chargeRef`).
    */
   errorCode?: ChargeErrorCode;
   /** Provider decline/error code when available. */
@@ -166,8 +174,11 @@ export interface ChargeResult {
  * - 'AMOUNT_MISMATCH': the provider reports money taken for another amount or currency than requested. `status` is
  *   'unknown'; `amount` / `currency` are the reported ones when the provider gave them. Do not retry: a retry gets the
  *   same answer. Review it, and refund or keep the money.
+ * - Since 2.3.0, 'PROVIDER_AUTH_FAILED' and 'PROVIDER_AUTH_UNAVAILABLE' (see `ProviderErrorCode`): the charge could
+ *   not be authenticated to the provider. `status` is 'unknown', never 'failed': not a decline, no dunning. Retry
+ *   later with the SAME `chargeRef` (an earlier attempt with it may have charged), and alert on the credentials.
  */
-export type ChargeErrorCode = 'AMOUNT_MISMATCH';
+export type ChargeErrorCode = 'AMOUNT_MISMATCH' | ProviderErrorCode;
 
 /**
  * Since 2.2.0. What the provider reports about money it took for a charge, when it is more than "paid":
@@ -226,6 +237,11 @@ export interface ChargeLookupResult {
    */
   refundedAmount?: number;
   error?: string;
+  /**
+   * Since 2.3.0. Set by a built-in provider when it could not authenticate (see `ProviderErrorCode`). Only on
+   * `unknown`.
+   */
+  errorCode?: ProviderErrorCode;
   /** Provider response. May contain personal data (masked PAN, payer account id): never log or persist it. */
   raw?: unknown;
 }
@@ -256,6 +272,12 @@ export interface MandateSetupOutcome {
    */
   firstCharge: ChargeResult;
   error?: string;
+  /**
+   * Since 2.3.0. Set by a built-in provider when it could not authenticate (see `ProviderErrorCode`). Only on an
+   * unverified outcome, never on its `firstCharge`: the code describes the call, not the charge. Re-run
+   * `confirmMandate(provider, pending, {})` later, unchanged.
+   */
+  errorCode?: ProviderErrorCode;
   raw?: unknown;
 }
 
@@ -270,6 +292,11 @@ export interface MandateCallbackInput {
 export interface MandateStatusResult {
   status: MandateStatus | 'unknown';
   verified: boolean;
+  /**
+   * Since 2.3.0. Set by a built-in provider when it could not authenticate (see `ProviderErrorCode`). Only on
+   * `unknown`.
+   */
+  errorCode?: ProviderErrorCode;
   raw?: unknown;
 }
 
@@ -277,5 +304,24 @@ export interface MandateStatusResult {
 export interface MandateRevokeResult {
   revokedAtProvider: boolean;
   error?: string;
+  /**
+   * Since 2.3.0. Set by a built-in provider when it could not authenticate (see `ProviderErrorCode`). Only with
+   * `revokedAtProvider: false`.
+   */
+  errorCode?: ProviderErrorCode;
   raw?: unknown;
+}
+
+/**
+ * Compile-time check only (`npm run typecheck`): ambient and not exported, so it emits no code and no declaration.
+ * A charge result written for 2.2.0, with `errorCode: 'AMOUNT_MISMATCH'`, keeps compiling (#53).
+ */
+declare class ChargeResultWrittenFor22 implements ChargeResult {
+  status: 'unknown';
+  verified: boolean;
+  chargeRef: string;
+  amount?: number;
+  currency?: string;
+  errorCode: 'AMOUNT_MISMATCH';
+  error?: string;
 }

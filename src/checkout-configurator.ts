@@ -1,6 +1,6 @@
 import { IPaymentProvider } from './interfaces/payment-provider.interface';
 import { PaymentRequest } from './models/payment-request.model';
-import { PaymentResult, WebhookResult } from './models/payment-result.model';
+import { PaymentResult, ProviderErrorCode, WebhookResult } from './models/payment-result.model';
 import { CheckoutConfig } from './models/checkout-config.model';
 import { CheckoutError } from './models/errors';
 import { CheckoutEventBus, CheckoutEventName, CheckoutEventPayload } from './events/checkout-event-bus';
@@ -41,8 +41,21 @@ const CHARGE_STATUSES: ReadonlySet<string> = new Set<ChargeStatus>([
   'requires_action',
 ]);
 
-/** Since 2.2.0. Every `ChargeErrorCode`: any other `errorCode` a provider sets is dropped. */
-const CHARGE_ERROR_CODES: ReadonlySet<unknown> = new Set<ChargeErrorCode>(['AMOUNT_MISMATCH']);
+/** Since 2.3.0. Every `ProviderErrorCode`: the only `errorCode` a mandate, setup or lookup result keeps. */
+const PROVIDER_ERROR_CODES: ReadonlySet<unknown> = new Set<ProviderErrorCode>([
+  'PROVIDER_AUTH_FAILED',
+  'PROVIDER_AUTH_UNAVAILABLE',
+]);
+
+/**
+ * Since 2.2.0. Every `ChargeErrorCode`: any other `errorCode` a provider sets is dropped. Since 2.3.0 the
+ * `ProviderErrorCode`s too.
+ */
+const CHARGE_ERROR_CODES: ReadonlySet<unknown> = new Set<ChargeErrorCode>([
+  'AMOUNT_MISMATCH',
+  'PROVIDER_AUTH_FAILED',
+  'PROVIDER_AUTH_UNAVAILABLE',
+]);
 
 const CHARGE_EVENTS: Record<ChargeStatus, CheckoutEventName> = {
   succeeded: 'charge.succeeded',
@@ -84,7 +97,10 @@ function isObject(value: unknown): value is Record<string, unknown> {
  *   'Charge lookup could not be verified';
  * - an `unknown` result carries no payment facts (`LOOKUP_FACTS`);
  * - `refundedAmount` is kept only on a verified `succeeded`, as a finite number >= 0;
- * - `chargeRef` is always the request's.
+ * - `chargeRef` is always the request's;
+ * - `errorCode` (since 2.3.0) is kept only when it is a `ProviderErrorCode` on a failure the provider reported:
+ *   `unknown`, or a status outside the five. A status that answers (`succeeded`, `failed`, `pending`, `absent`)
+ *   never carries one, even when it is made `unknown` for want of `verified: true`.
  */
 function normalizeLookup(result: unknown, chargeRef: string): ChargeLookupResult {
   if (!isObject(result)) {
@@ -98,6 +114,9 @@ function normalizeLookup(result: unknown, chargeRef: string): ChargeLookupResult
     verified: source.verified === true,
     chargeRef,
   };
+  if (!PROVIDER_ERROR_CODES.has(normalized.errorCode) || (known && source.status !== 'unknown')) {
+    delete normalized.errorCode;
+  }
   if (!known) {
     normalized.error = normalized.error ?? 'Provider returned an unrecognised lookup status';
   } else if (normalized.status !== 'unknown' && !normalized.verified) {
@@ -687,7 +706,7 @@ export class CheckoutConfigurator {
    *   `verified: true` (an unauthenticated state is not a fact), and never change `status`;
    * - `errorCode` (since 2.2.0): a final `succeeded` never carries one, nor does an unverified
    *   "success" turned `unknown`; on any other status a provider's code is kept only when it is a
-   *   known `ChargeErrorCode`.
+   *   known `ChargeErrorCode` (since 2.3.0 also the two `ProviderErrorCode`s).
    */
   private normalizeCharge(
     result: ChargeResult | undefined,
@@ -780,6 +799,8 @@ export class CheckoutConfigurator {
         pending: undefined,
         error: (isObject(start) ? start.error : undefined) ?? 'Mandate setup could not be started',
       };
+      // Since 2.3.0: a failed start keeps only a ProviderErrorCode
+      if (!PROVIDER_ERROR_CODES.has(result.errorCode)) delete result.errorCode;
     } else {
       const pending = start.pending;
       // The first charge's amount check in confirmMandate trusts `pending`: bind it to the request
@@ -798,6 +819,8 @@ export class CheckoutConfigurator {
             pending: undefined,
             error: 'Mandate setup does not match the request',
           };
+      // Since 2.3.0: a start the provider reported successful never carries an errorCode
+      delete result.errorCode;
     }
 
     if (result.success) {
@@ -844,7 +867,11 @@ export class CheckoutConfigurator {
    *   `outcome.hints`, else its `mandate.unverified`, reduced to `cardExpiry`, `maskedPan` and `payerEmail` with
    *   non-empty string values; no key when none is left). Every other outcome has `hints: undefined`. With
    *   `config.mandateHints: 'separate'` the returned mandate has no `unverified` key; otherwise (the default,
-   *   'inline') its `unverified` is a copy of `hints`, and absent without hints.
+   *   'inline') its `unverified` is a copy of `hints`, and absent without hints;
+   * - since 2.3.0, a top-level `errorCode` is kept only on an unverified outcome, and only when it is a
+   *   `ProviderErrorCode` (the call could not authenticate to the provider: re-confirm later); a verified outcome,
+   *   and one made unverified because it does not match `pending`, has none. An unverified outcome's first charge
+   *   still carries no `errorCode`.
    *
    * Events are emitted only for terminal outcomes: `mandate.created` (success) or
    * `mandate.setup_failed`, then `charge.*` for the first charge. A non-terminal outcome emits
@@ -932,7 +959,7 @@ export class CheckoutConfigurator {
         firstCharge.status = 'unknown';
         firstCharge.error = firstCharge.error ?? 'Charge outcome could not be verified';
       }
-      return {
+      const unverified: MandateSetupOutcome = {
         ...source,
         success: false,
         verified: false,
@@ -943,6 +970,9 @@ export class CheckoutConfigurator {
         firstCharge,
         error: source.error ?? 'Mandate outcome could not be verified',
       };
+      // Since 2.3.0: the top-level code of a call that could not authenticate, only a ProviderErrorCode
+      if (!PROVIDER_ERROR_CODES.has(unverified.errorCode)) delete unverified.errorCode;
+      return unverified;
     }
 
     const mismatch = (): MandateSetupOutcome => ({
@@ -985,6 +1015,8 @@ export class CheckoutConfigurator {
     };
     // A success without hints has no `hints` key
     if (success && hints === undefined) delete normalized.hints;
+    // Since 2.3.0: a verified outcome is an authenticated answer, never a call that could not authenticate
+    delete normalized.errorCode;
     return normalized;
   }
 
@@ -1060,19 +1092,25 @@ export class CheckoutConfigurator {
     return result;
   }
 
-  /** Re-reads the mandate's usability from the provider (`verified: false` when it cannot). */
+  /**
+   * Re-reads the mandate's usability from the provider (`verified: false` when it cannot). Since 2.3.0 the result keeps
+   * a provider's `errorCode` only when it is a `ProviderErrorCode` on `status: 'unknown'`.
+   */
   async getMandate(providerName: string, mandate: Mandate): Promise<MandateStatusResult> {
     const provider = this.getMandateProvider(providerName);
     this.assertMandate(providerName, mandate);
     const result = await provider.getMandate(mandate);
-    return { ...result, verified: result?.verified === true };
+    const normalized: MandateStatusResult = { ...result, verified: result?.verified === true };
+    if (normalized.status !== 'unknown' || !PROVIDER_ERROR_CODES.has(normalized.errorCode)) delete normalized.errorCode;
+    return normalized;
   }
 
   /**
    * Revokes the mandate at the provider, when the provider supports it, and emits
    * `mandate.revoked` with `data: { mandateRef, revokedAtProvider }` (a throwing listener goes to
    * `config.onListenerError` and never rejects). Mark your own copy revoked whatever the
-   * provider answers.
+   * provider answers. Since 2.3.0 the result keeps a provider's `errorCode` only when it is a `ProviderErrorCode` with
+   * `revokedAtProvider: false`; the event's payload is unchanged.
    */
   async revokeMandate(providerName: string, mandate: Mandate): Promise<MandateRevokeResult> {
     const provider = this.getMandateProvider(providerName);
@@ -1082,6 +1120,7 @@ export class CheckoutConfigurator {
       ...(isObject(providerResult) ? providerResult : {}),
       revokedAtProvider: isObject(providerResult) && providerResult.revokedAtProvider === true,
     };
+    if (result.revokedAtProvider || !PROVIDER_ERROR_CODES.has(result.errorCode)) delete result.errorCode;
     await this.emitMandateEvent(
       'mandate.revoked',
       {

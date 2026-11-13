@@ -306,6 +306,139 @@ describe('PayPalProvider timeoutMs (#45)', () => {
     });
   });
 
+  describe('what the token provider rethrows is a token failure: never classified as an API answer (#53)', () => {
+    const since = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
+
+    /** An SDK error of the token request answered `statusCode` (it carries the request with the Basic credentials). */
+    function tokenError(statusCode: number): Error {
+      // The SDK's OAuthProviderError (400, 401) has an empty message
+      const message = statusCode === 400 || statusCode === 401 ? '' : `Response status code was not ok: ${statusCode}.`;
+      return Object.assign(new Error(message), {
+        name: 'ApiError',
+        statusCode,
+        body: JSON.stringify({ error: 'invalid_client', error_description: 'Client Authentication failed' }),
+        request: { headers: { Authorization: 'Basic SECRET-TOKEN' } },
+      });
+    }
+
+    /** Fails the current client's token request with `error`, as the SDK does: the provider marks it, then rethrows it. */
+    async function failTokenRequest(error: unknown): Promise<void> {
+      const clients = sdk.clients.length;
+      const updateToken = vi.fn(async () => {
+        throw error;
+      });
+      await expect(tokenProviderOf(sdk.clientConfigs[clients - 1])(undefined, { updateToken })).rejects.toBe(error);
+      // The client was replaced (connect() ran): the mark must survive it
+      expect(sdk.clients).toHaveLength(clients + 1);
+    }
+
+    it('a marked 404 from getCapturedPayment is an unknown lookup with errorCode, not a skipped record', async () => {
+      const provider = newProvider({ timeoutMs: 30000 });
+      const marked = tokenError(404);
+      await failTokenRequest(marked);
+      sdk.searchTransactions.mockResolvedValueOnce({
+        result: { transactionDetails: [{ transactionInfo: { transactionId: 'CAP-1', invoiceId: 'SUB-0001-2026-12' } }] },
+      });
+      sdk.getCapturedPayment.mockRejectedValueOnce(marked);
+      const result = await provider.getCharge('SUB-0001-2026-12', { since });
+      expect(result).toEqual({
+        status: 'unknown',
+        verified: false,
+        chargeRef: 'SUB-0001-2026-12',
+        errorCode: 'PROVIDER_AUTH_UNAVAILABLE',
+        error: 'PayPal capture could not be read (HTTP 404)',
+      });
+      expectNoSecret(result);
+
+      // The same 404 not marked (an API answer: not a capture) is still skipped
+      sdk.searchTransactions.mockResolvedValueOnce({
+        result: { transactionDetails: [{ transactionInfo: { transactionId: 'CAP-1', invoiceId: 'SUB-0001-2026-12' } }] },
+      });
+      sdk.getCapturedPayment.mockRejectedValueOnce(tokenError(404));
+      expect(await provider.getCharge('SUB-0001-2026-12', { since })).toEqual({
+        status: 'unknown',
+        verified: false,
+        chargeRef: 'SUB-0001-2026-12',
+        error: 'PayPal lists this invoice_id but no capture was found',
+      });
+    });
+
+    it('a marked 404 is never revoked: getMandate unknown, revokeMandate false, both with errorCode', async () => {
+      const provider = newProvider();
+      const marked = tokenError(404);
+      await failTokenRequest(marked);
+      sdk.getPaymentToken.mockRejectedValueOnce(marked);
+      expect(await provider.getMandate(mandate)).toEqual({
+        status: 'unknown',
+        verified: false,
+        errorCode: 'PROVIDER_AUTH_UNAVAILABLE',
+      });
+      sdk.deletePaymentToken.mockRejectedValueOnce(marked);
+      expect(await provider.revokeMandate(mandate)).toEqual({
+        revokedAtProvider: false,
+        errorCode: 'PROVIDER_AUTH_UNAVAILABLE',
+        error: 'PayPal could not delete the vault token (HTTP 404)',
+      });
+    });
+
+    it('a marked 400 is never a failed charge: unknown, merchant-side, with errorCode; charge.unknown carries it', async () => {
+      const provider = newProvider();
+      const marked = tokenError(400);
+      await failTokenRequest(marked);
+      sdk.createOrder.mockRejectedValueOnce(marked);
+      const { checkout, events } = configured(provider);
+      const result = await checkout.chargeMandate('paypal', mandate, charge);
+      expect(result).toEqual({
+        status: 'unknown',
+        verified: false,
+        chargeRef: 'SUB-0001-2026-12',
+        providerCode: '400',
+        errorCode: 'PROVIDER_AUTH_FAILED',
+        error: 'PayPal refused the request (HTTP 400)',
+      });
+      expect(events.map((e) => e.name)).toEqual(['charge.unknown']);
+      expect((events[0].payload as { data: { errorCode?: string } }).data.errorCode).toBe('PROVIDER_AUTH_FAILED');
+      expectNoSecret(result);
+      expectNoSecret(events);
+    });
+
+    it("a marked refusal of the refund call is 'REFUND_FAILED': nothing was sent", async () => {
+      const provider = newProvider();
+      sdk.getOrder.mockResolvedValueOnce({ result: capturedOrder });
+      const marked = tokenError(401);
+      await failTokenRequest(marked);
+      sdk.refundCapturedPayment.mockRejectedValueOnce(marked);
+      expect(await provider.refundPayment('PAYPAL-ORD-2', 5)).toEqual({
+        success: false,
+        paymentId: 'PAYPAL-ORD-2',
+        status: 'REFUND_FAILED',
+        errorCode: 'PROVIDER_AUTH_FAILED',
+        error: 'PayPal authentication failed (HTTP 401)',
+      });
+    });
+
+    it('a non-object rejection of the token request is wrapped in an Error, then marked', async () => {
+      const provider = newProvider();
+      const config = sdk.clientConfigs[0];
+      let thrown: unknown;
+      await tokenProviderOf(config)(undefined, {
+        updateToken: async () => {
+          throw 'token service down';
+        },
+      }).catch((err: unknown) => {
+        thrown = err;
+      });
+      expect(thrown).toBeInstanceOf(Error);
+      expect((thrown as Error).message).toBe('PayPal access token unavailable');
+      sdk.getOrder.mockRejectedValueOnce(thrown);
+      expect(await provider.getPaymentDetails('PAYPAL-ORD-2')).toEqual({
+        success: false,
+        errorCode: 'PROVIDER_AUTH_UNAVAILABLE',
+        error: 'PayPal access token unavailable',
+      });
+    });
+  });
+
   describe('a call that times out fails like a network error, with no SDK error in results or events', () => {
     let provider: PayPalProvider;
 

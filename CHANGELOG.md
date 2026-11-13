@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.2.0] - Unreleased
+## [2.2.0] - 2026-11-13
+
+Recurring-payment follow-ups: a read-only charge lookup (`getCharge`) with the refunded amount, the structured state of a refunded or partly captured Nexi replay, a stable `AMOUNT_MISMATCH` error code, refund idempotency keys with a checked Satispay refund, an opt-in PayPal `timeoutMs`, and payment-method hints kept out of the persisted `Mandate` (`Mandate.unverified` is deprecated). The new APIs are additive or opt-in; the behaviour changes are under Changed and Fixed, and the `RefundOptions` entry under Added states a compile-time caveat for custom providers. Resolves #40, #41, #42, #43, #44, #45 and #46.
 
 ### Added
 - **Charge lookup** (read-only): `CheckoutConfigurator.getCharge(provider, chargeRef, options?)` answers "did money move for this `chargeRef`?" for an `unknown` charge that may not be retried, telling an authenticated "no transaction" (`absent`) apart from a lookup that failed (`unknown`). It never charges, never refunds, emits no event and is not a route. It validates first without calling the provider (`INVALID_MANDATE_REQUEST`: `chargeRef` against `CHARGE_REF_PATTERN`, `options.since` / `options.until` with a finite `Date.parse` and `until >= since`, `options.mandate` of this provider) and normalizes fail closed into a new object (only an exactly `verified: true` answer is `succeeded`, `failed`, `pending` or `absent`; an `unknown` one is never verified and carries no payment facts; `chargeRef` is the request's; a provider that throws gives `unknown` with `raw` reduced to `{ name, message }`). Resolves #40.

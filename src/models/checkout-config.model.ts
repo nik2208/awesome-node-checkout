@@ -26,4 +26,16 @@ export interface CheckoutConfig {
    * caller.
    */
   onListenerError?: (err: unknown, event: CheckoutEventName) => void | Promise<void>;
+
+  /**
+   * Since 2.2.0. Where `confirmMandate` returns the unsigned payment-method hints (`MandateHints`: masked PAN, card
+   * expiry, payer email):
+   * - 'inline' (default, the 2.1 placement): in `outcome.hints` and, deprecated, in `outcome.mandate.unverified`;
+   * - 'separate': only in `outcome.hints`; `outcome.mandate` has no `unverified` key, so it can be persisted verbatim
+   *   without personal data.
+   * Any other value behaves as 'inline'. Planned for 3.0.0: 'separate' becomes the only behaviour, and
+   * `Mandate.unverified` is removed.
+   * @default 'inline'
+   */
+  mandateHints?: 'inline' | 'separate';
 }

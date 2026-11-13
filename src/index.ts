@@ -19,6 +19,7 @@ export type {
   MandateSetupStart,
   MandateStatus,
   Mandate,
+  MandateHints,
   ChargeStatus,
   ChargeRequest,
   ChargeResult,

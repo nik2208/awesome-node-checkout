@@ -70,7 +70,23 @@ export interface MandateSetupStart {
 
 export type MandateStatus = 'active' | 'revoked';
 
-/** Persist verbatim; pass back to chargeMandate / getMandate / revokeMandate. JSON-serializable. */
+/**
+ * Since 2.2.0. Unsigned payment-method hints from a setup (masked PAN, card expiry, payer email). Personal data.
+ * Never use them for authorization decisions. The library never reads them back.
+ */
+export interface MandateHints {
+  /** Nexi `scadenza_pan`, when it is 6 digits (e.g. `203012`). */
+  cardExpiry?: string;
+  /** Nexi `pan`, masked (e.g. `453997******0006`), when well-formed. */
+  maskedPan?: string;
+  /** PayPal payer email, when PayPal reports one. */
+  payerEmail?: string;
+}
+
+/**
+ * Persist verbatim; pass back to chargeMandate / getMandate / revokeMandate. JSON-serializable. Since 2.2.0, with
+ * `CheckoutConfig.mandateHints: 'separate'` it carries none of the unsigned hints (`MandateHints`).
+ */
 export interface Mandate {
   provider: string;
   mandateRef: string;
@@ -84,8 +100,13 @@ export interface Mandate {
   createdAt: string;
   /** Provider-specific extra the provider needs at charge time (e.g. PayPal customer id). Never secrets. */
   providerData?: Record<string, string>;
-  /** Hints from unsigned fields. Never use for authorization decisions. */
-  unverified?: { cardExpiry?: string; maskedPan?: string; payerEmail?: string };
+  /**
+   * Hints from unsigned fields. Never use for authorization decisions.
+   * @deprecated Since 2.2.0: read `MandateSetupOutcome.hints`. With `CheckoutConfig.mandateHints: 'separate'` this
+   * key is never set. To be removed from `Mandate` in 3.0.0. A mandate persisted without it charges, reads and
+   * revokes exactly the same.
+   */
+  unverified?: MandateHints;
 }
 
 /**
@@ -221,6 +242,11 @@ export interface MandateSetupOutcome {
    */
   terminal: boolean;
   mandate?: Mandate;
+  /**
+   * Since 2.2.0. The unsigned payment-method hints of the setup. Only on a verified outcome with `success: true`, and
+   * only when there is at least one. Not part of the mandate: persist the mandate without it.
+   */
+  hints?: MandateHints;
   /**
    * The first charge (`chargeRef = orderId`). It can be `unknown` on a terminal outcome, even with
    * `success: true` (e.g. a PayPal capture still `PENDING`, a Satispay first payment that timed

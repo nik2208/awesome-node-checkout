@@ -7,6 +7,7 @@ import { CheckoutConfigurator } from '../../checkout-configurator';
 import { CheckoutEventName, CheckoutEventPayload } from '../../events/checkout-event-bus';
 import { isMandateProvider } from '../../interfaces/mandate-provider.interface';
 import { createCheckoutRouter } from '../../adapters/express';
+import type { CheckoutConfig } from '../../models/checkout-config.model';
 import { Mandate, MandatePendingState, MandateSetupRequest } from '../../models/mandate.model';
 
 // Recurring payments (mandates) on Nexi XPay, issue #31.
@@ -1003,6 +1004,111 @@ describe('NexiProvider mandates (#31)', () => {
 
       fetchMock().mockResolvedValueOnce(jsonResponse({ ...OK_RESP, contratti: [] }));
       expect(await provider.getMandate(mandate())).toMatchObject({ status: 'unknown', verified: false });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // #46 — unsigned payment-method hints out of the persisted Mandate
+  // ---------------------------------------------------------------------------
+  describe('payment-method hints through the configurator (#46)', () => {
+    // `pan` and `scadenza_pan` are not covered by the outcome MAC
+    const callback = () => ({ query: { ...okOutcome(), pan: '453997******0006' } });
+
+    async function confirmThrough(config?: CheckoutConfig) {
+      const checkout = new CheckoutConfigurator(config).registerProvider(new NexiProvider(baseConfig));
+      return checkout.confirmMandate('nexi', pendingState(), callback());
+    }
+
+    it('default config: outcome.hints, and outcome.mandate.unverified deep-equal to it (the 2.1 placement)', async () => {
+      const outcome = await confirmThrough();
+      expect(outcome).toMatchObject({ success: true, verified: true, terminal: true });
+      expect(outcome.hints).toStrictEqual({ cardExpiry: '203012', maskedPan: '453997******0006' });
+      expect(outcome.mandate!.unverified).toStrictEqual({ cardExpiry: '203012', maskedPan: '453997******0006' });
+    });
+
+    it("{ mandateHints: 'separate' }: the same outcome.hints, and a mandate without card data", async () => {
+      const outcome = await confirmThrough({ mandateHints: 'separate' });
+      expect(outcome).toMatchObject({ success: true, verified: true, terminal: true });
+      expect(outcome.hints).toStrictEqual({ cardExpiry: '203012', maskedPan: '453997******0006' });
+      expect('unverified' in outcome.mandate!).toBe(false);
+      expect(JSON.stringify(outcome.mandate)).not.toContain('453997');
+      expect(JSON.stringify(outcome.mandate)).not.toContain('203012');
+      expect(outcome.mandate).toStrictEqual({
+        provider: 'nexi',
+        mandateRef: 'MNDT0000000001',
+        providerMandateId: 'MNDT0000000001',
+        status: 'active',
+        createdAt: new Date(NOW).toISOString(),
+      });
+      // Out of scope: `raw` still holds the unfiltered callback fields (never persist or log it)
+      expect((outcome.raw as Record<string, string>).pan).toBe('453997******0006');
+      expect((outcome.raw as Record<string, string>).scadenza_pan).toBe('203012');
+    });
+
+    it('malformed pan and scadenza_pan give no hints and no unverified, in either mode', async () => {
+      for (const config of [{}, { mandateHints: 'separate' }] as CheckoutConfig[]) {
+        const checkout = new CheckoutConfigurator(config).registerProvider(new NexiProvider(baseConfig));
+        const outcome = await checkout.confirmMandate('nexi', pendingState(), {
+          query: { ...okOutcome(), pan: '<script>', scadenza_pan: '2030-12' },
+        });
+        expect(outcome.success).toBe(true);
+        expect(outcome.hints).toBeUndefined();
+        expect('unverified' in outcome.mandate!).toBe(false);
+      }
+    });
+
+    it('a separate-mode mandate, JSON round-tripped, charges, reads and revokes with the requests of the 2.1-shaped one', async () => {
+      const persisted = async (config: CheckoutConfig) =>
+        JSON.parse(JSON.stringify((await confirmThrough(config)).mandate)) as Mandate;
+      const separate = await persisted({ mandateHints: 'separate' });
+      const legacy = await persisted({}); // what 2.1 returned and apps persisted: it still has unverified
+      expect('unverified' in separate).toBe(false);
+      expect(legacy.unverified).toStrictEqual({ cardExpiry: '203012', maskedPan: '453997******0006' });
+
+      /** The provider requests of chargeMandate, getMandate and revokeMandate on a fresh configurator. */
+      const requests = async (persistedMandate: Mandate) => {
+        fetchMock().mockReset();
+        fetchMock()
+          .mockResolvedValueOnce(jsonResponse({ ...OK_RESP, report: [] }))
+          .mockResolvedValueOnce(jsonResponse({ ...OK_RESP, codiceAutorizzazione: 'X1' }))
+          .mockResolvedValueOnce(
+            jsonResponse({ ...OK_RESP, contratti: [{ numeroContratto: 'MNDT0000000001', statoPrimoPag: 'OK' }] }),
+          )
+          .mockResolvedValueOnce(jsonResponse(OK_RESP));
+        const checkout = new CheckoutConfigurator().registerProvider(new NexiProvider(baseConfig));
+        const charged = await checkout.chargeMandate('nexi', persistedMandate, {
+          chargeRef: CHARGE_REF,
+          amount: 19.9,
+          currency: 'EUR',
+        });
+        expect(charged).toMatchObject({ status: 'succeeded', verified: true, chargeRef: 'SUB-0001-2026-12' });
+        expect(await checkout.getMandate('nexi', persistedMandate)).toMatchObject({ status: 'active', verified: true });
+        expect((await checkout.revokeMandate('nexi', persistedMandate)).revokedAtProvider).toBe(true);
+        return fetchMock().mock.calls.map(([url, init]) => ({
+          url: String(url),
+          body: JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>,
+        }));
+      };
+
+      const sent = await requests(separate);
+      expect(sent.map((r) => r.url)).toEqual([
+        'https://int-ecommerce.nexi.it/ecomm/api/bo/situazioneOrdine',
+        'https://int-ecommerce.nexi.it/ecomm/api/recurring/pagamentoRicorrente',
+        'https://int-ecommerce.nexi.it/ecomm/api/contratti/dettagliContratto',
+        'https://int-ecommerce.nexi.it/ecomm/api/contratti/cancellaContratto',
+      ]);
+      expect(sent[1].body).toStrictEqual({
+        apiKey: 'ALIAS_TEST_01',
+        numeroContratto: 'MNDT0000000001',
+        codiceTransazione: 'SUB-0001-2026-12',
+        importo: '1990',
+        divisa: '978',
+        timeStamp: '1767225600000',
+        mac: 'c7f22774f25738eb5283df704e658ba98ba0a9e5',
+      });
+      expect(sent[2].body.mac).toBe('69237bb9072ccbae03137a7b7e5ef5def8a00055');
+      expect(sent[3].body.mac).toBe('ef8699b39d42f5e2cacd6b5b13b0f319b281f330');
+      expect(await requests(legacy)).toStrictEqual(sent);
     });
   });
 

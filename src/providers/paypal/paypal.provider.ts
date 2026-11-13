@@ -930,9 +930,9 @@ export class PayPalProvider
    * `unknown` too: the original may still take the money, so they are never a final `failed`.
    *
    * Since 2.3.0 (#53), a failed OAuth token request is never a `failed` charge: the order was not sent, so a 4xx of
-   * the token endpoint is the merchant-side `unknown` of a 401 (`providerCode` the status, 'PayPal refused the request
-   * (HTTP n)'), and every token failure and API 401 carries its `errorCode`. Retry with the same `chargeRef`: an
-   * earlier attempt with it may have charged.
+   * the token endpoint where 2.2.0 gave `failed` takes the merchant-side `unknown` of a 401 (`providerCode` the status,
+   * 'PayPal refused the request (HTTP n)'), a token 408 or 409 stays the `unknown` above, and every token failure and
+   * API 401 carries its `errorCode`. Retry with the same `chargeRef`: an earlier attempt with it may have charged.
    */
   async chargeMandate(mandate: Mandate, charge: ChargeRequest): Promise<ChargeResult> {
     const chargeRef = charge.chargeRef;

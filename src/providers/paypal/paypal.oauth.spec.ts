@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import crypto from 'node:crypto';
 import http from 'node:http';
+import https from 'node:https';
 import type { AddressInfo } from 'node:net';
+import type { Duplex } from 'node:stream';
+import tls from 'node:tls';
 import { PayPalProvider, PayPalProviderConfig } from './paypal.provider';
 import { CheckoutConfigurator } from '../../checkout-configurator';
 import type { CheckoutEventName, CheckoutEventPayload } from '../../events/checkout-event-bus';
@@ -16,13 +20,21 @@ import type { ProviderErrorCode } from '../../models/payment-result.model';
 // Since 2.3.0 (#53) such a failure, and an API call answered 401, carry a stable `errorCode`, and a failed token
 // request is never reported as PayPal's answer to the API call it never sent.
 //
-// A local fake PayPal answers instead of api-m.sandbox.paypal.com: axios sends every request, in clear text and
-// with its absolute URL, to the proxy named by `https_proxy`, so nothing leaves the machine, and every test
-// checks the requests the fake received.
+// A local fake PayPal answers instead of api-m.sandbox.paypal.com, as the proxy named by `https_proxy`, so nothing
+// leaves the machine, and every test checks the requests the fake received. axios reaches that proxy in one of two
+// ways, depending on its version, and the fake gives both the same answers:
+// - up to 1.16.0 (the lockfile has 1.15.0) it sends each request to the proxy in clear text, with its absolute URL;
+// - since 1.16.1 (a fresh install resolved 1.21.1 in November 2026) it opens a CONNECT tunnel to
+//   api-m.sandbox.paypal.com:443 and speaks TLS inside it. The fake accepts no other tunnel, and terminates that TLS
+//   itself with a throwaway certificate made at startup, the only one this test process then trusts.
+// The fake never opens a connection of its own. The first describe block checks both ways with any axios version.
 
 type TokenStep = 'hang' | 'reset' | number;
 
 const PROXY_ENV = ['https_proxy', 'HTTPS_PROXY', 'http_proxy', 'HTTP_PROXY', 'all_proxy', 'ALL_PROXY', 'no_proxy', 'NO_PROXY'];
+
+/** The only host the fake answers for: the base URL of the SDK's sandbox environment. */
+const PAYPAL_HOST = 'api-m.sandbox.paypal.com';
 
 const CLIENT_ID = 'CLIENT-ID-0001';
 const CLIENT_SECRET = 'CLIENT-SECRET-0001';
@@ -37,13 +49,22 @@ const AUTHENTICATION_FAILURE = {
 };
 
 const fake = {
+  /** The proxy named by `https_proxy`: it answers forwarded requests, and accepts CONNECT tunnels to PAYPAL_HOST. */
   server: undefined as http.Server | undefined,
+  port: 0,
+  /** Never listens: it terminates the TLS inside each tunnel the proxy accepts, and answers like the proxy. */
+  tls: undefined as https.Server | undefined,
+  /** The sockets of the tunnels: `server.closeAllConnections()` does not close them, and `server.close()` waits. */
+  tunnels: new Set<Duplex>(),
   /** Answers of the successive token requests; the last one repeats. */
   tokenPlan: [] as TokenStep[],
   tokenRequests: 0,
   /** Since 2.3.0 (#53): every API request (not the token request) answers 401 AUTHENTICATION_FAILURE. */
   apiUnauthorized: false,
-  /** `METHOD /path` of every request received. */
+  /**
+   * `METHOD /path` of every request received, forwarded or tunnelled. A request for another host, and a CONNECT the
+   * fake refused, are recorded with their target, so no test that checks this list can miss them.
+   */
   requests: [] as string[],
 };
 
@@ -70,7 +91,13 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
 }
 
 function answer(req: http.IncomingMessage, res: http.ServerResponse): void {
-  const url = new URL(req.url ?? '/', 'https://api-m.sandbox.paypal.com');
+  // A forwarded request carries its absolute URL, a tunnelled one only its path
+  const url = new URL(req.url ?? '/', `https://${PAYPAL_HOST}`);
+  if (url.host !== PAYPAL_HOST) {
+    fake.requests.push(`${req.method} ${url.href}`);
+    json(res, 403, { name: 'NOT_PAYPAL', message: 'The fake answers for the PayPal sandbox only.' });
+    return;
+  }
   fake.requests.push(`${req.method} ${url.pathname}`);
   if (req.method === 'POST' && url.pathname === '/v1/oauth2/token') {
     const step = fake.tokenPlan[Math.min(fake.tokenRequests++, fake.tokenPlan.length - 1)];
@@ -100,6 +127,87 @@ function answer(req: http.IncomingMessage, res: http.ServerResponse): void {
   }
   json(res, 404, { name: 'RESOURCE_NOT_FOUND', message: 'The specified resource does not exist.' });
 }
+
+/** DER (ITU-T X.690): a tag, the length of the content, the content. */
+function der(tag: number, ...content: Buffer[]): Buffer {
+  const body = Buffer.concat(content);
+  const n = body.length;
+  const length = n < 0x80 ? [n] : n < 0x100 ? [0x81, n] : [0x82, n >> 8, n & 0xff];
+  return Buffer.concat([Buffer.from([tag, ...length]), body]);
+}
+
+/** A DER OBJECT IDENTIFIER. */
+function oid(dotted: string): Buffer {
+  const [first, second, ...rest] = dotted.split('.').map(Number);
+  const bytes = [40 * first + second];
+  for (const arc of rest) {
+    const groups = [arc & 0x7f];
+    for (let high = arc >>> 7; high > 0; high >>>= 7) groups.unshift((high & 0x7f) | 0x80);
+    bytes.push(...groups);
+  }
+  return der(0x06, Buffer.from(bytes));
+}
+
+/** A DER UTCTime, `YYMMDDHHMMSSZ`. */
+const utcTime = (date: Date): Buffer =>
+  der(0x17, Buffer.from(`${date.toISOString().replace(/[-:T]/g, '').slice(2, 14)}Z`));
+
+/**
+ * A self-signed X.509 v3 certificate for `host` (ECDSA P-256 with SHA-256, valid for a day), made with node:crypto
+ * alone: no openssl, and no key in the repository.
+ */
+function throwawayCertificate(host: string): { key: string; cert: string } {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const ecdsaWithSha256 = der(0x30, oid('1.2.840.10045.4.3.2'));
+  const name = der(0x30, der(0x31, der(0x30, oid('2.5.4.3'), der(0x0c, Buffer.from(host))))); // CN=<host>
+  const now = Date.now();
+  const tbs = der(
+    0x30,
+    der(0xa0, der(0x02, Buffer.from([2]))), // version: v3
+    der(0x02, Buffer.from([1])), // serial number
+    ecdsaWithSha256,
+    name, // issuer
+    der(0x30, utcTime(new Date(now - 3_600_000)), utcTime(new Date(now + 86_400_000))),
+    name, // subject
+    publicKey.export({ type: 'spki', format: 'der' }),
+    // subjectAltName, dNSName <host>: the name TLS checks
+    der(0xa3, der(0x30, der(0x30, oid('2.5.29.17'), der(0x04, der(0x30, der(0x82, Buffer.from(host))))))),
+  );
+  const signature = der(0x03, Buffer.from([0]), crypto.sign('sha256', tbs, privateKey));
+  const base64 = der(0x30, tbs, ecdsaWithSha256, signature).toString('base64');
+  return {
+    key: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+    cert: `-----BEGIN CERTIFICATE-----\n${(base64.match(/.{1,64}/g) ?? []).join('\n')}\n-----END CERTIFICATE-----\n`,
+  };
+}
+
+/**
+ * A CONNECT (axios since 1.16.1): a tunnel to PAYPAL_HOST:443 is handed to `fake.tls`, which answers inside it; any
+ * other target is refused, and recorded.
+ */
+function tunnel(req: http.IncomingMessage, socket: Duplex, head: Buffer): void {
+  fake.tunnels.add(socket);
+  socket.once('close', () => fake.tunnels.delete(socket));
+  // A tunnel that the client aborts (a timeout) or the fake resets must not fail the run with an unhandled error
+  socket.on('error', () => undefined);
+  if (req.url !== `${PAYPAL_HOST}:443`) {
+    fake.requests.push(`CONNECT ${req.url}`);
+    socket.end('HTTP/1.1 403 Forbidden\r\nconnection: close\r\ncontent-length: 0\r\n\r\n');
+    return;
+  }
+  socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+  if (head.length > 0) socket.unshift(head);
+  fake.tls?.emit('connection', socket);
+}
+
+/** Closes every tunnel still open: a token request left hanging, or a TLS connection the client kept. */
+function closeTunnels(): void {
+  for (const socket of fake.tunnels) socket.destroy();
+  fake.tunnels.clear();
+}
+
+/** Undoes the trust that beforeAll gives the throwaway certificate. */
+let restoreTrust: () => void = () => undefined;
 
 const mandate: Mandate = {
   provider: 'paypal',
@@ -183,13 +291,33 @@ const ALL_EVENTS: CheckoutEventName[] = [
 const savedEnv: Record<string, string | undefined> = {};
 
 beforeAll(async () => {
+  const { key, cert } = throwawayCertificate(PAYPAL_HOST);
+  fake.tls = https.createServer({ key, cert }, answer);
+  // This test process trusts that certificate and no other, so a tunnel can only ever reach the fake: as the default
+  // CA list, used by every TLS connection that names no CA of its own, where this Node can set it (since 22.19 on
+  // the 22 line; Node 24.15 has it); otherwise as the CA of https.globalAgent, which axios gives the TLS inside its
+  // tunnels since 1.21.0
+  if (typeof tls.setDefaultCACertificates === 'function') {
+    const defaults = tls.getCACertificates('default');
+    tls.setDefaultCACertificates([cert]);
+    restoreTrust = () => tls.setDefaultCACertificates(defaults);
+  } else {
+    const { ca } = https.globalAgent.options;
+    https.globalAgent.options.ca = cert;
+    restoreTrust = () => {
+      if (ca === undefined) delete https.globalAgent.options.ca;
+      else https.globalAgent.options.ca = ca;
+    };
+  }
   const server = http.createServer(answer);
+  server.on('connect', tunnel);
   fake.server = server;
   // On the wildcard address, like the supertest servers of the other spec files (which connect to 127.0.0.1): with
   // BSD socket semantics (macOS) a listener on 127.0.0.1:P shadows a wildcard listener that another process gets on
   // the same ephemeral port P, so a supertest request could reach this fake; two wildcard listeners never share one
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const { port } = server.address() as AddressInfo;
+  fake.port = port;
   for (const key of PROXY_ENV) {
     savedEnv[key] = process.env[key];
     delete process.env[key];
@@ -202,9 +330,11 @@ afterAll(async () => {
     if (savedEnv[key] === undefined) delete process.env[key];
     else process.env[key] = savedEnv[key];
   }
+  restoreTrust();
   const server = fake.server;
   if (server) {
     server.closeAllConnections();
+    closeTunnels();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
@@ -222,6 +352,87 @@ afterEach(() => {
   vi.restoreAllMocks();
   // Drops the token request left hanging, and the SDK's idle connections
   fake.server?.closeAllConnections();
+  closeTunnels();
+});
+
+interface Reply {
+  status: number;
+  body: unknown;
+}
+
+function reply(res: http.IncomingMessage): Promise<Reply> {
+  return new Promise((resolve, reject) => {
+    let text = '';
+    res.setEncoding('utf8');
+    res.on('data', (chunk: string) => {
+      text += chunk;
+    });
+    res.on('end', () => resolve({ status: res.statusCode ?? 0, body: text === '' ? undefined : JSON.parse(text) }));
+    res.on('error', reject);
+  });
+}
+
+/** A request as axios up to 1.16.0 sends it through `https_proxy`: in clear text, with its absolute URL. */
+function forwarded(method: string, url: string): Promise<Reply> {
+  const { host, href } = new URL(url);
+  return new Promise((resolve, reject) => {
+    http
+      .request({ host: '127.0.0.1', port: fake.port, method, path: href, headers: { host } }, (res) => resolve(reply(res)))
+      .on('error', reject)
+      .end();
+  });
+}
+
+/**
+ * A request as axios since 1.16.1 sends it: a CONNECT tunnel to `target`, then TLS to PAYPAL_HOST inside it, with the
+ * CA that axios 1.21 takes from https.globalAgent (none when the default CA list holds the certificate).
+ */
+function tunnelled(method: string, path: string, target = `${PAYPAL_HOST}:443`): Promise<Reply> {
+  return new Promise((resolve, reject) => {
+    http
+      .request({ host: '127.0.0.1', port: fake.port, method: 'CONNECT', path: target })
+      .on('connect', (res, socket) => {
+        if (res.statusCode !== 200) {
+          socket.destroy();
+          resolve({ status: res.statusCode ?? 0, body: undefined });
+          return;
+        }
+        const secure = tls.connect({ ca: https.globalAgent.options.ca, socket, servername: PAYPAL_HOST });
+        http
+          .request({ host: PAYPAL_HOST, method, path, createConnection: () => secure }, (r) => resolve(reply(r)))
+          .on('error', reject)
+          .end();
+      })
+      .on('error', reject)
+      .end();
+  });
+}
+
+describe('the fake PayPal (harness): both ways axios reaches https_proxy, whichever version is installed', () => {
+  it('answers inside a CONNECT tunnel to PayPal as it answers a forwarded request', async () => {
+    fake.tokenPlan = [400, 200];
+    const refused = await tunnelled('POST', '/v1/oauth2/token');
+    expect(refused).toEqual({ status: 400, body: INVALID_CLIENT });
+    expect(await forwarded('POST', `https://${PAYPAL_HOST}/v1/oauth2/token`)).toMatchObject({ status: 200 });
+
+    fake.apiUnauthorized = true;
+    const viaTunnel = await tunnelled('GET', '/v2/checkout/orders/ORD-1');
+    const viaProxy = await forwarded('GET', `https://${PAYPAL_HOST}/v2/checkout/orders/ORD-1`);
+    expect(viaTunnel).toEqual({ status: 401, body: AUTHENTICATION_FAILURE });
+    expect(viaProxy).toEqual(viaTunnel);
+    expect(fake.requests).toEqual([TOKEN, TOKEN, READ, READ]);
+  });
+
+  it('refuses a tunnel or a request for any other host, and records it', async () => {
+    expect(await tunnelled('GET', '/', 'example.com:443')).toEqual({ status: 403, body: undefined });
+    expect(await tunnelled('GET', '/', `${PAYPAL_HOST}:80`)).toEqual({ status: 403, body: undefined });
+    expect(await forwarded('GET', 'https://example.com/')).toMatchObject({ status: 403 });
+    expect(fake.requests).toEqual([
+      'CONNECT example.com:443',
+      `CONNECT ${PAYPAL_HOST}:80`,
+      'GET https://example.com/',
+    ]);
+  });
 });
 
 describe('PayPalProvider after a failed OAuth token request (real SDK, #45)', () => {
@@ -713,4 +924,38 @@ describe('PayPal API 401 once a token is held (#53, real SDK)', () => {
     // The SDK keeps its token after an API 401 (requesting a new one is out of scope)
     expect(fake.requests).toEqual([TOKEN, READ, READ]);
   });
+});
+
+describe('PayPal token 408 and 409 on chargeMandate (#53, real SDK)', () => {
+  it.each([408, 409])(
+    "token %i: the 2.2.0 unknown of a 408 or 409 ('PayPal charge outcome unknown'), plus its errorCode, never failed",
+    async (status) => {
+      fake.tokenPlan = [status];
+      const provider = newProvider();
+      const checkout = new CheckoutConfigurator().registerProvider(provider);
+      const events: CheckoutEventName[] = [];
+      for (const name of ALL_EVENTS) {
+        checkout.events.on(name, () => {
+          events.push(name);
+        });
+      }
+      const expected = {
+        status: 'unknown',
+        verified: false,
+        chargeRef: 'SUB-0001-2026-12',
+        providerCode: String(status),
+        error: `PayPal charge outcome unknown (HTTP ${status})`,
+        errorCode: 'PROVIDER_AUTH_UNAVAILABLE',
+      };
+      const direct = await provider.chargeMandate(mandate, charge);
+      const through = await checkout.chargeMandate('paypal', mandate, charge);
+      for (const result of [direct, through]) {
+        expect(result).toEqual(expected);
+        expectNoCredentials(result);
+      }
+      expect(events).toEqual(['charge.unknown']);
+      // Only token requests: no order was sent
+      expect(fake.requests).toEqual([TOKEN, TOKEN]);
+    },
+  );
 });

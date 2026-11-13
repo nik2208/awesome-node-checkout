@@ -665,6 +665,14 @@ describe('NexiProvider mandates (#31)', () => {
         expect(result.verified).toBe(true);
         expect(result.providerPaymentId).toBe('SUB-0001-2026-12');
         expect(result.raw).toEqual({ stato });
+        // 2.2.0 (#42): the structured state, next to the unchanged raw.stato
+        const expected: Record<string, [string, string]> = {
+          Rimborsato: ['refunded', 'Rimborsato'],
+          'Rimborsato Parz.': ['partially_refunded', 'Rimborsato Parz.'],
+          'Contabilizzato Parz.': ['partially_captured', 'Contabilizzato Parz.'],
+        };
+        expect(result.providerState).toBe(expected[stato][0]);
+        expect(result.providerStatus).toBe(expected[stato][1]);
         expect(fetchMock()).toHaveBeenCalledTimes(1);
       },
     );
@@ -777,6 +785,70 @@ describe('NexiProvider mandates (#31)', () => {
       const max = await provider.chargeMandate(mandate(), { ...charge, amount: 999999.99 });
       expect(callBody(1).importo).toBe('99999999');
       expect(max.status).toBe('succeeded');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 2.2.0 (#42) — structured replay state: providerState / providerStatus
+  // ---------------------------------------------------------------------------
+  describe('chargeMandate, structured replay state (#42)', () => {
+    const charge = { chargeRef: CHARGE_REF, amount: 19.9, currency: 'EUR' };
+    const emptyLookup = () => jsonResponse({ ...OK_RESP, report: [] });
+    const ko = (codice: number, messaggio = 'error') => jsonResponse({ esito: 'KO', errore: { codice, messaggio } });
+
+    it("stato ' rimborsato parz. ' is trimmed in providerStatus, and raw.stato stays verbatim", async () => {
+      fetchMock().mockResolvedValueOnce(
+        jsonResponse({ ...OK_RESP, report: [{ ...PAID_ENTRY, stato: ' rimborsato parz. ' }] }),
+      );
+      const result = await provider.chargeMandate(mandate(), charge);
+      expect(result.status).toBe('succeeded');
+      expect(result.providerState).toBe('partially_refunded');
+      expect(result.providerStatus).toBe('rimborsato parz.');
+      expect(result.raw).toEqual({ stato: ' rimborsato parz. ' });
+    });
+
+    it("a replay of Autorizzato has providerStatus 'Autorizzato' and no providerState", async () => {
+      fetchMock().mockResolvedValueOnce(jsonResponse({ ...OK_RESP, report: [PAID_ENTRY] }));
+      const result = await provider.chargeMandate(mandate(), charge);
+      expect(result.status).toBe('succeeded');
+      expect(result.providerStatus).toBe('Autorizzato');
+      expect('providerState' in result).toBe(false);
+      expect(result.raw).toEqual({ stato: 'Autorizzato' });
+    });
+
+    it('a direct pagamentoRicorrente OK sets neither field', async () => {
+      fetchMock()
+        .mockResolvedValueOnce(emptyLookup())
+        .mockResolvedValueOnce(jsonResponse({ ...OK_RESP, codiceAutorizzazione: 'X1' }));
+      const result = await provider.chargeMandate(mandate(), charge);
+      expect(result.status).toBe('succeeded');
+      expect('providerState' in result).toBe(false);
+      expect('providerStatus' in result).toBe(false);
+    });
+
+    it("KO 9 re-read: an empty first lookup, KO 9, then a re-read 'Rimborsato' is succeeded and refunded", async () => {
+      fetchMock()
+        .mockResolvedValueOnce(emptyLookup())
+        .mockResolvedValueOnce(ko(9))
+        .mockResolvedValueOnce(jsonResponse({ ...OK_RESP, report: [{ ...PAID_ENTRY, stato: 'Rimborsato' }] }));
+      const result = await provider.chargeMandate(mandate(), charge);
+      expect(fetchMock()).toHaveBeenCalledTimes(3);
+      expect(result.status).toBe('succeeded');
+      expect(result.verified).toBe(true);
+      expect(result.providerState).toBe('refunded');
+      expect(result.providerStatus).toBe('Rimborsato');
+      expect(result.raw).toEqual({ stato: 'Rimborsato' });
+    });
+
+    it('refused and in-progress replays set neither field', async () => {
+      for (const stato of ['Negato', 'In Corso']) {
+        fetchMock().mockReset();
+        fetchMock().mockResolvedValueOnce(jsonResponse({ ...OK_RESP, report: [{ ...PAID_ENTRY, stato }] }));
+        const result = await provider.chargeMandate(mandate(), charge);
+        expect(result.status).not.toBe('succeeded');
+        expect('providerState' in result).toBe(false);
+        expect('providerStatus' in result).toBe(false);
+      }
     });
   });
 

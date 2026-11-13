@@ -122,6 +122,74 @@ export interface ChargeResult {
   error?: string;
   /** Provider decline/error code when available. */
   providerCode?: string;
+  /**
+   * Since 2.2.0. The charge took money, but the provider now reports it refunded or only partly captured. Do not treat
+   * such a charge as paid (do not extend a subscription on it). Only on verified results.
+   */
+  providerState?: ChargeProviderState;
+  /** Since 2.2.0. The provider's own status for the charge, trimmed (Nexi `stato`), when it reported one. Only on verified results. */
+  providerStatus?: string;
+  raw?: unknown;
+}
+
+/**
+ * Since 2.2.0. What the provider reports about money it took for a charge, when it is more than "paid":
+ * - 'refunded': taken, then refunded in full (Nexi `Rimborsato`, PayPal capture `REFUNDED`);
+ * - 'partially_refunded': taken, then refunded in part (Nexi `Rimborsato Parz.`, PayPal `PARTIALLY_REFUNDED`);
+ * - 'partially_captured': only part of the authorized amount was captured (Nexi `Contabilizzato Parz.`).
+ */
+export type ChargeProviderState = 'refunded' | 'partially_refunded' | 'partially_captured';
+
+/**
+ * Since 2.2.0. Status of a read-only charge lookup (`getCharge`):
+ * - 'succeeded': money was taken for `chargeRef` (it may have been refunded since: see `providerState`);
+ * - 'failed': the provider holds `chargeRef` and every attempt was refused: no money was taken;
+ * - 'pending': an attempt exists that is not final (Nexi `In Corso` or an unrecognised `stato`, a PayPal capture
+ *   `PENDING`): it may still take money;
+ * - 'absent': the provider reports, authenticated, that it holds no transaction for `chargeRef`;
+ * - 'unknown': the lookup says nothing (network error, timeout, HTTP error, bad or missing MAC, unparseable body,
+ *   missing permission, data not indexed yet, ambiguous data).
+ * A lookup made while a request with this chargeRef may still be in flight proves nothing: `absent` can be
+ * followed by that request taking the money. Look up only once no such request can still complete.
+ */
+export type ChargeLookupStatus = 'succeeded' | 'failed' | 'pending' | 'absent' | 'unknown';
+
+/** Since 2.2.0. Options of a charge lookup (`getCharge`). */
+export interface ChargeLookupOptions {
+  /** ISO 8601: the earliest time a request with this chargeRef may have been sent. PayPal: required. Nexi: ignored. */
+  since?: string;
+  /** ISO 8601: the latest time a request with this chargeRef may have been sent. Default: `since`. Nexi: ignored. */
+  until?: string;
+  /**
+   * When given, the charge found must belong to this mandate (PayPal: `custom_id === mandate.mandateRef`),
+   * otherwise the result is `unknown`. Nexi: ignored.
+   */
+  mandate?: Mandate;
+}
+
+/** Since 2.2.0. Result of a read-only charge lookup (`getCharge`). */
+export interface ChargeLookupResult {
+  status: ChargeLookupStatus;
+  /** true only for an authenticated answer (MAC-checked Nexi response, OAuth-authenticated PayPal read). Always false with 'unknown'. */
+  verified: boolean;
+  /** Always the requested chargeRef. */
+  chargeRef: string;
+  /** Id accepted by `refundPayment(provider, id, amount)`: Nexi `codiceTransazione` (= chargeRef), PayPal order id. */
+  providerPaymentId?: string;
+  /** Amount and currency as reported by the provider (major units). Not compared with anything: the app compares. */
+  amount?: number;
+  currency?: string;
+  /** The provider's own status for the charge, trimmed (Nexi `stato` such as 'Rimborsato Parz.', PayPal capture status). */
+  providerStatus?: string;
+  providerState?: ChargeProviderState;
+  /**
+   * Since 2.2.0. Total refunded so far for this charge, in major units of the charge's currency, as the provider reports
+   * it. `0` means the provider reports no refund. Absent (undefined) means the provider does not report it: never read
+   * absence as 0.
+   */
+  refundedAmount?: number;
+  error?: string;
+  /** Provider response. May contain personal data (masked PAN, payer account id): never log or persist it. */
   raw?: unknown;
 }
 

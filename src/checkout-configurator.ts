@@ -5,8 +5,12 @@ import { CheckoutConfig } from './models/checkout-config.model';
 import { CheckoutError } from './models/errors';
 import { CheckoutEventBus, CheckoutEventName, CheckoutEventPayload } from './events/checkout-event-bus';
 import { IMandateProvider, isMandateProvider } from './interfaces/mandate-provider.interface';
+import { isChargeLookupProvider } from './interfaces/charge-lookup-provider.interface';
 import {
   CHARGE_REF_PATTERN,
+  ChargeLookupOptions,
+  ChargeLookupResult,
+  ChargeLookupStatus,
   ChargeRequest,
   ChargeResult,
   ChargeStatus,
@@ -40,8 +44,68 @@ const CHARGE_EVENTS: Record<ChargeStatus, CheckoutEventName> = {
 const SETUP_MISMATCH = 'Mandate outcome does not match the pending setup';
 const AMOUNT_MISMATCH = 'Charged amount does not match the request';
 
+const LOOKUP_STATUSES: ReadonlySet<string> = new Set<ChargeLookupStatus>([
+  'succeeded',
+  'failed',
+  'pending',
+  'absent',
+  'unknown',
+]);
+
+/** The payment facts of a lookup result: never on an `unknown` one. */
+const LOOKUP_FACTS = [
+  'providerPaymentId',
+  'amount',
+  'currency',
+  'providerStatus',
+  'providerState',
+  'refundedAmount',
+] as const;
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object';
+}
+
+/**
+ * Lookup normalization (fail closed). Returns a new object, never mutates the provider's:
+ * - a non-object result, or a status outside the five, is `unknown`;
+ * - `verified` is `true` only when the provider set exactly `true`, and never with `unknown`;
+ * - any status other than `unknown` without `verified: true` becomes `unknown` with
+ *   'Charge lookup could not be verified';
+ * - an `unknown` result carries no payment facts (`LOOKUP_FACTS`);
+ * - `refundedAmount` is kept only on a verified `succeeded`, as a finite number >= 0;
+ * - `chargeRef` is always the request's.
+ */
+function normalizeLookup(result: unknown, chargeRef: string): ChargeLookupResult {
+  if (!isObject(result)) {
+    return { status: 'unknown', verified: false, chargeRef, error: 'Provider returned no lookup result' };
+  }
+  const source = result as Partial<ChargeLookupResult>;
+  const known = typeof source.status === 'string' && LOOKUP_STATUSES.has(source.status);
+  const normalized: ChargeLookupResult = {
+    ...source,
+    status: known ? (source.status as ChargeLookupStatus) : 'unknown',
+    verified: source.verified === true,
+    chargeRef,
+  };
+  if (!known) {
+    normalized.error = normalized.error ?? 'Provider returned an unrecognised lookup status';
+  } else if (normalized.status !== 'unknown' && !normalized.verified) {
+    normalized.status = 'unknown';
+    normalized.error = 'Charge lookup could not be verified';
+  }
+  if (normalized.status === 'unknown') {
+    normalized.verified = false;
+    for (const key of LOOKUP_FACTS) delete normalized[key];
+  }
+  const refunded = normalized.refundedAmount;
+  if (
+    'refundedAmount' in normalized &&
+    (normalized.status !== 'succeeded' || typeof refunded !== 'number' || !Number.isFinite(refunded) || refunded < 0)
+  ) {
+    delete normalized.refundedAmount;
+  }
+  return normalized;
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -501,6 +565,8 @@ export class CheckoutConfigurator {
           currency: result.currency,
           providerCode: result.providerCode,
           mandateUnusable: result.mandateUnusable,
+          // Since 2.2.0: a refunded or partly captured charge (only on verified results)
+          providerState: result.providerState,
         },
         raw: result.raw,
       },
@@ -517,7 +583,10 @@ export class CheckoutConfigurator {
    *   "success" means we do not know);
    * - a verified `succeeded` whose reported amount or currency differs from the request becomes
    *   `unknown` with error 'Charged amount does not match the request'. Absent fields are not
-   *   compared (Nexi's charge response carries no amount).
+   *   compared (Nexi's charge response carries no amount). `providerState` and `providerStatus`
+   *   survive that check: the state is the more specific fact;
+   * - `providerState` and `providerStatus` (since 2.2.0) are dropped from any result that is not
+   *   `verified: true` (an unauthenticated state is not a fact), and never change `status`.
    */
   private normalizeCharge(
     result: ChargeResult | undefined,
@@ -530,6 +599,10 @@ export class CheckoutConfigurator {
       : { status: 'unknown', verified: false, chargeRef, error: 'Provider returned no charge result' };
     normalized.chargeRef = chargeRef;
     normalized.verified = normalized.verified === true;
+    if (!normalized.verified) {
+      delete normalized.providerState;
+      delete normalized.providerStatus;
+    }
     if (!CHARGE_STATUSES.has(normalized.status)) {
       normalized.status = 'unknown';
     }
@@ -729,7 +802,8 @@ export class CheckoutConfigurator {
     const providerCharge = isObject(source.firstCharge) ? source.firstCharge : undefined;
 
     if (source.verified !== true) {
-      // Like normalizeOutcome: an unauthenticated callback provides no identities and no amounts
+      // Like normalizeOutcome: an unauthenticated callback provides no identities, no amounts and no
+      // provider state (since 2.2.0)
       const firstCharge: ChargeResult = providerCharge
         ? {
             ...providerCharge,
@@ -740,6 +814,8 @@ export class CheckoutConfigurator {
             currency: undefined,
           }
         : { status: 'unknown', verified: false, chargeRef: pending.orderId };
+      delete firstCharge.providerState;
+      delete firstCharge.providerStatus;
       if (!CHARGE_STATUSES.has(firstCharge.status)) firstCharge.status = 'unknown';
       if (firstCharge.status === 'succeeded') {
         firstCharge.status = 'unknown';
@@ -888,5 +964,104 @@ export class CheckoutConfigurator {
       mandate.mandateRef,
     );
     return result;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Charge lookup (read-only)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Since 2.2.0. True when the provider implements `IChargeLookupProvider` (`isChargeLookupProvider`): Nexi and
+   * PayPal, not Satispay.
+   * @throws CheckoutError('PROVIDER_NOT_FOUND') if the provider is not registered.
+   */
+  supportsChargeLookup(providerName: string): boolean {
+    return isChargeLookupProvider(this.getProvider(providerName));
+  }
+
+  /**
+   * Since 2.2.0. Read-only lookup of a charge by its `chargeRef` ("did money move for it?"), for an `unknown` charge
+   * that may not be retried (the subscription closed meanwhile, the replay window has passed, manual resolution).
+   * Never charges, never refunds, and emits no event. Never mounted as a route.
+   *
+   * Validates first, without calling the provider (`INVALID_MANDATE_REQUEST`): `chargeRef` must match
+   * `CHARGE_REF_PATTERN`; `options.since` and `options.until`, when present, must be strings with a finite
+   * `Date.parse`, and `until >= since`; `options.mandate`, when present, must belong to this provider. A provider that
+   * throws gives `unknown`, with `raw` reduced to the error's `{ name, message }`. See `normalizeLookup` for the rest:
+   * only a verified answer is `succeeded`, `failed`, `pending` or `absent`.
+   *
+   * A lookup made while a request with this chargeRef may still be in flight proves nothing: `absent` can be followed
+   * by that request taking the money. Look up only once no such request can still complete.
+   *
+   * @throws CheckoutError('CHARGE_LOOKUP_NOT_SUPPORTED') if the provider does not implement `IChargeLookupProvider`.
+   */
+  async getCharge(
+    providerName: string,
+    chargeRef: string,
+    options?: ChargeLookupOptions,
+  ): Promise<ChargeLookupResult> {
+    const provider = this.getProvider(providerName);
+    if (!isChargeLookupProvider(provider)) {
+      throw new CheckoutError(
+        `Provider '${providerName}' does not support charge lookups`,
+        'CHARGE_LOOKUP_NOT_SUPPORTED',
+        providerName,
+      );
+    }
+    if (typeof chargeRef !== 'string' || !CHARGE_REF_PATTERN.test(chargeRef)) {
+      throw this.invalidMandate('Invalid chargeRef: expected /^[A-Za-z0-9-]{2,30}$/', providerName);
+    }
+    const lookupOptions = this.lookupOptions(providerName, options);
+
+    let providerResult: unknown;
+    try {
+      providerResult = await provider.getCharge(chargeRef, lookupOptions);
+    } catch (err) {
+      // Same rule as chargeMandate: only name and message of the thrown value, never the object itself (SDK errors
+      // carry the request and its headers)
+      providerResult = {
+        status: 'unknown',
+        verified: false,
+        chargeRef,
+        error: 'Charge lookup failed: the provider call failed',
+        ...(err instanceof Error ? { raw: { name: err.name, message: err.message } } : {}),
+      };
+    }
+    return normalizeLookup(providerResult, chargeRef);
+  }
+
+  /**
+   * Validates the options of `getCharge` (`INVALID_MANDATE_REQUEST`) and returns a copy with the known fields only.
+   * `undefined` (or `null`) means no constraint.
+   */
+  private lookupOptions(
+    providerName: string,
+    options: ChargeLookupOptions | undefined,
+  ): ChargeLookupOptions | undefined {
+    if (options === undefined || options === null) return undefined;
+    if (typeof options !== 'object') {
+      throw this.invalidMandate('Invalid charge lookup options', providerName);
+    }
+    const time = (field: 'since' | 'until'): number | undefined => {
+      const value: unknown = options[field];
+      if (value === undefined) return undefined;
+      const ms = typeof value === 'string' ? Date.parse(value) : NaN;
+      if (!Number.isFinite(ms)) {
+        throw this.invalidMandate(`Invalid ${field}: expected an ISO 8601 date and time`, providerName);
+      }
+      return ms;
+    };
+    const since = time('since');
+    const until = time('until');
+    if (since !== undefined && until !== undefined && until < since) {
+      throw this.invalidMandate('Invalid until: it is earlier than since', providerName);
+    }
+    if (options.mandate !== undefined) this.assertMandate(providerName, options.mandate);
+
+    const copy: ChargeLookupOptions = {};
+    if (options.since !== undefined) copy.since = options.since;
+    if (options.until !== undefined) copy.until = options.until;
+    if (options.mandate !== undefined) copy.mandate = options.mandate;
+    return copy;
   }
 }

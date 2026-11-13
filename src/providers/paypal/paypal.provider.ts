@@ -4,9 +4,11 @@ import {
   LogLevel,
   OrdersController,
   PaymentsController,
+  TransactionSearchController,
   VaultController,
 } from '@paypal/paypal-server-sdk';
 import type {
+  CapturedPayment,
   CheckoutPaymentIntent,
   Order,
   OrderRequest,
@@ -15,13 +17,20 @@ import type {
   PaypalPaymentTokenCustomerType,
   PaypalPaymentTokenUsageType,
   PaypalWalletContextShippingPreference,
+  SearchResponse,
   StoredPaymentSourceUsageType,
   StoreInVaultInstruction,
+  TransactionDetails,
   UsagePattern,
 } from '@paypal/paypal-server-sdk';
 import { BasePaymentProvider } from '../../abstract/base-payment-provider.abstract';
 import { IMandateProvider } from '../../interfaces/mandate-provider.interface';
+import { IChargeLookupProvider } from '../../interfaces/charge-lookup-provider.interface';
 import {
+  ChargeLookupOptions,
+  ChargeLookupResult,
+  ChargeLookupStatus,
+  ChargeProviderState,
   ChargeRequest,
   ChargeResult,
   Mandate,
@@ -36,7 +45,7 @@ import {
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult } from '../../models/payment-result.model';
 import { parseAmount } from '../../utils/parsing.util';
-import { isInvalidAmountError, toMajorString, toMinorUnits } from '../../utils/money';
+import { currencyExponent, isInvalidAmountError, toMajorString, toMinorUnits } from '../../utils/money';
 import { appendMandateRef } from '../../utils/url';
 import { redactSecret } from '../../utils/redact';
 
@@ -54,6 +63,32 @@ const ORDER_NOT_MATCHING = 'Order does not match the pending setup';
 const CAPTURED_AMOUNT_MISMATCH = 'Captured amount does not match';
 const DUPLICATE_CHARGE =
   'A charge with this chargeRef was already submitted; reconcile it in PayPal';
+
+// Charge lookup by invoice_id (Transaction Search, since 2.2.0)
+const HOUR_MS = 60 * 60 * 1000;
+/** Margin added on each side of `since` / `until` in the search window. */
+const SEARCH_MARGIN_MS = HOUR_MS;
+/** Longest `until - since`: with both margins the window stays within PayPal's 31-day maximum. */
+const LOOKUP_MAX_SPAN_MS = 30 * 24 * HOUR_MS;
+/** `absent` only this long after `until`: the 1-hour margin plus PayPal's 3-hour indexing delay. */
+const LOOKUP_ABSENT_AFTER_MS = 4 * HOUR_MS;
+/** `page_size` is 1-500 (Transaction Search schema). */
+const SEARCH_PAGE_SIZE = 500;
+const SEARCH_MAX_PAGES = 10;
+/** More records with the invoice_id than this is ambiguous. */
+const LOOKUP_MAX_RECORDS = 5;
+const CAPTURE_NOT_MATCHING = 'PayPal capture does not match the charge';
+const UNEXPECTED_SEARCH = 'Unexpected PayPal transaction search response';
+
+/** Capture status → lookup status and state. Any other value is `pending`: fail safe, like Nexi's unknown `stato`. */
+const CAPTURE_LOOKUP = new Map<string, { status: ChargeLookupStatus; providerState?: ChargeProviderState }>([
+  ['COMPLETED', { status: 'succeeded' }],
+  ['PARTIALLY_REFUNDED', { status: 'succeeded', providerState: 'partially_refunded' }],
+  ['REFUNDED', { status: 'succeeded', providerState: 'refunded' }],
+  ['PENDING', { status: 'pending' }],
+  ['DECLINED', { status: 'failed' }],
+  ['FAILED', { status: 'failed' }],
+]);
 
 /** True when `value` + `currency` (as PayPal reports them) are `amount` + `expectedCurrency`. */
 function sameMoney(value: unknown, currency: unknown, amount: number, expectedCurrency: string): boolean {
@@ -91,11 +126,47 @@ function firstCapture(order: unknown): any {
 }
 
 /**
+ * Since 2.2.0. Total of the `COMPLETED` refunds of an order's first purchase unit, in major units of `currency`,
+ * summed in minor units (5.00 + 4.99 = 999 minor units = 9.99). Refunds are listed per purchase unit, not per
+ * capture, so with more than one capture the total is not one capture's: undefined. A missing refunds list counts
+ * as no refund (0). A `PENDING` refund is not counted: it may still complete. Undefined, never a guess, when a
+ * counted refund has another currency (compared case-insensitively) or a value that is not a positive amount of
+ * `currency`.
+ */
+function completedRefundTotal(order: unknown, currency: unknown): number | undefined {
+  if (typeof currency !== 'string' || currency.trim() === '') return undefined;
+  const payments = firstPurchaseUnit(order)?.payments;
+  const captures = payments?.captures;
+  if (Array.isArray(captures) && captures.length > 1) return undefined;
+  const refunds = payments?.refunds ?? [];
+  if (!Array.isArray(refunds)) return undefined;
+  const code = currency.trim().toUpperCase();
+  let minor = 0;
+  for (const refund of refunds) {
+    if (refund?.status !== 'COMPLETED') continue;
+    const refundCurrency = refund?.amount?.currencyCode;
+    if (typeof refundCurrency !== 'string' || refundCurrency.trim().toUpperCase() !== code) return undefined;
+    const value = parseAmount(refund?.amount?.value);
+    if (value === undefined || value <= 0) return undefined;
+    try {
+      minor += toMinorUnits(value, code);
+    } catch {
+      // More decimals than the currency allows
+      return undefined;
+    }
+  }
+  return minor / 10 ** currencyExponent(code);
+}
+
+/**
  * PayPal Checkout provider.
  * Flow: `redirect` — creates an order, redirects the user to PayPal,
  * then captures the payment on return via `handleRedirect`.
+ *
+ * Charge lookup (`IChargeLookupProvider`, since 2.2.0): `getCharge` locates a charge by `invoice_id` with the
+ * Transaction Search API and re-reads its capture.
  */
-export class PayPalProvider extends BasePaymentProvider implements IMandateProvider {
+export class PayPalProvider extends BasePaymentProvider implements IMandateProvider, IChargeLookupProvider {
   readonly name = 'paypal';
   readonly flow = 'redirect' as const;
 
@@ -103,6 +174,8 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
   private ordersController: OrdersController;
   private paymentsController: PaymentsController;
   private vaultController: VaultController;
+  /** Built on the first `getCharge`, never in the constructor (see `transactionSearch`). */
+  private transactionSearchController?: TransactionSearchController;
 
   constructor(private readonly config: PayPalProviderConfig) {
     super();
@@ -232,6 +305,8 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
       const currency = typeof capture?.amount?.currencyCode === 'string' ? capture.amount.currencyCode : undefined;
       const isCaptureCompleted = captureStatus === 'COMPLETED' && amount !== undefined && amount > 0 && !!currency && currency.trim() !== '';
       const status = captureStatus ?? 'NO_CAPTURE';
+      // Since 2.2.0: the order's COMPLETED refunds, from the same read (no extra API call)
+      const refundedAmount = capture ? completedRefundTotal(order, currency) : undefined;
 
       return {
         success: isCaptureCompleted,
@@ -242,6 +317,7 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
         captureStatus,
         amount,
         currency,
+        ...(refundedAmount !== undefined ? { refundedAmount } : {}),
         raw: order,
         ...(isCaptureCompleted
           ? {}
@@ -824,5 +900,203 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
         raw: this.apiErrorRaw(error),
       };
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Charge lookup by invoice_id (IChargeLookupProvider, since 2.2.0)
+  // -------------------------------------------------------------------------
+
+  /**
+   * The Transaction Search controller, built on the first use: an eager one in the constructor would require every
+   * SDK mock to define `TransactionSearchController`.
+   */
+  private get transactionSearch(): TransactionSearchController {
+    if (this.transactionSearchController === undefined) {
+      this.transactionSearchController = new TransactionSearchController(this.client);
+    }
+    return this.transactionSearchController;
+  }
+
+  /**
+   * Read-only lookup of a charge by `chargeRef`: renewal orders carry `invoice_id = chargeRef` (and a setup's first
+   * charge `invoice_id = orderId`). Orders v2 has no search, so the Transaction Search API **locates** the capture
+   * (`GET /v1/reporting/transactions`, which needs "Transaction search" enabled on the REST app), and the answer
+   * comes from the authenticated re-read of that capture. Never charges, never refunds, never throws.
+   *
+   * - `options.since` is required (`until` defaults to `since`, at most 30 days later). The search window is
+   *   `since - 1 h` .. `min(now, until + 1 h)`, read in pages of 500, at most 10 pages.
+   * - No record with this invoice_id: `absent` once `now - until >= 4 h` (the 1-hour margin plus PayPal's 3-hour
+   *   indexing delay), `unknown` before.
+   * - Every matching record is re-read with `getCapturedPayment`; a 404 (not a capture, e.g. a refund of the same
+   *   invoice) is skipped. One capture maps its status: `COMPLETED` `succeeded`, `PARTIALLY_REFUNDED` / `REFUNDED`
+   *   `succeeded` with that `providerState`, `PENDING` `pending`, `DECLINED` / `FAILED` `failed`, anything else
+   *   `pending`. `providerPaymentId` is the order id (`refundPayment` takes it) and `raw` the captured payment.
+   * - `unknown`: a capture of another invoice_id or (with `options.mandate`) another `custom_id`, more than one
+   *   distinct capture (a possible double charge: reconcile it in PayPal), more than 5 matching records, more than
+   *   10 pages, any error. Error results carry only PayPal's error body, never the SDK error (it carries the bearer
+   *   token), and never a search page (it lists other customers' transactions).
+   */
+  async getCharge(chargeRef: string, options: ChargeLookupOptions = {}): Promise<ChargeLookupResult> {
+    const unknown = (error: string): ChargeLookupResult => ({ status: 'unknown', verified: false, chargeRef, error });
+    try {
+      // 1. Arguments
+      const since = options?.since;
+      if (since === undefined || since === null) return unknown('PayPal charge lookup requires options.since');
+      const until = options?.until ?? since;
+      const sinceMs = typeof since === 'string' ? Date.parse(since) : NaN;
+      const untilMs = typeof until === 'string' ? Date.parse(until) : NaN;
+      if (!Number.isFinite(sinceMs) || !Number.isFinite(untilMs) || untilMs < sinceMs) {
+        return unknown('Invalid PayPal charge lookup window');
+      }
+      if (untilMs - sinceMs > LOOKUP_MAX_SPAN_MS) return unknown('PayPal charge lookup window exceeds 31 days');
+      const mandate = options?.mandate;
+
+      // 2. Window
+      const now = Date.now();
+      const startMs = sinceMs - SEARCH_MARGIN_MS;
+      const endMs = Math.min(now, untilMs + SEARCH_MARGIN_MS);
+      if (startMs >= endMs) return unknown('PayPal charge lookup window has not started yet');
+      const startDate = new Date(startMs).toISOString();
+      const endDate = new Date(endMs).toISOString();
+
+      // 3. Search. It has no invoice_id filter, and no amount or currency filter is set on purpose: a charge taken
+      // for another amount must still be found
+      const records: TransactionDetails[] = [];
+      for (let page = 1, totalPages = 1; page <= totalPages; page++) {
+        let response: SearchResponse;
+        try {
+          ({ result: response } = await this.transactionSearch.searchTransactions({
+            startDate,
+            endDate,
+            fields: 'transaction_info',
+            balanceAffectingRecordsOnly: 'N',
+            pageSize: SEARCH_PAGE_SIZE,
+            page,
+          }));
+        } catch (error) {
+          return this.lookupFailure(chargeRef, 'PayPal transaction search failed', error);
+        }
+        const pages: unknown = response?.totalPages ?? 1;
+        const details: unknown = response?.transactionDetails ?? [];
+        if (typeof pages !== 'number' || !Number.isInteger(pages) || pages < 1 || !Array.isArray(details)) {
+          return unknown(UNEXPECTED_SEARCH);
+        }
+        if (pages > SEARCH_MAX_PAGES) return unknown('Too many PayPal transactions in the lookup window');
+        totalPages = pages;
+        // 4. Matching records
+        for (const detail of details as TransactionDetails[]) {
+          if (detail?.transactionInfo?.invoiceId === chargeRef) records.push(detail);
+        }
+        if (records.length > LOOKUP_MAX_RECORDS) {
+          return unknown(`More than ${LOOKUP_MAX_RECORDS} PayPal transactions have this invoice_id: reconcile it in PayPal`);
+        }
+      }
+
+      // 5. No matching record
+      if (records.length === 0) {
+        return now - untilMs >= LOOKUP_ABSENT_AFTER_MS
+          ? { status: 'absent', verified: true, chargeRef }
+          : unknown('PayPal transaction search may not list this charge yet');
+      }
+
+      // 6. Re-read every matching record (a capture can be listed more than once: one read per id)
+      const captures = new Map<string, CapturedPayment>();
+      for (const id of new Set(records.map((r) => r.transactionInfo?.transactionId))) {
+        if (typeof id !== 'string' || id === '') return unknown(UNEXPECTED_SEARCH);
+        let capture: CapturedPayment;
+        try {
+          ({ result: capture } = await this.paymentsController.getCapturedPayment({ captureId: id }));
+        } catch (error) {
+          // Not a capture (e.g. a refund of the same invoice)
+          if (this.apiIssue(error).status === 404) continue;
+          return this.lookupFailure(chargeRef, 'PayPal capture could not be read', error);
+        }
+        if (
+          capture === null ||
+          typeof capture !== 'object' ||
+          capture.id !== id ||
+          capture.invoiceId !== chargeRef ||
+          (mandate !== undefined && mandate !== null && capture.customId !== mandate.mandateRef)
+        ) {
+          return unknown(CAPTURE_NOT_MATCHING);
+        }
+        captures.set(id, capture);
+      }
+      if (captures.size === 0) return unknown('PayPal lists this invoice_id but no capture was found');
+      if (captures.size > 1) {
+        // A possible double charge: never pick one
+        return unknown('More than one PayPal capture has this invoice_id: reconcile it in PayPal');
+      }
+
+      // 7. One capture
+      const [capture] = captures.values();
+      return await this.captureLookup(chargeRef, capture);
+    } catch {
+      return unknown('PayPal charge lookup failed');
+    }
+  }
+
+  /**
+   * Maps the one capture found by `getCharge`. `raw` is the captured payment, never a search page.
+   *
+   * `refundedAmount` (`succeeded` only): `0` for a `COMPLETED` capture, with no other API call; for `REFUNDED` and
+   * `PARTIALLY_REFUNDED`, the COMPLETED refunds of its order (`getOrder` on the order id), only when that order's
+   * first capture is this one. Absent when the order id is missing, `getOrder` fails, or the total is not certain.
+   */
+  private async captureLookup(chargeRef: string, capture: CapturedPayment): Promise<ChargeLookupResult> {
+    const captureStatus: string | undefined = typeof capture.status === 'string' ? capture.status : undefined;
+    const mapped = (captureStatus !== undefined ? CAPTURE_LOOKUP.get(captureStatus) : undefined) ?? {
+      status: 'pending' as const,
+    };
+    const amount = parseAmount(capture.amount?.value);
+    const currency = typeof capture.amount?.currencyCode === 'string' ? capture.amount.currencyCode : undefined;
+    const orderId = capture.supplementaryData?.relatedIds?.orderId;
+    const providerPaymentId = typeof orderId === 'string' && orderId !== '' ? orderId : undefined;
+    let refundedAmount: number | undefined;
+    if (captureStatus === 'COMPLETED') {
+      refundedAmount = 0;
+    } else if ((captureStatus === 'REFUNDED' || captureStatus === 'PARTIALLY_REFUNDED') && providerPaymentId !== undefined) {
+      refundedAmount = await this.orderRefundTotal(providerPaymentId, capture.id, currency);
+    }
+    return {
+      status: mapped.status,
+      verified: true,
+      chargeRef,
+      ...(providerPaymentId !== undefined ? { providerPaymentId } : {}),
+      ...(amount !== undefined ? { amount } : {}),
+      ...(currency !== undefined ? { currency } : {}),
+      ...(captureStatus !== undefined ? { providerStatus: captureStatus } : {}),
+      ...(mapped.providerState !== undefined ? { providerState: mapped.providerState } : {}),
+      ...(refundedAmount !== undefined ? { refundedAmount } : {}),
+      raw: capture,
+    };
+  }
+
+  /** The COMPLETED refunds of `orderId`, when its first capture is `captureId`; undefined on any doubt. Never throws. */
+  private async orderRefundTotal(
+    orderId: string,
+    captureId: string | undefined,
+    currency: string | undefined,
+  ): Promise<number | undefined> {
+    try {
+      const { result: order } = await this.ordersController.getOrder({ id: orderId });
+      if (captureId === undefined || firstCapture(order)?.id !== captureId) return undefined;
+      return completedRefundTotal(order, currency);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** An `unknown` lookup for a failed SDK call: the HTTP status in `error`, only PayPal's error body in `raw`. */
+  private lookupFailure(chargeRef: string, what: string, error: unknown): ChargeLookupResult {
+    const { status } = this.apiIssue(error);
+    const raw = this.apiErrorRaw(error);
+    return {
+      status: 'unknown',
+      verified: false,
+      chargeRef,
+      error: status !== undefined ? `${what} (HTTP ${status})` : what,
+      ...(raw !== undefined ? { raw } : {}),
+    };
   }
 }

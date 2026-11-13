@@ -6,6 +6,8 @@ export type { IPaymentProvider, PaymentFlow } from './interfaces/payment-provide
 export type { ITransactionStore, TransactionData } from './interfaces/transaction-store.interface';
 export type { IMandateProvider } from './interfaces/mandate-provider.interface';
 export { isMandateProvider } from './interfaces/mandate-provider.interface';
+export type { IChargeLookupProvider } from './interfaces/charge-lookup-provider.interface';
+export { isChargeLookupProvider } from './interfaces/charge-lookup-provider.interface';
 
 // ---- Models ----------------------------------------------------------------
 export type { PaymentRequest } from './models/payment-request.model';
@@ -24,6 +26,10 @@ export type {
   MandateCallbackInput,
   MandateStatusResult,
   MandateRevokeResult,
+  ChargeProviderState,
+  ChargeLookupStatus,
+  ChargeLookupOptions,
+  ChargeLookupResult,
 } from './models/mandate.model';
 export { MANDATE_REF_PATTERN, CHARGE_REF_PATTERN } from './models/mandate.model';
 export { CheckoutError } from './models/errors';

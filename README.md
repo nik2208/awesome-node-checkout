@@ -246,9 +246,10 @@ Since 2.0.0 every permissive behaviour of `createCheckoutRouter` is an explicit,
 | `supportsMandates(provider)` | `true` when the provider implements `IMandateProvider` (`isMandateProvider`). |
 | `createMandate(provider, request)` | Validates first (`INVALID_MANDATE_REQUEST` for `mandateRef`, `orderId`, `description` of 1-127 chars, a `returnUrl`/`cancelUrl` (or a `notifyUrl`, when set) that is not an absolute `http(s)` URL; `INVALID_AMOUNT` from the amount) without calling the provider. A start whose `pending` does not match the request (`provider`, `mandateRef`, `orderId`, and `amount` and `currency`, compared in minor units and case-insensitively; a missing or invalid one never matches) is returned as `success: false`, since `confirmMandate` checks the first charge's amount against `pending`. Emits `mandate.setup_started` (`verified: false`) on success. |
 | `confirmMandate(provider, pending, input)` | Unverified outcome → `success: false`, `terminal: false`, no `mandate`, a `succeeded` first charge becomes `unknown`. A verified outcome whose `firstCharge.chargeRef` or `mandate` does not match `pending` → unverified, non-terminal failure `'Mandate outcome does not match the pending setup'`. `terminal` is the provider's value AND `verified` (always `true` with `success: true`). Events **only for terminal outcomes**: `mandate.created` or `mandate.setup_failed`, then `charge.*` for the first charge. An unverified outcome's `firstCharge` carries no `providerPaymentId`, `amount` or `currency`. Re-callable with `{}` and the consumed `pending` to resolve an `unknown` first charge (see below). |
-| `chargeMandate(provider, mandate, charge)` | Validates `chargeRef` and the amount. A `revoked` mandate returns `failed` with `mandateUnusable: true` without calling the provider. An unverified `succeeded` becomes `unknown` (never `failed`). A verified `succeeded` whose reported amount or currency differs from the request becomes `unknown` with `'Charged amount does not match the request'`. A provider that throws gives `unknown`, whose `raw` (and the `charge.unknown` event's) is only the error's `{ name, message }`, never the SDK request, headers or body. `chargeRef` is always the request's. Emits `charge.succeeded`, `charge.failed`, `charge.unknown` or `charge.requires_action`; a throwing listener never rejects it (see below). |
+| `chargeMandate(provider, mandate, charge)` | Validates `chargeRef` and the amount. A `revoked` mandate returns `failed` with `mandateUnusable: true` without calling the provider. An unverified `succeeded` becomes `unknown` (never `failed`). A verified `succeeded` whose reported amount or currency differs from the request becomes `unknown` with `'Charged amount does not match the request'`. A provider that throws gives `unknown`, whose `raw` (and the `charge.unknown` event's) is only the error's `{ name, message }`, never the SDK request, headers or body. `chargeRef` is always the request's. Since 2.2.0, `providerState` and `providerStatus` (a Nexi replay of a refunded or partly captured charge) **survive the amount check**, since the state is the more specific fact, and are **dropped from any unverified result**; they never change `status`. Emits `charge.succeeded`, `charge.failed`, `charge.unknown` or `charge.requires_action` (with `data.providerState`); a throwing listener never rejects it (see below). |
 | `getMandate(provider, mandate)` | Re-reads usability from the provider: `{ status: 'active' \| 'revoked' \| 'unknown', verified }`. Call it before charging when in doubt. |
 | `revokeMandate(provider, mandate)` | Calls the provider and emits `mandate.revoked` with `data: { mandateRef, revokedAtProvider }`. **Mark your own copy revoked whatever the provider answers.** |
+| `supportsChargeLookup(provider)` / `getCharge(provider, chargeRef, options?)` | Since 2.2.0. Read-only: did money move for this `chargeRef`? Validates first, normalizes fail closed, emits no event. See [Looking up a charge](#looking-up-a-charge). |
 
 Mandate methods throw `CheckoutError('MANDATES_NOT_SUPPORTED')` (HTTP 422 through the router) for a provider without mandate support, and `INVALID_MANDATE_REQUEST` for a `pending` or `mandate` of another provider.
 
@@ -378,10 +379,16 @@ for (const sub of await subscriptions.due(new Date())) {
 
   switch (result.status) {
     case 'succeeded':       // money taken: extend the period, issue the invoice
+      if (result.providerState) {
+        // A Nexi replay of a charge since refunded or only partly captured: not a paid renewal
+        await subscriptions.review(sub, result.providerState);
+        break;
+      }
       await subscriptions.renew(sub, result.providerPaymentId);
       break;
     case 'unknown':         // do NOT count as a failure: retry with the SAME chargeRef next run
-                            // (first charges of a setup are re-confirmed instead, see above)
+                            // (first charges of a setup are re-confirmed instead, see above;
+                            // when a retry is no longer allowed, look the charge up, see below)
       await subscriptions.markUnknown(sub, result.error);
       break;
     case 'failed':          // authoritative refusal: dunning, next attempt gets a NEW chargeRef
@@ -397,13 +404,78 @@ for (const sub of await subscriptions.due(new Date())) {
 
 Only `failed` counts towards dunning. Refund a mandate charge with the existing `refundPayment(provider, result.providerPaymentId, amount)`. To change the card, the customer creates a new mandate.
 
+### Looking up a charge
+
+Since 2.2.0. The documented way to resolve an `unknown` charge is a retry with the same `chargeRef`, but a retry is not always allowed: the subscription may have closed meanwhile (a retry would charge for a service no longer delivered), the replay window may have passed (PayPal keeps `PayPal-Request-Id` for 6 hours; Satispay does not document its retention), or an operator resolves the charge by hand. `getCharge` answers, **read-only**, "did money move for this `chargeRef`?". It never charges, never refunds, emits no event and is never mounted as a route.
+
+```typescript
+if (checkout.supportsChargeLookup(mandate.provider)) {
+  const found = await checkout.getCharge(mandate.provider, chargeRef, {
+    since: attempt.firstSentAt, // ISO 8601: the earliest time a request with this chargeRef may have been sent
+    until: attempt.lastSentAt,  // the latest one (default: since)
+    mandate,                    // optional: the charge found must belong to this mandate
+  });
+  switch (found.status) {
+    case 'succeeded': /* money taken (found.providerState: refunded or partly captured since?) */ break;
+    case 'failed':    /* every attempt refused: close it, dun with a NEW chargeRef */ break;
+    case 'absent':    /* authoritatively no transaction: nothing taken, dun with a NEW chargeRef */ break;
+    case 'pending':   /* an attempt that may still take money: look again later */ break;
+    case 'unknown':   /* the lookup says nothing: look again later or reconcile by hand */ break;
+  }
+}
+```
+
+| `status` | Meaning |
+|----------|---------|
+| `succeeded` | Money was taken for `chargeRef`. It may have been refunded since: see `providerState` (`refunded`, `partially_refunded`, `partially_captured`) and `refundedAmount`. |
+| `failed` | The provider holds `chargeRef` and every attempt was refused: no money was taken. |
+| `pending` | An attempt exists that is not final (Nexi `In Corso` or an unrecognised `stato`, a PayPal capture `PENDING`): it may still take money. |
+| `absent` | The provider reports, **authenticated**, that it holds no transaction for `chargeRef`. |
+| `unknown` | The lookup says nothing: network error, timeout, HTTP error, bad or missing MAC, unparseable body, missing permission, data not indexed yet, ambiguous data. |
+
+- **The in-flight rule.** A lookup made while a request with this `chargeRef` may still be in flight proves nothing: `absent` can be followed by that request taking the money. Look up only once no such request can still complete.
+- **What the configurator guarantees.** `getCharge` validates first, without calling the provider (`INVALID_MANDATE_REQUEST`): `chargeRef` must match `CHARGE_REF_PATTERN`; `options.since` and `options.until`, when present, must be strings with a finite `Date.parse`, with `until >= since`; `options.mandate`, when present, must belong to the provider. Then it normalizes fail closed, into a new object: `verified` is `true` only when the provider said exactly `true`; any status other than `unknown` without it becomes `unknown` (`'Charge lookup could not be verified'`), and an `unknown` result is never verified and carries no `providerPaymentId`, `amount`, `currency`, `providerStatus`, `providerState` or `refundedAmount`; `chargeRef` is always the request's; a provider that throws gives `unknown` with `raw` reduced to the error's `{ name, message }`.
+- **Not supported:** `getCharge` on a provider without the capability (Satispay in 2.2.0, which documents no search by `external_code`) throws `CheckoutError('CHARGE_LOOKUP_NOT_SUPPORTED')`, which the router maps to HTTP 422. Check `checkout.supportsChargeLookup(provider)` first.
+- **`raw`** is the provider's answer (the Nexi `situazioneOrdine` JSON, the PayPal captured payment). It may contain personal data (masked PAN, payer account id): never log or persist it.
+- **`refundedAmount`** is the provider's total refunded so far for the charge, in major units of its currency, only on a verified `succeeded`. `0` means the provider reports no refund; **absent means the provider does not report it: never read absence as `0`**. PayPal counts the order's `COMPLETED` refunds (a `PENDING` refund is not counted: it may still complete). Nexi reports `0` for a paid state without a refund and nothing for `Rimborsato` / `Rimborsato Parz.`, since `situazioneOrdine` documents no refunded amount: with Nexi, compare `providerState` only and reconcile partial refunds in the Nexi back office. PayPal `getPaymentDetails(orderId)` reports the same `refundedAmount` (from the order it already reads), and the other providers' `getPaymentDetails` leave it undefined.
+
+**Nexi XPay** reads `situazioneOrdine` for the code (bounded by `timeoutMs`), classifying every report entry like the [replay guard](#nexi-xpay) of `chargeMandate`. `options` are ignored.
+
+| `situazioneOrdine` | Result |
+|--------------------|--------|
+| An entry took the money (`Autorizzato`, `Contabilizzato`, `Catturato`, `Contabilizzato Parz.`, `Rimborsato`, `Rimborsato Parz.`) | `succeeded`, verified; `providerPaymentId` = `chargeRef`; `amount`, `currency` and `providerStatus` (the `stato`, trimmed) of that entry; `providerState` for the last three (a refund or partial-capture entry wins over a plain paid one); `refundedAmount: 0` except for `Rimborsato` / `Rimborsato Parz.` |
+| Every entry refused (`Negato`, `Annullato`, `Non Creato`) | `failed`, verified, with `providerStatus` |
+| An entry `In Corso`, or with an unrecognised or missing `stato` (and none paid) | `pending`, verified |
+| OK with no entry for the code, or a **MAC-signed** KO "not found" (2, 13) | `absent`, verified |
+| A KO "not found" **without a MAC** | `unknown`, `'Nexi "not found" answer carries no MAC'` |
+| HTTP, network, timeout, non-JSON, bad or missing MAC, no `report`, any other KO | `unknown` (the `error` never contains the response body) |
+
+Whether XPay signs its KO answers is to be confirmed against `int-ecommerce.nexi.it`. If it never does, a Nexi "not found" is always `unknown` and only an "OK with no entry" gives `absent`: the fail-closed reading.
+
+**PayPal** has no search on Orders v2. `getCharge` locates the capture with the **Transaction Search** API, by `invoice_id` (renewal orders carry `invoice_id = chargeRef` and `custom_id = mandateRef`; a setup's first charge carries `invoice_id = orderId`), then re-reads the capture with `getCapturedPayment`: the answer comes from that authenticated read. It needs "Transaction search" enabled on the REST app (see [Provider prerequisites](#provider-prerequisites)).
+
+- **`options.since` is required** (without it: `unknown`, no API call); `until` defaults to `since` and may be at most 30 days later (otherwise `unknown`, `'PayPal charge lookup window exceeds 31 days'`). The search window is `since − 1 h` .. `min(now, until + 1 h)`: PayPal's maximum is 31 days. Pages of 500, at most 10 pages (more is `unknown`), and no amount filter, so a charge taken for another amount is still found.
+- **Indexing delay.** PayPal lists a transaction up to 3 hours after it executed. No record with the `invoice_id` is `absent` only once `now − until >= 4 h` (the 1-hour margin plus the 3-hour delay), and `unknown` before (`'PayPal transaction search may not list this charge yet'`).
+- **A double charge is `unknown`.** More than one distinct capture with the `invoice_id` gives `unknown` (`'More than one PayPal capture has this invoice_id: reconcile it in PayPal'`): the library never picks one. So do more than 5 matching records, and a capture whose `invoice_id` or (with `options.mandate`) `custom_id` does not match. A matching record that is not a capture (a 404 on the re-read, e.g. a refund of the same invoice) is skipped.
+
+| Capture `status` | `status` | `providerState` |
+|------------------|----------|-----------------|
+| `COMPLETED` | `succeeded` (`refundedAmount: 0`) | none |
+| `PARTIALLY_REFUNDED` | `succeeded` | `partially_refunded` |
+| `REFUNDED` | `succeeded` | `refunded` |
+| `PENDING` | `pending` | none |
+| `DECLINED`, `FAILED` | `failed` | none |
+| any other value | `pending` (fail safe) | none |
+
+Every row is verified, with `providerStatus` = the capture status, `amount` and `currency` of the capture, `providerPaymentId` = the order id (`capture.supplementary_data.related_ids.order_id`, the id `refundPayment` takes) and `raw` = the captured payment, never a search page (it lists other customers' transactions). For `REFUNDED` and `PARTIALLY_REFUNDED`, `refundedAmount` comes from one more read of the order (`getOrder`): it is left out, and the result stays `succeeded` with its state, when that read fails or the order's first capture is not this one. Error results carry only PayPal's error body, with the HTTP status in `error` (for example `'PayPal transaction search failed (HTTP 403)'`), never the SDK error, which carries the bearer token.
+
 ### Provider prerequisites
 
 - **Nexi XPay:** MIT/recurring must be enabled on the terminal profile by Nexi support. Scheduled and unscheduled contracts are not interchangeable: state which one you need.
-- **PayPal:** "Save payment methods" (reference transactions) must be approved on the account. Turn on the payment receiving preference "Block accidental payments" (one payment per invoice ID): with it, a replay after PayPal's 6-hour request-id window cannot charge twice.
+- **PayPal:** "Save payment methods" (reference transactions) must be approved on the account. Turn on the payment receiving preference "Block accidental payments" (one payment per invoice ID): with it, a replay after PayPal's 6-hour request-id window cannot charge twice. For [`getCharge`](#looking-up-a-charge), enable **Transaction search** on the REST app (scope `https://uri.paypal.com/services/reporting/search/read`): without it the lookup answers `unknown`.
 - **Satispay:** pre-authorized payments (Automatic Payments) must be enabled for the shop.
 
-Use `checkout.supportsMandates(provider)` to check whether a registered provider implements `IMandateProvider`.
+Use `checkout.supportsMandates(provider)` to check whether a registered provider implements `IMandateProvider`, and `checkout.supportsChargeLookup(provider)` for `IChargeLookupProvider`.
 
 ### Nexi XPay
 
@@ -425,7 +497,7 @@ const nexi = new NexiProvider({
 - **Currency: EUR only.** `pagamentoRicorrente` accepts only `divisa=978`, so `createMandate` and `chargeMandate` with any other currency return a failure without calling Nexi.
 - **Callback.** Nexi redirects the customer to `url` / `url_back` with the outcome in the query string, and sends the `urlpost` notification as a **form POST**: mount `express.urlencoded()` before the checkout router, or the notification body is empty and the outcome stays unverified. Both arrive at the callback route and are verified with the 7-field outcome MAC; the MAC-covered `codTrans`, `importo` and `divisa` must match the pending setup. The contract number is always the persisted `mandateRef`, never the query's `num_contratto`; an OK outcome must still echo `num_contratto` equal to it (without it, no contract may have been registered), and a `tipo_servizio` / `tipo_richiesta` other than `paga_multi` / `PP` is rejected; such outcomes are unverified and non-terminal. The validated card expiry (`scadenza_pan`) and masked PAN (`pan`) are copied to `mandate.unverified`; the unfiltered callback fields, these two included, remain in the outcome's `raw` and in the `raw` of the `mandate.created` / `mandate.setup_failed` events, so do not log or persist `raw` where card data must not appear. Only `KO`, `ANNULLO` and `ERRORE` are terminal refusals; any other `esito` (such as a pending one) is unverified and non-terminal, so the pending setup survives until the final outcome arrives. A Nexi first payment is never `unknown` on a terminal outcome.
 - **Notification (`urlpost`) must get HTTP 200.** The manual requires the `urlpost` answer to be an "HTTP 200" to confirm receipt (pp. 22-23 and 33). Do not redirect the POST: the README `onOutcome` redirects only `GET` requests (the customer's browser) and lets the route answer `200 { success }` for the POST. On a terminal set to void on notification failure, every other answer must be assumed to count as a failed delivery: the `404` for a late or replayed `urlpost` whose pending setup was already consumed or expired, a `500` from a hook that throws, and a `302` too (whether XPay treats a 3xx as a failure is not documented; this follows the manual's "must be HTTP 200" wording). Whenever the `urlpost` is confirmed first, it consumes the pending setup, and the customer's browser then reaches the callback route with no pending state and gets the route's `404` JSON instead of your UI. That order is guaranteed on a terminal that voids on notification failure, where the redirect to `url` happens only after the `urlpost` answer (p. 33), and possible on any other.
-- **Retries.** Before every charge the provider reads `situazioneOrdine` for the `chargeRef`: one that took the money (`Autorizzato`, `Contabilizzato`, `Contabilizzato Parz.`, and also `Rimborsato` / `Rimborsato Parz.`) is returned as `succeeded` without charging again, with the `stato` in `result.raw.stato`; one that Nexi refused (`Negato`, `Annullato`, `Non Creato`) as `failed`; one still in progress (`In Corso`) or with any other `stato`, and a lookup that fails, as `unknown` (nothing is charged). A refunded `chargeRef` is `succeeded` because the charge did happen: check `result.raw.stato` before extending a subscription on a retried charge. Retry an `unknown` charge with the same `chargeRef`; an `In Corso` one resolves once Nexi completes it. **A dunning retry after `failed` needs a new `chargeRef`**: Nexi would accept up to 2 retries of the same code after a KO, but the library does not use them. If several report entries share the `chargeRef`, any one that took the money makes it `succeeded`, otherwise any one not final makes it `unknown`, and it is `failed` only when every entry is a refusal. Codes 8, 14 and 22 (invalid contract, card expired, card not chargeable) set `mandateUnusable`; credential, MAC and technical errors are `unknown`. An amount over 8 digits of cents (999999.99 EUR) is `failed` without calling Nexi.
+- **Retries.** Before every charge the provider reads `situazioneOrdine` for the `chargeRef`: one that took the money (`Autorizzato`, `Contabilizzato`, `Contabilizzato Parz.`, and also `Rimborsato` / `Rimborsato Parz.`) is returned as `succeeded` without charging again, with the `stato` in `result.providerStatus` (trimmed) and, for `Rimborsato`, `Rimborsato Parz.` and `Contabilizzato Parz.`, `result.providerState` (`'refunded'`, `'partially_refunded'`, `'partially_captured'`); one that Nexi refused (`Negato`, `Annullato`, `Non Creato`) as `failed`; one still in progress (`In Corso`) or with any other `stato`, and a lookup that fails, as `unknown` (nothing is charged). A refunded `chargeRef` is `succeeded` because the charge did happen: check `result.providerState` before extending a subscription on a retried charge, and send a partly captured one to review, since the money taken may be less than the price. Both fields survive the configurator's amount check (a partly captured or refunded charge can report another amount, which makes the result `unknown`) and are dropped from unverified results. `result.raw.stato` is still there, verbatim, but it is not the documented field. Retry an `unknown` charge with the same `chargeRef`; an `In Corso` one resolves once Nexi completes it. **A dunning retry after `failed` needs a new `chargeRef`**: Nexi would accept up to 2 retries of the same code after a KO, but the library does not use them. If several report entries share the `chargeRef`, any one that took the money makes it `succeeded` (a refunded or partly captured entry is the one reported, as the most specific fact), otherwise any one not final makes it `unknown`, and it is `failed` only when every entry is a refusal. Since 2.2.0, `getPaymentDetails('nexi', code)` selects the entry the same way (it used to read only the first one): a code listed `Negato` then `Contabilizzato` is paid (`success: true`), and one listed `Autorizzato` then `Rimborsato` reports `Rimborsato` (`success: false`). To read a charge without charging, use [`getCharge`](#looking-up-a-charge). Codes 8, 14 and 22 (invalid contract, card expired, card not chargeable) set `mandateUnusable`; credential, MAC and technical errors are `unknown`. An amount over 8 digits of cents (999999.99 EUR) is `failed` without calling Nexi.
 - **12-month expiry (manual, p. 61).** Contracts unused for more than 12 months expire under card-scheme rules, so a **yearly** plan sits right at the limit. Nexi's remedy is a 1-cent recurring charge followed by a refund before the 12 months run out (`chargeMandate` with a 0.01 EUR charge, then `refundPayment('nexi', result.providerPaymentId, 0.01)`): your scheduler must plan for it.
 - **Refunds.** `providerPaymentId` is the `codiceTransazione` (= `chargeRef`), so the existing `refundPayment` refunds a mandate charge.
 
@@ -538,7 +610,7 @@ checkout.events
   .on('mandate.created',        ({ provider, orderId, data }) => { /* terminal, verified */ })
   .on('mandate.setup_failed',   ({ provider, orderId, error, data }) => { /* terminal, verified */ })
   .on('mandate.revoked',        ({ provider, data }) => { /* data.revokedAtProvider */ })
-  .on('charge.succeeded',       ({ paymentId, orderId /* = chargeRef */, verified, data }) => { /* ... */ })
+  .on('charge.succeeded',       ({ paymentId, orderId /* = chargeRef */, verified, data }) => { /* data.providerState: refunded or partly captured since */ })
   .on('charge.failed',          ({ orderId, error, data }) => { /* data.mandateUnusable, data.providerCode */ })
   .on('charge.unknown',         ({ orderId, error }) => { /* chargeMandate: retry with the same chargeRef; first charge: re-confirm */ })
   .on('charge.requires_action', ({ orderId }) => { /* ... */ });
@@ -626,6 +698,8 @@ checkout.registerProvider(new StripeProvider({ secretKey: '...' }));
 ```
 
 To support [recurring payments](#recurring-payments-mandates), also implement `IMandateProvider` (`createMandate`, `confirmMandate`, `chargeMandate`, `getMandate`, `revokeMandate`): `isMandateProvider` detects the five methods, and the configurator validates inputs and normalizes outcomes as described there. Append `mandate_ref` to the setup URLs with `appendMandateRef(url, mandateRef)`. `confirmMandate(pending, {})`, with no callback input, must be safe to call again at any time, including after a terminal outcome: re-read the setup server-to-server or replay your own idempotency keys, never start a second first charge, and return an unverified, non-terminal outcome when you cannot re-read. Apps rely on it to [resolve an unknown first charge](#resolving-an-unknown-first-charge).
+
+To support [charge lookups](#looking-up-a-charge) (since 2.2.0), also implement the optional `IChargeLookupProvider`: `getCharge(chargeRef, options?)` returning a `ChargeLookupResult`. `isChargeLookupProvider` detects the method (`checkout.supportsChargeLookup(provider)`), and `IPaymentProvider` and `IMandateProvider` are unchanged, so existing providers keep compiling. `getCharge` is read-only and never throws for provider errors: it returns `unknown`. Answer `absent` only for an authenticated "no transaction for this chargeRef" (a failed lookup is `unknown`), set `verified: true` only on authenticated answers, and never put other customers' data or an SDK error (it carries the request headers) in `raw`. The configurator validates the inputs and normalizes the result fail closed.
 
 ---
 

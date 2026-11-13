@@ -6,12 +6,17 @@ import { Mandate, MandatePendingState, MandateSetupRequest } from '../../models/
 
 // PayPalProvider timeoutMs (#45): the SDK Client gets `timeout` only for a valid value, and a call that
 // times out fails like a network error, with no part of the SDK error (its config and request carry the
-// bearer token) in a result or an event.
+// bearer token) in a result or an event. A failed OAuth token request replaces the SDK client (the SDK
+// would keep the failure for every later call): wiring here, end to end with the real SDK in
+// paypal.oauth.spec.ts.
 
-// Mock of PayPal Server SDK v2.5 that records the Client configuration. Environment values are
-// strings here so that the recorded configuration can be compared as a literal.
+// Mock of PayPal Server SDK v2.5 that records the Client configurations, the Client instances and the
+// client each controller is built with. Environment values are strings here so that the recorded
+// configuration can be compared as a literal.
 const sdk = vi.hoisted(() => ({
   clientConfigs: [] as unknown[],
+  clients: [] as unknown[],
+  controllers: [] as { kind: string; client: unknown }[],
   createOrder: vi.fn(),
   captureOrder: vi.fn(),
   getOrder: vi.fn(),
@@ -28,23 +33,36 @@ vi.mock('@paypal/paypal-server-sdk', () => ({
   Client: class {
     constructor(cfg: unknown) {
       sdk.clientConfigs.push(cfg);
+      sdk.clients.push(this);
     }
   },
   OrdersController: class {
     createOrder = sdk.createOrder;
     captureOrder = sdk.captureOrder;
     getOrder = sdk.getOrder;
+    constructor(client: unknown) {
+      sdk.controllers.push({ kind: 'orders', client });
+    }
   },
   PaymentsController: class {
     refundCapturedPayment = sdk.refundCapturedPayment;
     getCapturedPayment = sdk.getCapturedPayment;
+    constructor(client: unknown) {
+      sdk.controllers.push({ kind: 'payments', client });
+    }
   },
   VaultController: class {
     getPaymentToken = sdk.getPaymentToken;
     deletePaymentToken = sdk.deletePaymentToken;
+    constructor(client: unknown) {
+      sdk.controllers.push({ kind: 'vault', client });
+    }
   },
   TransactionSearchController: class {
     searchTransactions = sdk.searchTransactions;
+    constructor(client: unknown) {
+      sdk.controllers.push({ kind: 'search', client });
+    }
   },
 }));
 
@@ -56,12 +74,35 @@ const timeoutError = Object.assign(new Error('timeout of 30000ms exceeded'), {
   request: { headers: { authorization: 'Bearer SECRET-TOKEN' } },
 });
 
-/** The Client options of 2.1.0, unchanged by #45. */
+/**
+ * The Client options of 2.1.0, unchanged by `timeoutMs`, plus (since 2.2.0) the OAuth token provider that
+ * replaces a client whose token request failed.
+ */
 const CLIENT_CONFIG = {
-  clientCredentialsAuthCredentials: { oAuthClientId: 'id', oAuthClientSecret: 'secret' },
+  clientCredentialsAuthCredentials: {
+    oAuthClientId: 'id',
+    oAuthClientSecret: 'secret',
+    oAuthTokenProvider: expect.any(Function),
+  },
   environment: 'Sandbox',
   logging: { logLevel: 'error' },
 };
+
+/** The SDK's `oAuthTokenProvider(lastToken, authManager)`, with the part of the auth manager it uses. */
+type TokenProvider = (
+  lastToken: unknown,
+  authManager: { updateToken: (token?: unknown) => Promise<unknown> },
+) => Promise<unknown>;
+
+function tokenProviderOf(config: unknown): TokenProvider {
+  return (config as { clientCredentialsAuthCredentials: { oAuthTokenProvider: TokenProvider } })
+    .clientCredentialsAuthCredentials.oAuthTokenProvider;
+}
+
+/** The kinds of controller built with `client`, in order. */
+function controllersOf(client: unknown): string[] {
+  return sdk.controllers.filter((c) => c.client === client).map((c) => c.kind);
+}
 
 const ORDER_ID = 'PAYPAL-ORD-1';
 
@@ -162,6 +203,8 @@ describe('PayPalProvider timeoutMs (#45)', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     sdk.clientConfigs.length = 0;
+    sdk.clients.length = 0;
+    sdk.controllers.length = 0;
   });
 
   describe('SDK Client configuration', () => {
@@ -174,7 +217,11 @@ describe('PayPalProvider timeoutMs (#45)', () => {
     it("keeps environment 'live' and the credentials next to the timeout", () => {
       new PayPalProvider({ clientId: 'live-id', clientSecret: 'live-secret', environment: 'live', timeoutMs: 1500 });
       expect(sdk.clientConfigs[0]).toEqual({
-        clientCredentialsAuthCredentials: { oAuthClientId: 'live-id', oAuthClientSecret: 'live-secret' },
+        clientCredentialsAuthCredentials: {
+          oAuthClientId: 'live-id',
+          oAuthClientSecret: 'live-secret',
+          oAuthTokenProvider: expect.any(Function),
+        },
         environment: 'Production',
         logging: { logLevel: 'error' },
         timeout: 1500,
@@ -198,6 +245,64 @@ describe('PayPalProvider timeoutMs (#45)', () => {
       newProvider({ timeoutMs });
       expect(sdk.clientConfigs[0]).not.toHaveProperty('timeout');
       expect(sdk.clientConfigs[0]).toEqual(CLIENT_CONFIG);
+    });
+  });
+
+  describe('a failed OAuth token request replaces the SDK client (the SDK would keep the failure)', () => {
+    const since = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
+
+    it('the token provider is the SDK default: the token of authManager.updateToken(lastToken), and the same client', async () => {
+      newProvider({ timeoutMs: 30000 });
+      const lastToken = { accessToken: 'OLD', tokenType: 'Bearer', expiry: BigInt(0) };
+      const token = { accessToken: 'A21AA-NEW', tokenType: 'Bearer' };
+      const updateToken = vi.fn(async () => token);
+      await expect(tokenProviderOf(sdk.clientConfigs[0])(lastToken, { updateToken })).resolves.toBe(token);
+      expect(updateToken).toHaveBeenCalledTimes(1);
+      expect(updateToken).toHaveBeenCalledWith(lastToken);
+      expect(sdk.clients).toHaveLength(1);
+    });
+
+    it('rethrows the same error, so the calls waiting for that token fail as in 2.1, and builds a new client and controllers', async () => {
+      const provider = newProvider({ timeoutMs: 30000 });
+      sdk.searchTransactions.mockRejectedValue(timeoutError);
+      await provider.getCharge('SUB-0001-2026-12', { since });
+      const [first] = sdk.clients;
+      expect(controllersOf(first)).toEqual(['orders', 'payments', 'vault', 'search']);
+
+      const updateToken = vi.fn(async () => {
+        throw timeoutError;
+      });
+      await expect(tokenProviderOf(sdk.clientConfigs[0])(undefined, { updateToken })).rejects.toBe(timeoutError);
+      expect(sdk.clients).toHaveLength(2);
+      // The same options, with a token provider of its own
+      expect(sdk.clientConfigs[1]).toEqual({ ...CLIENT_CONFIG, timeout: 30000 });
+      expect(tokenProviderOf(sdk.clientConfigs[1])).not.toBe(tokenProviderOf(sdk.clientConfigs[0]));
+      const second = sdk.clients[1];
+      expect(controllersOf(second)).toEqual(['orders', 'payments', 'vault']);
+
+      // The Transaction Search controller too is built again, on the new client
+      await provider.getCharge('SUB-0001-2026-12', { since });
+      expect(controllersOf(second)).toEqual(['orders', 'payments', 'vault', 'search']);
+      expect(controllersOf(first)).toEqual(['orders', 'payments', 'vault', 'search']);
+    });
+
+    it('only the current client is replaced: a late failure on a client already replaced builds nothing', async () => {
+      newProvider();
+      const failing = {
+        updateToken: vi.fn(async () => {
+          throw timeoutError;
+        }),
+      };
+      const firstProvider = tokenProviderOf(sdk.clientConfigs[0]);
+      await expect(firstProvider(undefined, failing)).rejects.toBe(timeoutError);
+      expect(sdk.clients).toHaveLength(2);
+      // A concurrent call of the first client whose token request fails later
+      await expect(firstProvider(undefined, failing)).rejects.toBe(timeoutError);
+      expect(sdk.clients).toHaveLength(2);
+      // A failure on the current client replaces it again: without timeoutMs too
+      await expect(tokenProviderOf(sdk.clientConfigs[1])(undefined, failing)).rejects.toBe(timeoutError);
+      expect(sdk.clients).toHaveLength(3);
+      expect(sdk.clientConfigs[2]).toEqual(CLIENT_CONFIG);
     });
   });
 

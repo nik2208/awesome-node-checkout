@@ -206,8 +206,9 @@ There is no route for mandate charges or revocations: call `chargeMandate` / `re
 ```typescript
 const key = `${charge.chargeRef}-R1`; // ONE key per intended refund; a second partial refund is -R2
 const result = await checkout.refundPayment('paypal', charge.providerPaymentId, 9.9, { idempotencyKey: key });
-if (!result.success && result.verified !== true) {
-  // Outcome unknown (timeout, 5xx): retry later with the SAME key, never with a new one
+if (!result.success) {
+  // Not proof that nothing was refunded: read it with the provider's table below (the meaning of
+  // `verified` differs). Until the table says nothing was refunded, retry only with the SAME key
 }
 ```
 
@@ -223,8 +224,17 @@ if (!result.success && result.verified !== true) {
 - **The configurator fails closed.** It validates the options before calling the provider and before emitting `payment.refunded`, so a refund you asked to be idempotent is never sent without its key:
   - options that are not an object, or a key that is not a string matching the pattern: `CheckoutError('INVALID_REFUND_REQUEST')` (HTTP 400 through the router);
   - a key on a provider whose `supportsRefundIdempotency` is not `true` (Nexi, or a custom provider written for 2.1): `CheckoutError('REFUND_IDEMPOTENCY_NOT_SUPPORTED')` (HTTP 422).
-- **Without `options`** the provider is called with `(paymentId, amount)`, exactly as in 2.1, and `payment.refunded` is unchanged. The Express route `POST /:provider/refund` takes no key: its body stays `{ paymentId, amount }`.
+- **Without `options`** the provider is called with `(paymentId, amount)`, exactly as in 2.1, and `payment.refunded` is unchanged. A provider whose `supportsRefundIdempotency` is not `true` is always called that way: options without a key are not passed on to it, since its own third parameter, if it has one, may mean something else. The Express route `POST /:provider/refund` takes no key: its body stays `{ paymentId, amount }`.
 - **Called directly**, without the configurator: `NexiProvider.refundPayment(id, amount, { idempotencyKey })` returns `{ success: false, status: 'REFUND_FAILED' }` without any request, and PayPal and Satispay do the same for a key that does not match the pattern.
+
+**PayPal refunds** keep their 2.1 mapping, which is not Satispay's: on PayPal, `verified: true` with `success: false` is a refund that PayPal created but did not report `COMPLETED` (it may still complete), and a refusal comes back without `verified`.
+
+| PayPal answer | Result |
+|---------------|--------|
+| A refund `COMPLETED` | `{ success: true, verified: true, paymentId: <refund id>, status: 'COMPLETED', raw }` |
+| A refund with another status, such as `PENDING` | `{ success: false, verified: true, paymentId: <refund id>, status, raw }`: PayPal created the refund, and a `PENDING` one may still complete. Never refund again under a new key: re-read the order with `getPaymentDetails` (its `raw` lists the refunds with their status; `refundedAmount` counts the `COMPLETED` ones) |
+| Any error of the order read or of the refund call: network error, timeout, HTTP 4xx or 5xx | `{ success: false, error }`, without `verified` or `status`. `error` is the SDK's message, and it is empty for some refusals (a 422 `REFUND_AMOUNT_EXCEEDED` gives `''`). The result does not tell a refusal from an unknown outcome: a retry with the same key never refunds twice while PayPal keeps the key (45 days), but a refusal answers the same every time, so bound the retries, then reconcile in the PayPal dashboard |
+| No capture on the order, no currency for a partial refund, an invalid amount, or (called directly) an invalid key | `{ success: false, status: 'REFUND_FAILED', error }` (`'FAILED'` for an invalid amount), without `verified`: no refund request was sent |
 
 **Satispay refunds** (since 2.2.0) follow Satispay's documented flow: a refund is a new payment, `POST /g_business/v1/payments` with `flow: 'REFUND'`, `parent_payment_uid` (the payment to refund), `amount_unit` and `currency: 'EUR'`. `amount_unit` is required, so a **full refund** first reads the payment (`GET /payments/{id}`): unless the read answers this id, `ACCEPTED` and an integer `amount_unit` greater than 0, the result is `{ success: false, status: 'REFUND_FAILED', error: 'Satispay payment could not be read: no refund was sent' }` and nothing is sent. After an earlier partial refund, a full refund of the original amount is refused (4xx): pass the remaining amount explicitly. The answer is mapped as follows:
 
@@ -459,7 +469,7 @@ for (const sub of await subscriptions.due(new Date())) {
 }
 ```
 
-Only `failed` counts towards dunning. Refund a mandate charge with the existing `refundPayment(provider, result.providerPaymentId, amount)`; since 2.2.0, pass `{ idempotencyKey }` (for example `` `${chargeRef}-R1` ``) on PayPal and Satispay, so that a refund whose outcome is unknown can be retried with the same key instead of being reconciled by hand (Nexi takes no key: see [Refunds](#refunds)). To change the card, the customer creates a new mandate.
+Only `failed` counts towards dunning. Refund a mandate charge with the existing `refundPayment(provider, result.providerPaymentId, amount)`; since 2.2.0, pass `{ idempotencyKey }` (for example `` `${chargeRef}-R1` ``) on PayPal and Satispay, so that a refund whose outcome is unknown can be retried with the same key instead of being reconciled by hand at once (Nexi takes no key). Read each result with the provider's table in [Refunds](#refunds), and bound the retries: a PayPal refusal looks like an unknown outcome and answers the same every time. To change the card, the customer creates a new mandate.
 
 ### Looking up a charge
 
@@ -588,12 +598,13 @@ const nexi = new NexiProvider({
 
 **Status and revocation.** `getMandate` reads the vault token: present is `active`, 404 is `revoked` (both verified), anything else is `unknown` (unverified). `revokeMandate` **deletes the vault payment token** (`DELETE /v3/vault/payment-tokens/{id}`); a token already gone (404) also counts as revoked. Mark your own copy `revoked` whatever it returns: the configurator then refuses to charge it without calling PayPal, and PayPal itself refuses a charge on a deleted token.
 
-**Refunds.** `refundPayment('paypal', orderId, amount?, { idempotencyKey })` sends the key as `PayPal-Request-Id`, which PayPal keeps for 45 days (see [Refunds](#refunds)).
+**Refunds.** `refundPayment('paypal', orderId, amount?, { idempotencyKey })` sends the key as `PayPal-Request-Id`, which PayPal keeps for 45 days. Read the result with the PayPal table in [Refunds](#refunds): a `PENDING` refund is `success: false` with `verified: true` and may still complete, and a refusal (4xx) has no `verified`, like a timeout.
 
 **Timeout** (since 2.2.0, opt-in). The PayPal SDK has no timeout by default, so a request that PayPal accepts but never answers keeps the caller waiting forever: a renewal job stalls on it, and a lease or claim held around the call is never released. `new PayPalProvider({ clientId, clientSecret, timeoutMs: 30000 })` passes `timeout` to the SDK `Client`, which bounds every PayPal API call of the provider, the OAuth token request and the `getCharge` Transaction Search included. A call that exceeds it fails like a network error: `chargeMandate` and `getCharge` are `unknown`, `confirmMandate` is unverified and non-terminal with an `unknown` first charge, `getMandate` is `unknown`, `revokeMandate` gives `revokedAtProvider: false`, and `createMandate`, `createPayment`, `executePayment`, `getPaymentDetails` and `refundPayment` give `success: false` without `verified` (a capture or a refund may have happened: retry a refund only with the same idempotency key). The thrown SDK error, which carries the request headers and so the bearer token, never reaches a result or an event.
 - **Why opt-in in 2.x.** Without `timeoutMs` nothing changes: there is no timeout, exactly as in 2.1.0. A default timeout would turn a slow but successful capture or refund into an apparent failure for callers that do not treat that outcome as uncertain. A future 3.0.0 can make 30000 the default, as `timeoutMs` already is for Nexi and Satispay mandate calls.
 - **Values.** 30000 is a sensible value. Only a finite number greater than 0 is used: `0`, a negative number, `NaN`, `Infinity` or a string behave as not set, as for `NexiProviderConfig.timeoutMs`.
 - **Inactivity, not a deadline.** It is the SDK's (axios) socket inactivity timeout: a response that keeps trickling bytes is not cut off.
+- **A failed OAuth token request.** The SDK requests a token on the first call (and again when it expires) and makes every call wait for that request. When it fails (a timeout, a reset connection, an HTTP error of `/v1/oauth2/token`), the calls waiting for it fail with that error, mapped as in 2.1.0 (a timeout like a network error, as above), with nothing sent to the API. Since 2.2.0 the provider then replaces its SDK client, so the next call requests a new token; in 2.1.0 every later call of that `PayPalProvider` failed at once with the same error, until the app built a new one. Without `timeoutMs`, a token request that never answers stalls every later call of the provider, not only the first.
 
 ### Satispay
 
@@ -703,7 +714,7 @@ Currencies are validated against the ISO 4217 list of active alpha-3 codes (`ISO
 | `payment.created` (and `payment.failed` from `createPayment`) | always `false`: creation reports no payment outcome. `paymentId`/`orderId` are the ones you just created. |
 | `payment.completed` / `payment.failed` from `handleRedirect` / `executePayment` | `true` only for a MAC-verified (Nexi) or API-read (PayPal, Satispay) outcome, whatever its `success` |
 | `webhook.received` | `true` only for a MAC/signature-verified notification or an authenticated API re-read |
-| `payment.refunded` | `true` when the refund outcome comes from an authenticated provider API response (PayPal, Satispay: since 2.2.0 only an `ACCEPTED` refund or a 4xx refusal, never an unknown outcome); `false` for Nexi, whose refund response carries no MAC checked by the library |
+| `payment.refunded` | `true` when the refund outcome comes from an authenticated provider API response: PayPal, for any refund it returned, `COMPLETED` or not (a `PENDING` one may still complete; a refusal has no `verified`); Satispay, since 2.2.0, only an `ACCEPTED` refund or a 4xx refusal, never an unknown outcome. `false` for Nexi, whose refund response carries no MAC checked by the library. See [Refunds](#refunds) |
 
 Custom providers must set `verified: true` on the outcomes they have authenticated; an outcome without it is treated as unverified.
 
@@ -764,6 +775,8 @@ checkout.registerProvider(new StripeProvider({ secretKey: '...' }));
 ```
 
 **Refund idempotency** (since 2.2.0). `refundPayment(paymentId, amount?, options?)` has an optional third parameter, `RefundOptions`. A provider written for 2.1 keeps its two-parameter `refundPayment` and keeps compiling: it never receives a key, because the configurator refuses one (`REFUND_IDEMPOTENCY_NOT_SUPPORTED`) unless the provider declares `readonly supportsRefundIdempotency = true`. Declare it only when `refundPayment` sends `options.idempotencyKey` to the provider's API, so that a retry with the same key never refunds twice.
+
+- **Caveat: a 2.1 `refundPayment` with a third parameter of its own.** A provider whose `refundPayment` already declared a third parameter of another type, for example `reason?: 'duplicate' | 'fraudulent'`, no longer compiles against 2.2: TS2416 for a `BasePaymentProvider` subclass or a class that implements `IPaymentProvider`, TS2322 for an object typed `IPaymentProvider`. Widen that parameter to accept `RefundOptions` too (`reason?: 'duplicate' | 'fraudulent' | RefundOptions`): it compiles again, and its own callers are unchanged. At runtime nothing changes for it: without `supportsRefundIdempotency`, the configurator always calls it with `(paymentId, amount)`.
 
 To support [recurring payments](#recurring-payments-mandates), also implement `IMandateProvider` (`createMandate`, `confirmMandate`, `chargeMandate`, `getMandate`, `revokeMandate`): `isMandateProvider` detects the five methods, and the configurator validates inputs and normalizes outcomes as described there. Append `mandate_ref` to the setup URLs with `appendMandateRef(url, mandateRef)`. `confirmMandate(pending, {})`, with no callback input, must be safe to call again at any time, including after a terminal outcome: re-read the setup server-to-server or replay your own idempotency keys, never start a second first charge, and return an unverified, non-terminal outcome when you cannot re-read. Apps rely on it to [resolve an unknown first charge](#resolving-an-unknown-first-charge).
 

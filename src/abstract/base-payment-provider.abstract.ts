@@ -51,3 +51,21 @@ declare class SubclassWrittenFor21 extends BasePaymentProvider {
   getPaymentDetails(paymentId: string): Promise<PaymentResult>;
   refundPayment(paymentId: string, amount?: number): Promise<PaymentResult>;
 }
+
+/**
+ * Compile-time check only, as above. A subclass written for 2.1 whose `refundPayment` already declared a third
+ * parameter of another type does not compile against the 2.2 signature as it is (TS2416): it compiles again once that
+ * parameter also accepts `RefundOptions` (README "Custom Provider").
+ */
+declare class SubclassWithItsOwnThirdParameter extends BasePaymentProvider {
+  readonly name: string;
+  readonly flow: PaymentFlow;
+  createPayment(request: PaymentRequest): Promise<PaymentResult>;
+  executePayment(paymentId: string, data?: Record<string, string>): Promise<PaymentResult>;
+  getPaymentDetails(paymentId: string): Promise<PaymentResult>;
+  refundPayment(
+    paymentId: string,
+    amount?: number,
+    reason?: 'duplicate' | 'fraudulent' | RefundOptions,
+  ): Promise<PaymentResult>;
+}

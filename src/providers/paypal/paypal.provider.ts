@@ -68,8 +68,11 @@ export interface PayPalProviderConfig {
    * - `createMandate`, `createPayment`, `executePayment`, `getPaymentDetails`, `refundPayment` → `success: false`
    *   without `verified` (the outcome is unknown: a capture or a refund may have happened; retry a refund only with
    *   the same `RefundOptions.idempotencyKey`).
-   * Not set (default): no timeout, as in 2.1. A request PayPal never answers then waits forever. 30000 is a sensible
-   * value. This is the SDK's (axios) inactivity timeout: a response that keeps trickling bytes is not cut off.
+   * A token request that times out fails only the calls waiting for that token, with nothing sent: the provider then
+   * replaces its SDK client, and the next call requests a new token (since 2.2.0, for any failed token request).
+   * Not set (default): no timeout, as in 2.1. A request PayPal never answers then waits forever, and a token request
+   * that never answers stalls every later call of the provider. 30000 is a sensible value. This is the SDK's (axios)
+   * inactivity timeout: a response that keeps trickling bytes is not cut off.
    * Only a finite number > 0 is used: any other value (`0`, negative, `NaN`, `Infinity`, a string) behaves as not set.
    */
   timeoutMs?: number;
@@ -203,24 +206,44 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
   /** Since 2.2.0: `refundPayment` sends `options.idempotencyKey` as `PayPal-Request-Id` (kept 45 days by PayPal). */
   readonly supportsRefundIdempotency = true;
 
-  private client: Client;
-  private ordersController: OrdersController;
-  private paymentsController: PaymentsController;
-  private vaultController: VaultController;
-  /** Built on the first `getCharge`, never in the constructor (see `transactionSearch`). */
+  // Assigned by `connect`, from the constructor and again after a failed OAuth token request
+  private client!: Client;
+  private ordersController!: OrdersController;
+  private paymentsController!: PaymentsController;
+  private vaultController!: VaultController;
+  /** Built on the first `getCharge` of each client, never in `connect` (see `transactionSearch`). */
   private transactionSearchController?: TransactionSearchController;
 
   constructor(private readonly config: PayPalProviderConfig) {
     super();
-    const { clientId, clientSecret, environment = 'sandbox', timeoutMs } = config;
+    this.connect();
+  }
+
+  /**
+   * Builds the SDK client and its controllers: in the constructor, and again, since 2.2.0, after a failed OAuth token
+   * request. The SDK keeps the token request of a client and makes every later call of that client wait for it, so
+   * once that request has failed (a timeout, a network error, an HTTP error of `/v1/oauth2/token`), every later call
+   * would fail at once with the same error, without being sent, for the life of the provider. The token provider
+   * below is the SDK default (`updateToken`) plus a reconnection: on a failure it replaces the client, then rethrows,
+   * so the calls waiting for that token fail exactly as in 2.1 and the next call requests a new token. Only the
+   * failure of the current client's token request replaces it: a late failure on a client already replaced (a
+   * concurrent call) does nothing.
+   */
+  private connect(): void {
+    const { clientId, clientSecret, environment = 'sandbox', timeoutMs } = this.config;
     // Since 2.2.0, opt-in: without a valid timeoutMs the SDK default stays (no timeout, as in 2.1)
     const timeout =
       typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : undefined;
 
-    this.client = new Client({
+    const client: Client = new Client({
       clientCredentialsAuthCredentials: {
         oAuthClientId: clientId,
         oAuthClientSecret: clientSecret,
+        oAuthTokenProvider: (lastToken, authManager) =>
+          authManager.updateToken(lastToken).catch((error: unknown) => {
+            if (this.client === client) this.connect();
+            throw error;
+          }),
       },
       environment:
         environment === 'live' ? Environment.Production : Environment.Sandbox,
@@ -230,9 +253,11 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
       ...(timeout !== undefined ? { timeout } : {}),
     });
 
-    this.ordersController = new OrdersController(this.client);
-    this.paymentsController = new PaymentsController(this.client);
-    this.vaultController = new VaultController(this.client);
+    this.client = client;
+    this.ordersController = new OrdersController(client);
+    this.paymentsController = new PaymentsController(client);
+    this.vaultController = new VaultController(client);
+    this.transactionSearchController = undefined;
   }
 
   async createPayment(request: PaymentRequest): Promise<PaymentResult> {

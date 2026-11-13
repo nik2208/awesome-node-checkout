@@ -391,7 +391,9 @@ export class CheckoutConfigurator {
    * - a key on a provider whose `supportsRefundIdempotency` is not `true` (Nexi, a provider written for 2.1) →
    *   `CheckoutError('REFUND_IDEMPOTENCY_NOT_SUPPORTED')` (HTTP 422 through the router).
    * Without `options` (or with `null`) the provider is called with `(paymentId, amount)`, exactly as in 2.1; with
-   * them, with `(paymentId, amount, { idempotencyKey })` (the known field only). Emits `payment.refunded`, unchanged.
+   * them, with `(paymentId, amount, { idempotencyKey })` (the known field only). A provider whose
+   * `supportsRefundIdempotency` is not `true` always gets `(paymentId, amount)`: options without a key are not passed
+   * on to it, since its own third parameter, if any, may mean something else. Emits `payment.refunded`, unchanged.
    */
   async refundPayment(
     providerName: string,
@@ -423,7 +425,9 @@ export class CheckoutConfigurator {
 
   /**
    * Since 2.2.0. Validates the options of `refundPayment` and returns a copy with the known field only, or undefined
-   * for no options. The key is read once: the provider gets exactly the value that was checked.
+   * when the provider is called without options: no options, or options without a key for a provider whose
+   * `supportsRefundIdempotency` is not `true` (a provider written for 2.1 gets the 2.1 call, whatever its own third
+   * parameter). The key is read once: the provider gets exactly the value that was checked.
    */
   private refundOptions(
     providerName: string,
@@ -435,7 +439,7 @@ export class CheckoutConfigurator {
       throw new CheckoutError('Invalid refund options', 'INVALID_REFUND_REQUEST', providerName);
     }
     const idempotencyKey: unknown = options.idempotencyKey;
-    if (idempotencyKey === undefined) return {};
+    if (idempotencyKey === undefined) return provider.supportsRefundIdempotency === true ? {} : undefined;
     if (!isRefundIdempotencyKey(idempotencyKey)) {
       throw new CheckoutError(
         'Invalid idempotencyKey: expected /^[A-Za-z0-9_-]{8,64}$/',

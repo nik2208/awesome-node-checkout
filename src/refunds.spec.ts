@@ -38,6 +38,22 @@ class DummyProvider extends BasePaymentProvider {
   }
 }
 
+/**
+ * A provider written for 2.1 whose refundPayment already had a third parameter of its own, widened to accept
+ * RefundOptions too so that it compiles against 2.2 (README "Custom Provider"). No supportsRefundIdempotency.
+ */
+class ReasonProvider extends DummyProvider {
+  name = 'reason';
+
+  async refundPayment(
+    id: string,
+    amount?: number,
+    reason?: 'duplicate' | 'fraudulent' | RefundOptions,
+  ): Promise<PaymentResult> {
+    return { success: true, paymentId: id, status: 'REFUNDED', raw: { amount, reason } };
+  }
+}
+
 const KEY = 'refund-ORD-001-R1';
 
 async function rejection(promise: Promise<unknown>): Promise<CheckoutError> {
@@ -185,11 +201,26 @@ describe('Refund idempotency keys: configurator (#44)', () => {
       ]);
     });
 
-    it('options without a key are passed on, and need no provider support', async () => {
+    it('options without a key need no provider support, and go only to a provider that supports keys', async () => {
       await checkout.refundPayment('paypal', 'ORD', 5, {});
       await checkout.refundPayment('dummy', 'PAY-1', 5, {});
       expect(paypalRefund.mock.calls).toEqual([['ORD', 5, {}]]);
-      expect(dummyRefund).toHaveBeenCalledTimes(1);
+      // A provider written for 2.1 gets the 2.1 call
+      expect(dummyRefund.mock.calls).toEqual([['PAY-1', 5]]);
+      expect(dummyRefund.mock.calls[0]).toHaveLength(2);
+    });
+
+    it('a provider written for 2.1 with a third parameter of its own never gets the options in it', async () => {
+      const reason = new ReasonProvider();
+      checkout.registerProvider(reason);
+      const reasonRefund = vi.spyOn(reason, 'refundPayment');
+      const result = await checkout.refundPayment('reason', 'PAY-2', 5, {});
+      expect(reasonRefund.mock.calls).toEqual([['PAY-2', 5]]);
+      expect(reasonRefund.mock.calls[0]).toHaveLength(2);
+      expect(result).toMatchObject({ success: true, paymentId: 'PAY-2', status: 'REFUNDED' });
+      expect((result.raw as { reason?: unknown }).reason).toBeUndefined();
+      // Its own callers keep passing their value
+      await expect(reason.refundPayment('PAY-3', 5, 'duplicate')).resolves.toMatchObject({ raw: { reason: 'duplicate' } });
     });
 
     it('a provider written for 2.1 keeps working without options: same call, same result, same event', async () => {

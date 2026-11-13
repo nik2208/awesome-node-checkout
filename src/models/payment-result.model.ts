@@ -21,6 +21,15 @@ export interface PaymentResult {
   /** ISO 4217 alpha code reported by the provider (e.g. 'EUR') */
   currency?: string;
 
+  /**
+   * Since 2.2.0. Total refunded so far for this charge, in major units of the charge's currency, as the provider reports
+   * it. `0` means the provider reports no refund. Absent (undefined) means the provider does not report it: never read
+   * absence as 0.
+   *
+   * Set only by PayPal `getPaymentDetails` (the order's COMPLETED refunds); the other providers leave it undefined.
+   */
+  refundedAmount?: number;
+
   /** Order identifier associated with the payment if tracked */
   orderId?: string;
 

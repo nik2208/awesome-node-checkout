@@ -650,6 +650,7 @@ function sendErrorResponse(
       WEBHOOK_NOT_SUPPORTED: 422,
       REDIRECT_NOT_SUPPORTED: 422,
       MANDATES_NOT_SUPPORTED: 422,
+      CHARGE_LOOKUP_NOT_SUPPORTED: 422,
     };
     const status = statusMap[err.code] ?? 400;
     res.status(status).json({ success: false, error: err.message, code: err.code });

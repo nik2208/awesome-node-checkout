@@ -10,7 +10,17 @@ export type CheckoutErrorCode =
   | 'MANDATES_NOT_SUPPORTED'
   | 'INVALID_MANDATE_REQUEST'
   /** Since 2.2.0: `getCharge` on a provider without `IChargeLookupProvider` (HTTP 422 through the router). */
-  | 'CHARGE_LOOKUP_NOT_SUPPORTED';
+  | 'CHARGE_LOOKUP_NOT_SUPPORTED'
+  /**
+   * Since 2.2.0: `refundPayment` with invalid `options`, such as an `idempotencyKey` that is not a string matching
+   * `REFUND_IDEMPOTENCY_KEY_PATTERN` (HTTP 400 through the router).
+   */
+  | 'INVALID_REFUND_REQUEST'
+  /**
+   * Since 2.2.0: `refundPayment` with an `idempotencyKey` on a provider whose `supportsRefundIdempotency` is not
+   * `true`, such as Nexi (HTTP 422 through the router).
+   */
+  | 'REFUND_IDEMPOTENCY_NOT_SUPPORTED';
 
 export class CheckoutError extends Error {
   constructor(

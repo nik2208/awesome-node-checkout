@@ -44,6 +44,7 @@ import {
 } from '../../models/mandate.model';
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult } from '../../models/payment-result.model';
+import { RefundOptions, isRefundIdempotencyKey } from '../../models/refund.model';
 import { parseAmount } from '../../utils/parsing.util';
 import { currencyExponent, isInvalidAmountError, toMajorString, toMinorUnits } from '../../utils/money';
 import { appendMandateRef } from '../../utils/url';
@@ -56,6 +57,22 @@ export interface PayPalProviderConfig {
   environment?: 'sandbox' | 'live';
   /** Vault customer type of the payment tokens saved by `createMandate`. @default 'CONSUMER' */
   customerType?: 'CONSUMER' | 'BUSINESS';
+  /**
+   * Since 2.2.0. Timeout of every PayPal API call made by this provider, the OAuth token request included, in ms. It is
+   * passed to the SDK `Client` as `timeout`. A call that exceeds it fails like a network error:
+   * - `chargeMandate` → `unknown`;
+   * - `confirmMandate` → unverified, non-terminal, with an `unknown` first charge;
+   * - `getMandate` → `unknown`;
+   * - `revokeMandate` → `revokedAtProvider: false`;
+   * - `getCharge` → `unknown`;
+   * - `createMandate`, `createPayment`, `executePayment`, `getPaymentDetails`, `refundPayment` → `success: false`
+   *   without `verified` (the outcome is unknown: a capture or a refund may have happened; retry a refund only with
+   *   the same `RefundOptions.idempotencyKey`).
+   * Not set (default): no timeout, as in 2.1. A request PayPal never answers then waits forever. 30000 is a sensible
+   * value. This is the SDK's (axios) inactivity timeout: a response that keeps trickling bytes is not cut off.
+   * Only a finite number > 0 is used: any other value (`0`, negative, `NaN`, `Infinity`, a string) behaves as not set.
+   */
+  timeoutMs?: number;
 }
 
 const SETUP_NOT_MATCHING = 'Outcome does not match the pending setup';
@@ -183,6 +200,8 @@ function captureRefundTotal(order: unknown, captureStatus: unknown, currency: un
 export class PayPalProvider extends BasePaymentProvider implements IMandateProvider, IChargeLookupProvider {
   readonly name = 'paypal';
   readonly flow = 'redirect' as const;
+  /** Since 2.2.0: `refundPayment` sends `options.idempotencyKey` as `PayPal-Request-Id` (kept 45 days by PayPal). */
+  readonly supportsRefundIdempotency = true;
 
   private client: Client;
   private ordersController: OrdersController;
@@ -193,7 +212,10 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
 
   constructor(private readonly config: PayPalProviderConfig) {
     super();
-    const { clientId, clientSecret, environment = 'sandbox' } = config;
+    const { clientId, clientSecret, environment = 'sandbox', timeoutMs } = config;
+    // Since 2.2.0, opt-in: without a valid timeoutMs the SDK default stays (no timeout, as in 2.1)
+    const timeout =
+      typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : undefined;
 
     this.client = new Client({
       clientCredentialsAuthCredentials: {
@@ -205,6 +227,7 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
       logging: {
         logLevel: LogLevel.Error,
       },
+      ...(timeout !== undefined ? { timeout } : {}),
     });
 
     this.ordersController = new OrdersController(this.client);
@@ -351,7 +374,17 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
     }
   }
 
-  async refundPayment(paymentId: string, amount?: number): Promise<PaymentResult> {
+  /**
+   * Refunds the first capture of the order `paymentId`, in full (`amount` omitted) or in part. Since 2.2.0,
+   * `options.idempotencyKey` is sent as `PayPal-Request-Id` (PayPal keeps it 45 days): a retry with the same key gets
+   * PayPal's original answer. Without a key the request is exactly the 2.1 one. A key that does not match
+   * `REFUND_IDEMPOTENCY_KEY_PATTERN` is refused (`REFUND_FAILED`) without any request.
+   */
+  async refundPayment(paymentId: string, amount?: number, options?: RefundOptions): Promise<PaymentResult> {
+    const idempotencyKey = options?.idempotencyKey;
+    if (idempotencyKey !== undefined && !isRefundIdempotencyKey(idempotencyKey)) {
+      return { success: false, paymentId, status: 'REFUND_FAILED', error: 'Invalid refund idempotency key' };
+    }
     try {
       // Retrieve order to find the capture ID and currency
       const { result: order } = await this.ordersController.getOrder({ id: paymentId });
@@ -392,6 +425,8 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
 
       const { result: refund } = await this.paymentsController.refundCapturedPayment({
         captureId,
+        // Only when given: without a key the call is exactly `{ captureId, body }`, as in 2.1
+        ...(idempotencyKey !== undefined ? { paypalRequestId: idempotencyKey } : {}),
         body: refundBody as any,
       });
 
@@ -697,7 +732,12 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
     };
   }
 
-  /** Maps the first capture of a setup order (`chargeRef = pending.orderId`). */
+  /**
+   * Maps the first capture of a setup order (`chargeRef = pending.orderId`). A `COMPLETED` capture of other money
+   * than `pending` (or with no valid amount) is `unknown`; since 2.2.0 it carries `errorCode: 'AMOUNT_MISMATCH'`, the
+   * order id (`refundPayment` takes it: the money was captured) and the amount and currency PayPal reported, when it
+   * reported them.
+   */
   private mapSetupCapture(order: Order, pending: MandatePendingState): ChargeResult {
     const chargeRef = pending.orderId;
     const cap = firstCapture(order);
@@ -705,7 +745,19 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
     switch (capStatus) {
       case 'COMPLETED':
         if (!sameMoney(cap?.amount?.value, cap?.amount?.currencyCode, pending.amount, pending.currency)) {
-          return { status: 'unknown', verified: true, chargeRef, error: CAPTURED_AMOUNT_MISMATCH };
+          // `cap.amount` may be missing or malformed here: every read is guarded, money was taken
+          const amount = parseAmount(cap?.amount?.value);
+          const currency: unknown = cap?.amount?.currencyCode;
+          return {
+            status: 'unknown',
+            verified: true,
+            chargeRef,
+            errorCode: 'AMOUNT_MISMATCH',
+            error: CAPTURED_AMOUNT_MISMATCH,
+            ...(typeof order?.id === 'string' && order.id !== '' ? { providerPaymentId: order.id } : {}),
+            ...(amount !== undefined ? { amount } : {}),
+            ...(typeof currency === 'string' ? { currency } : {}),
+          };
         }
         return {
           status: 'succeeded',

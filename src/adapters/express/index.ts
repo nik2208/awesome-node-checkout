@@ -651,6 +651,7 @@ function sendErrorResponse(
       REDIRECT_NOT_SUPPORTED: 422,
       MANDATES_NOT_SUPPORTED: 422,
       CHARGE_LOOKUP_NOT_SUPPORTED: 422,
+      REFUND_IDEMPOTENCY_NOT_SUPPORTED: 422,
     };
     const status = statusMap[err.code] ?? 400;
     res.status(status).json({ success: false, error: err.message, code: err.code });

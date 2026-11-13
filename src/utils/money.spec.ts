@@ -276,16 +276,33 @@ describe('money utils (Issue #29)', () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it('refundPayment with an omitted amount still sends an empty body (full refund)', async () => {
-      const fetchMock = vi.fn().mockResolvedValue({
-        ok: true,
-        text: vi.fn().mockResolvedValue(JSON.stringify({ id: 'REF-1', status: 'ACCEPTED' })),
-      });
+    it('refundPayment with an omitted amount still refunds in full: it reads the payment, then refunds its amount_unit (#44)', async () => {
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          text: vi.fn().mockResolvedValue(JSON.stringify({ id: 'SAT-1', status: 'ACCEPTED', amount_unit: 1999, currency: 'EUR' })),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          text: vi.fn().mockResolvedValue(
+            JSON.stringify({ id: 'REF-1', type: 'REFUND_TO_BUSINESS', status: 'ACCEPTED', amount_unit: 1999, currency: 'EUR' }),
+          ),
+        });
       globalThis.fetch = fetchMock as any;
       const satispay = new SatispayProvider({ keyId: 'k', privateKey });
       const result = await satispay.refundPayment('SAT-1');
       expect(result.success).toBe(true);
-      expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual({});
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe('GET');
+      expect(JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string)).toEqual({
+        flow: 'REFUND',
+        parent_payment_uid: 'SAT-1',
+        amount_unit: 1999,
+        currency: 'EUR',
+      });
     });
   });
 

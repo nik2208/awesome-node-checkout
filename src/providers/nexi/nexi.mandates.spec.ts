@@ -1019,6 +1019,25 @@ describe('NexiProvider mandates (#31)', () => {
     expect(result.success).toBe(true);
   });
 
+  it('refundPayment with an idempotency key, called directly, refuses without any request (#44)', async () => {
+    expect(provider.supportsRefundIdempotency).not.toBe(true);
+    const result = await provider.refundPayment('SUB-0001-2026-12', 19.9, { idempotencyKey: 'refund-SUB-0001-R1' });
+    expect(result).toEqual({
+      success: false,
+      status: 'REFUND_FAILED',
+      error: 'Nexi refunds do not support an idempotency key',
+    });
+    expect(fetchMock()).not.toHaveBeenCalled();
+  });
+
+  it('refundPayment with options but no key sends the storno as before (#44)', async () => {
+    fetchMock().mockResolvedValueOnce(jsonResponse({ esito: 'OK' }));
+    const result = await provider.refundPayment('SUB-0001-2026-12', 19.9, {});
+    expect(fetchMock()).toHaveBeenCalledTimes(1);
+    expect(callUrl(0)).toBe('https://int-ecommerce.nexi.it/ecomm/api/vas/igfs/storno/plain');
+    expect(result.success).toBe(true);
+  });
+
   // ---------------------------------------------------------------------------
   // AC 9 — end to end through CheckoutConfigurator and the Express callback route
   // ---------------------------------------------------------------------------

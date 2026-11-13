@@ -119,7 +119,13 @@ export interface ChargeResult {
   currency?: string;
   /** Set when the provider says the mandate is no longer usable (revoked, expired, contract KO). */
   mandateUnusable?: boolean;
+  /** Free text: compare `errorCode`, never this. */
   error?: string;
+  /**
+   * Since 2.2.0. Stable, machine-readable reason set by the library (see `ChargeErrorCode`). Never on a `succeeded`
+   * result. An unknown code is treated like no code.
+   */
+  errorCode?: ChargeErrorCode;
   /** Provider decline/error code when available. */
   providerCode?: string;
   /**
@@ -131,6 +137,16 @@ export interface ChargeResult {
   providerStatus?: string;
   raw?: unknown;
 }
+
+/**
+ * Since 2.2.0. Stable, machine-readable reason set by the library on a charge result. Compare this, never `error`
+ * (free text). More codes may be added in minor releases: treat an unknown code like no code. `providerCode` stays the
+ * provider's own decline or error code.
+ * - 'AMOUNT_MISMATCH': the provider reports money taken for another amount or currency than requested. `status` is
+ *   'unknown'; `amount` / `currency` are the reported ones when the provider gave them. Do not retry: a retry gets the
+ *   same answer. Review it, and refund or keep the money.
+ */
+export type ChargeErrorCode = 'AMOUNT_MISMATCH';
 
 /**
  * Since 2.2.0. What the provider reports about money it took for a charge, when it is more than "paid":

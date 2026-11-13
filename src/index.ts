@@ -30,8 +30,11 @@ export type {
   ChargeLookupStatus,
   ChargeLookupOptions,
   ChargeLookupResult,
+  ChargeErrorCode,
 } from './models/mandate.model';
 export { MANDATE_REF_PATTERN, CHARGE_REF_PATTERN } from './models/mandate.model';
+export type { RefundOptions } from './models/refund.model';
+export { REFUND_IDEMPOTENCY_KEY_PATTERN } from './models/refund.model';
 export { CheckoutError } from './models/errors';
 export type { CheckoutErrorCode } from './models/errors';
 

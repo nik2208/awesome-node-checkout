@@ -1136,6 +1136,25 @@ describe('NexiProvider mandates (#31)', () => {
     expect(fetchMock()).not.toHaveBeenCalled();
   });
 
+  it('refundPayment called directly with any key, or with options of another shape, refuses without any request (#44)', async () => {
+    for (const idempotencyKey of ['short', 123 as unknown as string]) {
+      expect(await provider.refundPayment('SUB-0001-2026-12', 19.9, { idempotencyKey })).toEqual({
+        success: false,
+        status: 'REFUND_FAILED',
+        error: 'Nexi refunds do not support an idempotency key',
+      });
+    }
+    // options is typed unknown (for 2.1 subclasses with a third parameter of their own): other shapes are refused
+    for (const options of ['duplicate', 42, [], { idempotencyKy: 'refund-SUB-0001-R1' }, { reason: 'duplicate' }]) {
+      expect(await provider.refundPayment('SUB-0001-2026-12', 19.9, options)).toEqual({
+        success: false,
+        status: 'REFUND_FAILED',
+        error: 'Invalid refund options',
+      });
+    }
+    expect(fetchMock()).not.toHaveBeenCalled();
+  });
+
   it('refundPayment with options but no key sends the storno as before (#44)', async () => {
     fetchMock().mockResolvedValueOnce(jsonResponse({ esito: 'OK' }));
     const result = await provider.refundPayment('SUB-0001-2026-12', 19.9, {});

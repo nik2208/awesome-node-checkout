@@ -17,8 +17,9 @@ export type CheckoutErrorCode =
    */
   | 'INVALID_REFUND_REQUEST'
   /**
-   * Since 2.2.0: `refundPayment` with an `idempotencyKey` on a provider whose `supportsRefundIdempotency` is not
-   * `true`, such as Nexi (HTTP 422 through the router).
+   * Since 2.2.0: `refundPayment` with an `idempotencyKey` on a provider for which `isRefundIdempotencyProvider` is
+   * false, such as Nexi, a provider written for 2.1, or a subclass whose `refundPayment` override declares only
+   * `(paymentId, amount)` (HTTP 422 through the router).
    */
   | 'REFUND_IDEMPOTENCY_NOT_SUPPORTED';
 

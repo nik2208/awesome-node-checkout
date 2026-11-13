@@ -986,6 +986,66 @@ describe('SatispayProvider mandates (pre-authorized payment tokens)', () => {
       });
     });
 
+    describe('a 2xx ACCEPTED answer is this refund only when it is bound to the request (release review)', () => {
+      const MISMATCH = {
+        success: false,
+        error: 'Satispay answer does not match the refund request',
+      };
+
+      it('a charge replayed for a reused key (a chargeRef as the refund key) is not a refund: uncertain, not verified', async () => {
+        // The shape of the library's own PRE_AUTHORIZED charge answer: no type, external_code = chargeRef
+        const charge = { id: 'pay_9', status: 'ACCEPTED', amount_unit: 1990, currency: 'EUR', external_code: 'SUB-0001-2026-12' };
+        routes({ [`POST ${PAYMENTS}`]: () => resp(200, charge) });
+        const checkout = new CheckoutConfigurator();
+        checkout.registerProvider(provider);
+        const events: any[] = [];
+        checkout.events.on('payment.refunded', (payload) => {
+          events.push(payload);
+        });
+
+        const result = await checkout.refundPayment('satispay', 'pay_1', 19.9, { idempotencyKey: 'SUB-0001-2026-12' });
+
+        expect(result).toEqual({ ...MISMATCH, raw: charge });
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({ provider: 'satispay', paymentId: 'pay_1', verified: false });
+        expect(events[0].status).toBeUndefined();
+      });
+
+      it('a REFUND_TO_BUSINESS answer for another amount (500 for a 19.90 refund) is not this refund', async () => {
+        routes({ [`POST ${PAYMENTS}`]: () => resp(200, { ...refund, amount_unit: 500 }) });
+        expect(await provider.refundPayment('pay_1', 19.9)).toEqual({ ...MISMATCH, raw: { ...refund, amount_unit: 500 } });
+      });
+
+      it.each([
+        ['no type', (({ type: _type, ...rest }) => rest)(refund)],
+        ["type: 'TO_BUSINESS'", { ...refund, type: 'TO_BUSINESS' }],
+        ['an external_code', { ...refund, external_code: 'refund-SUB-0001-R1' }],
+        ["the refunded payment's own id", { ...refund, id: 'pay_1' }],
+        ['no amount_unit', (({ amount_unit: _unit, ...rest }) => rest)(refund)],
+        ["amount_unit: '1990'", { ...refund, amount_unit: '1990' }],
+        ['an empty id', { ...refund, id: '' }],
+      ])('ACCEPTED with %s: uncertain, not verified, no status', async (_label, body) => {
+        routes({ [`POST ${PAYMENTS}`]: () => resp(200, body) });
+        const result = await provider.refundPayment('pay_1', 19.9, { idempotencyKey: 'refund-SUB-0001-R1' });
+        expect(result).toEqual({ ...MISMATCH, raw: body });
+      });
+
+      it('external_code null or empty is no external_code', async () => {
+        for (const external_code of [null, '']) {
+          routes({ [`POST ${PAYMENTS}`]: () => resp(200, { ...refund, external_code }) });
+          expect(await provider.refundPayment('pay_1', 19.9)).toMatchObject({ success: true, verified: true, paymentId: 'ref_1' });
+        }
+      });
+
+      it('full refund: the answer must carry the amount_unit that the read gave', async () => {
+        routes({
+          [`GET ${PAYMENTS}/pay_1`]: () => resp(200, payment),
+          [`POST ${PAYMENTS}`]: () => resp(200, { ...refund, amount_unit: 990 }),
+        });
+        expect(await provider.refundPayment('pay_1')).toEqual({ ...MISMATCH, raw: { ...refund, amount_unit: 990 } });
+      });
+    });
+
     it("400 { code: 36, message } is an authenticated refusal: { success: false, verified: true, status: 'REFUND_FAILED', error }", async () => {
       routes({ [`POST ${PAYMENTS}`]: () => resp(400, { code: 36, message: 'Refund amount exceeds the payment' }) });
       const result = await provider.refundPayment('pay_1', 19.9);
@@ -1099,6 +1159,24 @@ describe('SatispayProvider mandates (pre-authorized payment tokens)', () => {
         const result = await provider.refundPayment('pay_1', 19.9, { idempotencyKey });
         expect(result).toMatchObject({ success: false, status: 'REFUND_FAILED' });
         expect(result.verified).not.toBe(true);
+      }
+      expect(fetchMock()).not.toHaveBeenCalled();
+    });
+
+    it('called directly with options of another shape (typed unknown, for 2.1 subclasses), refuses without any request', async () => {
+      for (const options of [
+        'duplicate',
+        42,
+        [],
+        { idempotencyKy: 'refund-SUB-0001-R1' },
+        { idempotencyKey: 'refund-SUB-0001-R1', reason: 'duplicate' },
+      ]) {
+        expect(await provider.refundPayment('pay_1', 19.9, options)).toEqual({
+          success: false,
+          paymentId: 'pay_1',
+          status: 'REFUND_FAILED',
+          error: 'Invalid refund options',
+        });
       }
       expect(fetchMock()).not.toHaveBeenCalled();
     });

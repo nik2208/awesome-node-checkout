@@ -8,6 +8,8 @@ export type { IMandateProvider } from './interfaces/mandate-provider.interface';
 export { isMandateProvider } from './interfaces/mandate-provider.interface';
 export type { IChargeLookupProvider } from './interfaces/charge-lookup-provider.interface';
 export { isChargeLookupProvider } from './interfaces/charge-lookup-provider.interface';
+export type { IRefundIdempotencyProvider } from './interfaces/refund-idempotency-provider.interface';
+export { isRefundIdempotencyProvider } from './interfaces/refund-idempotency-provider.interface';
 
 // ---- Models ----------------------------------------------------------------
 export type { PaymentRequest } from './models/payment-request.model';

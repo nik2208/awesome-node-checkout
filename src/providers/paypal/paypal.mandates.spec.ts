@@ -956,6 +956,37 @@ describe('PayPalProvider mandates (Vault)', () => {
       expect(sdk.getOrder).not.toHaveBeenCalled();
       expect(sdk.refundCapturedPayment).not.toHaveBeenCalled();
     });
+
+    it('called directly with options of another shape (typed unknown, for 2.1 subclasses), refuses without any request', async () => {
+      for (const options of [
+        'duplicate',
+        42,
+        [],
+        { idempotencyKy: 'refund-SUB-0001-R1' },
+        { idempotencyKey: 'refund-SUB-0001-R1', reason: 'duplicate' },
+      ]) {
+        const refund = await provider.refundPayment('PAYPAL-ORD-2', 19.9, options);
+        expect(refund).toEqual({
+          success: false,
+          paymentId: 'PAYPAL-ORD-2',
+          status: 'REFUND_FAILED',
+          error: 'Invalid refund options',
+        });
+      }
+      expect(sdk.getOrder).not.toHaveBeenCalled();
+      expect(sdk.refundCapturedPayment).not.toHaveBeenCalled();
+    });
+
+    it('called directly with null options, the call is exactly the 2.1 one', async () => {
+      sdk.getOrder.mockResolvedValueOnce({ result: chargeOrder('COMPLETED', 'COMPLETED') });
+      sdk.refundCapturedPayment.mockResolvedValueOnce({ result: { id: 'REFUND-1', status: 'COMPLETED' } });
+      const refund = await provider.refundPayment('PAYPAL-ORD-2', 19.9, null);
+      expect(sdk.refundCapturedPayment.mock.calls[0][0]).toEqual({
+        captureId: 'CAP-2',
+        body: { amount: { value: '19.90', currencyCode: 'EUR' } },
+      });
+      expect(refund.success).toBe(true);
+    });
   });
 
   it('package.json declares @paypal/paypal-server-sdk ^2.5.0 (criterion 7)', () => {

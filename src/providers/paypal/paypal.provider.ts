@@ -26,6 +26,7 @@ import type {
 import { BasePaymentProvider } from '../../abstract/base-payment-provider.abstract';
 import { IMandateProvider } from '../../interfaces/mandate-provider.interface';
 import { IChargeLookupProvider } from '../../interfaces/charge-lookup-provider.interface';
+import { IRefundIdempotencyProvider } from '../../interfaces/refund-idempotency-provider.interface';
 import {
   ChargeLookupOptions,
   ChargeLookupResult,
@@ -44,7 +45,7 @@ import {
 } from '../../models/mandate.model';
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult } from '../../models/payment-result.model';
-import { RefundOptions, isRefundIdempotencyKey } from '../../models/refund.model';
+import { readRefundOptions } from '../../models/refund.model';
 import { parseAmount } from '../../utils/parsing.util';
 import { currencyExponent, isInvalidAmountError, toMajorString, toMinorUnits } from '../../utils/money';
 import { appendMandateRef } from '../../utils/url';
@@ -199,12 +200,22 @@ function captureRefundTotal(order: unknown, captureStatus: unknown, currency: un
  *
  * Charge lookup (`IChargeLookupProvider`, since 2.2.0): `getCharge` locates a charge by `invoice_id` with the
  * Transaction Search API and re-reads its capture.
+ *
+ * Refund idempotency keys (`IRefundIdempotencyProvider`, since 2.2.0): `refundPayment` sends
+ * `options.idempotencyKey` as `PayPal-Request-Id`.
  */
-export class PayPalProvider extends BasePaymentProvider implements IMandateProvider, IChargeLookupProvider {
+export class PayPalProvider
+  extends BasePaymentProvider
+  implements IMandateProvider, IChargeLookupProvider, IRefundIdempotencyProvider
+{
   readonly name = 'paypal';
   readonly flow = 'redirect' as const;
-  /** Since 2.2.0: `refundPayment` sends `options.idempotencyKey` as `PayPal-Request-Id` (kept 45 days by PayPal). */
-  readonly supportsRefundIdempotency = true;
+  /**
+   * Since 2.2.0: `refundPayment` sends `options.idempotencyKey` as `PayPal-Request-Id` (kept 45 days by PayPal).
+   * Typed `boolean` so that a subclass can set it to `false`, for example one whose `refundPayment` override does not
+   * pass `options` on (see `IRefundIdempotencyProvider`).
+   */
+  readonly supportsRefundIdempotency: boolean = true;
 
   // Assigned by `connect`, from the constructor and again after a failed OAuth token request
   private client!: Client;
@@ -402,14 +413,19 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
   /**
    * Refunds the first capture of the order `paymentId`, in full (`amount` omitted) or in part. Since 2.2.0,
    * `options.idempotencyKey` is sent as `PayPal-Request-Id` (PayPal keeps it 45 days): a retry with the same key gets
-   * PayPal's original answer. Without a key the request is exactly the 2.1 one. A key that does not match
-   * `REFUND_IDEMPOTENCY_KEY_PATTERN` is refused (`REFUND_FAILED`) without any request.
+   * PayPal's original answer. Without a key the request is exactly the 2.1 one.
+   *
+   * `options` is a `RefundOptions` (see `IRefundIdempotencyProvider`), typed `unknown` here so that a subclass written
+   * for 2.1 whose override declared a third parameter of its own keeps compiling. Anything other than `undefined`,
+   * `null` or `{ idempotencyKey? }` with a key matching `REFUND_IDEMPOTENCY_KEY_PATTERN` (another field, a misspelt
+   * key, a value that is not an object) is refused (`REFUND_FAILED`) without any request.
    */
-  async refundPayment(paymentId: string, amount?: number, options?: RefundOptions): Promise<PaymentResult> {
-    const idempotencyKey = options?.idempotencyKey;
-    if (idempotencyKey !== undefined && !isRefundIdempotencyKey(idempotencyKey)) {
-      return { success: false, paymentId, status: 'REFUND_FAILED', error: 'Invalid refund idempotency key' };
+  async refundPayment(paymentId: string, amount?: number, options?: unknown): Promise<PaymentResult> {
+    const read = readRefundOptions(options);
+    if (!read.ok) {
+      return { success: false, paymentId, status: 'REFUND_FAILED', error: read.error };
     }
+    const idempotencyKey = read.idempotencyKey;
     try {
       // Retrieve order to find the capture ID and currency
       const { result: order } = await this.ordersController.getOrder({ id: paymentId });
@@ -1206,4 +1222,18 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
       ...(raw !== undefined ? { raw } : {}),
     };
   }
+}
+
+/**
+ * Compile-time check only (`npm run typecheck`): ambient and not exported, so it emits no code and no declaration.
+ * A subclass written for 2.1 whose `refundPayment` override declared a third parameter of its own must keep
+ * compiling (#44).
+ */
+declare class PayPalProviderSubclassWrittenFor21 extends PayPalProvider {
+  refundPayment(paymentId: string, amount?: number, reason?: 'duplicate' | 'fraudulent'): Promise<PaymentResult>;
+}
+
+/** Compile-time check only, as above: a subclass may opt out of refund idempotency keys (README "Custom Provider"). */
+declare class PayPalProviderWithoutRefundKeys extends PayPalProvider {
+  readonly supportsRefundIdempotency: false;
 }

@@ -4,7 +4,7 @@ import { generateOrderId } from '../../utils/ids';
 import { currencyExponent, isInvalidAmountError, toMinorUnits } from '../../utils/money';
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult, WebhookResult } from '../../models/payment-result.model';
-import { RefundOptions } from '../../models/refund.model';
+import { readRefundOptions } from '../../models/refund.model';
 import { parseAmountFromCents, parseNexiCurrency } from '../../utils/parsing.util';
 import { appendMandateRef } from '../../utils/url';
 import { IMandateProvider } from '../../interfaces/mandate-provider.interface';
@@ -911,12 +911,23 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
 
   /**
    * Storno of `paymentId` (`codTrans`), in full (`amount` omitted) or in part. The storno API has no idempotency key,
-   * so `supportsRefundIdempotency` is unset and the configurator refuses a key (`REFUND_IDEMPOTENCY_NOT_SUPPORTED`).
-   * Called directly with one (since 2.2.0), it returns `REFUND_FAILED` without any request.
+   * so the provider does not implement `IRefundIdempotencyProvider` and the configurator refuses a key
+   * (`REFUND_IDEMPOTENCY_NOT_SUPPORTED`). Called directly with one (since 2.2.0), it returns `REFUND_FAILED` without
+   * any request, and so it does for `options` that are not `undefined`, `null` or `{ idempotencyKey? }` (typed
+   * `unknown` so that a subclass written for 2.1 whose override declared a third parameter of its own keeps compiling).
    */
-  async refundPayment(paymentId: string, amount?: number, options?: RefundOptions): Promise<PaymentResult> {
-    if (options?.idempotencyKey !== undefined) {
+  async refundPayment(paymentId: string, amount?: number, options?: unknown): Promise<PaymentResult> {
+    if (
+      options !== null &&
+      typeof options === 'object' &&
+      (options as Record<string, unknown>)['idempotencyKey'] !== undefined
+    ) {
+      // Any key, valid or not: the storno API has none
       return { success: false, status: 'REFUND_FAILED', error: 'Nexi refunds do not support an idempotency key' };
+    }
+    const read = readRefundOptions(options);
+    if (!read.ok) {
+      return { success: false, status: 'REFUND_FAILED', error: read.error };
     }
     try {
       const timestamp = new Date().toISOString();
@@ -1399,4 +1410,13 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
       return { revokedAtProvider: false, error: 'Failed to revoke Nexi mandate' };
     }
   }
+}
+
+/**
+ * Compile-time check only (`npm run typecheck`): ambient and not exported, so it emits no code and no declaration.
+ * A subclass written for 2.1 whose `refundPayment` override declared a third parameter of its own must keep
+ * compiling (#44).
+ */
+declare class NexiProviderSubclassWrittenFor21 extends NexiProvider {
+  refundPayment(paymentId: string, amount?: number, reason?: 'duplicate' | 'fraudulent'): Promise<PaymentResult>;
 }

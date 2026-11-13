@@ -2,7 +2,7 @@ import * as crypto from 'crypto';
 import { BasePaymentProvider } from '../../abstract/base-payment-provider.abstract';
 import { PaymentRequest } from '../../models/payment-request.model';
 import { PaymentResult, WebhookResult } from '../../models/payment-result.model';
-import { RefundOptions, isRefundIdempotencyKey } from '../../models/refund.model';
+import { readRefundOptions } from '../../models/refund.model';
 import { ITransactionStore } from '../../interfaces/transaction-store.interface';
 import { InMemoryTransactionStore } from '../../stores/in-memory-transaction.store';
 import { parseAmountFromCents, parseNexiCurrency } from '../../utils/parsing.util';
@@ -10,6 +10,7 @@ import { generateOrderId } from '../../utils/ids';
 import { currencyExponent, isInvalidAmountError, toMinorUnits } from '../../utils/money';
 import { appendMandateRef } from '../../utils/url';
 import { IMandateProvider } from '../../interfaces/mandate-provider.interface';
+import { IRefundIdempotencyProvider } from '../../interfaces/refund-idempotency-provider.interface';
 import {
   ChargeRequest,
   ChargeResult,
@@ -119,15 +120,19 @@ export interface SatispayProviderConfig {
  * Recurring payments (`IMandateProvider`): Automatic Payments, web-redirect flow. A setup creates
  * a pre-authorized payment token, the customer approves it in Satispay, and every charge (the
  * first one included) is a synchronous `PRE_AUTHORIZED` payment. EUR only.
+ *
+ * Refund idempotency keys (`IRefundIdempotencyProvider`, since 2.2.0): `refundPayment` sends
+ * `options.idempotencyKey` as `Idempotency-Key`.
  */
-export class SatispayProvider extends BasePaymentProvider implements IMandateProvider {
+export class SatispayProvider extends BasePaymentProvider implements IMandateProvider, IRefundIdempotencyProvider {
   readonly name = 'satispay';
   readonly flow = 'webhook' as const;
   /**
    * Since 2.2.0: `refundPayment` sends `options.idempotencyKey` as `Idempotency-Key` (retention not documented by
-   * Satispay: retry promptly).
+   * Satispay: retry promptly). Typed `boolean` so that a subclass can set it to `false`, for example one whose
+   * `refundPayment` override does not pass `options` on (see `IRefundIdempotencyProvider`).
    */
-  readonly supportsRefundIdempotency = true;
+  readonly supportsRefundIdempotency: boolean = true;
 
   private readonly apiUrl: string;
   private readonly transactionStore: ITransactionStore;
@@ -572,16 +577,28 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
    *   `amount_unit > 0`, the result is `REFUND_FAILED` and nothing is sent. After an earlier
    *   partial refund, a full refund of the original amount is refused (4xx): pass the remaining
    *   amount explicitly.
-   * - `success: true` (verified) only for a 2xx `ACCEPTED` refund with an id and a `type` absent
-   *   or `REFUND_TO_BUSINESS`. Any other 2xx, a network error or a timeout, and HTTP 401, 403,
-   *   408, 409, 429 or 5xx are an unknown outcome (`success: false` without `verified`: the
-   *   refund may exist). Any other 4xx is an authenticated refusal (`verified: true`,
-   *   `REFUND_FAILED`): nothing was refunded.
+   * - `success: true` (verified) only for a 2xx `ACCEPTED` answer bound to this request: an id
+   *   that is not `paymentId`, `type: 'REFUND_TO_BUSINESS'`, the `amount_unit` sent, and no
+   *   `external_code` (refunds send none; every library charge sends one). Another 2xx `ACCEPTED`
+   *   answer, for example a charge that Satispay replays for a refund key equal to its
+   *   `Idempotency-Key`, is `{ success: false, error: 'Satispay answer does not match the refund
+   *   request' }` without `verified` or `status`. Any other 2xx, a network error or a timeout, and
+   *   HTTP 401, 403, 408, 409, 429 or 5xx are an unknown outcome too (`success: false` without
+   *   `verified`: the refund may exist). Any other 4xx is an authenticated refusal (`verified:
+   *   true`, `REFUND_FAILED`): nothing was refunded.
+   * - A Satispay refund key shares one key space with the charges (each is a `POST /payments`):
+   *   it must never equal a `chargeRef`, an `orderId` or `setup-<orderId>` of the account.
+   * - "no refund was sent" (a full refund whose read failed) is about this call only: on a retry
+   *   with the same key, an earlier attempt's refund may exist. Retry again, or pass the amount
+   *   explicitly, so that every retry sends the same body and skips the read.
    * - Bounded by `config.timeoutMs` only when it is set (no default timeout, as in 2.1).
-   * - A key that does not match `REFUND_IDEMPOTENCY_KEY_PATTERN` is refused (`REFUND_FAILED`)
-   *   without any request.
+   * - `options` is a `RefundOptions` (see `IRefundIdempotencyProvider`), typed `unknown` here so
+   *   that a subclass written for 2.1 whose override declared a third parameter of its own keeps
+   *   compiling. Anything other than `undefined`, `null` or `{ idempotencyKey? }` with a key
+   *   matching `REFUND_IDEMPOTENCY_KEY_PATTERN` (another field, a misspelt key, a value that is not
+   *   an object) is refused (`REFUND_FAILED`) without any request.
    */
-  async refundPayment(paymentId: string, amount?: number, options?: RefundOptions): Promise<PaymentResult> {
+  async refundPayment(paymentId: string, amount?: number, options?: unknown): Promise<PaymentResult> {
     if (!this.isValidPaymentId(paymentId)) {
       return {
         success: false,
@@ -590,10 +607,11 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
         error: 'Invalid payment ID format',
       };
     }
-    const idempotencyKey = options?.idempotencyKey;
-    if (idempotencyKey !== undefined && !isRefundIdempotencyKey(idempotencyKey)) {
-      return { success: false, paymentId, status: 'REFUND_FAILED', error: 'Invalid refund idempotency key' };
+    const read = readRefundOptions(options);
+    if (!read.ok) {
+      return { success: false, paymentId, status: 'REFUND_FAILED', error: read.error };
     }
+    const idempotencyKey = read.idempotencyKey;
     // As configured: unset means no timeout, as the 2.1 refund (request()) had none
     const timeout = { timeoutMs: this.config.timeoutMs };
 
@@ -643,11 +661,14 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
       idempotencyKey !== undefined ? { 'Idempotency-Key': idempotencyKey } : {},
       timeout,
     );
-    return this.mapRefund(res);
+    return this.mapRefund(res, paymentId, amountUnit);
   }
 
-  /** The answer to a `flow: 'REFUND'` payment, mapped as documented on `refundPayment`. */
-  private mapRefund(res: SatispaySendResult): PaymentResult {
+  /**
+   * The answer to a `flow: 'REFUND'` payment, mapped as documented on `refundPayment`. `paymentId` and `amountUnit` are
+   * the request's: a 2xx `ACCEPTED` answer is this refund only when it is bound to them.
+   */
+  private mapRefund(res: SatispaySendResult, paymentId: string, amountUnit: number): PaymentResult {
     if (res.networkError) {
       // The refund may exist: no `verified`
       return { success: false, error: 'Satispay refund outcome unknown (network error or timeout)' };
@@ -655,11 +676,25 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
     const json = res.json;
     if (res.ok) {
       const status = typeof json?.['status'] === 'string' ? json['status'] : undefined;
-      const id = json?.['id'];
-      const type = json?.['type'];
-      if (status === 'ACCEPTED' && typeof id === 'string' && id !== '' && (type === undefined || type === 'REFUND_TO_BUSINESS')) {
-        const refunded = parseAmountFromCents(json?.['amount_unit']);
-        const currency = json?.['currency'];
+      if (json && status === 'ACCEPTED') {
+        const id = json['id'];
+        const externalCode = json['external_code'];
+        const bound =
+          typeof id === 'string' &&
+          id !== '' &&
+          // A refund is a new payment: the refunded one's own answer is a replay
+          id !== paymentId &&
+          json['type'] === 'REFUND_TO_BUSINESS' &&
+          json['amount_unit'] === amountUnit &&
+          // Refunds send no external_code; every library charge sends one (= chargeRef or orderId)
+          (externalCode === undefined || externalCode === null || externalCode === '');
+        if (!bound) {
+          // For example a charge replayed for a refund key equal to its Idempotency-Key: this
+          // refund may or may not exist
+          return { success: false, error: 'Satispay answer does not match the refund request', raw: json };
+        }
+        const refunded = parseAmountFromCents(amountUnit);
+        const currency = json['currency'];
         return {
           success: true,
           // Authenticated server-to-server response, as in getPaymentDetails
@@ -671,7 +706,7 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
           raw: json,
         };
       }
-      // Not final, another type, no id or no JSON: uncertain
+      // Not final, or no JSON: uncertain
       const reported = status ?? 'UNKNOWN';
       return { success: false, status: reported, error: `Satispay refund is ${reported}`, raw: json };
     }
@@ -1219,4 +1254,18 @@ export class SatispayProvider extends BasePaymentProvider implements IMandatePro
     if (res.json['id'] !== tokenId || typeof status !== 'string') return { kind: 'unavailable' };
     return { kind: 'found', status, json: res.json };
   }
+}
+
+/**
+ * Compile-time check only (`npm run typecheck`): ambient and not exported, so it emits no code and no declaration.
+ * A subclass written for 2.1 whose `refundPayment` override declared a third parameter of its own must keep
+ * compiling (#44).
+ */
+declare class SatispayProviderSubclassWrittenFor21 extends SatispayProvider {
+  refundPayment(paymentId: string, amount?: number, reason?: 'duplicate' | 'fraudulent'): Promise<PaymentResult>;
+}
+
+/** Compile-time check only, as above: a subclass may opt out of refund idempotency keys (README "Custom Provider"). */
+declare class SatispayProviderWithoutRefundKeys extends SatispayProvider {
+  readonly supportsRefundIdempotency: false;
 }

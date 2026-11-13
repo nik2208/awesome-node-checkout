@@ -84,7 +84,8 @@ describe('Refund idempotency keys: configurator (#44)', () => {
     nexi = new NexiProvider({ merchantId: 'ALIAS_TEST_01', macKey: 'TEST_SECRET_KEY_0001' });
     dummy = new DummyProvider();
     checkout.registerProvider(paypal).registerProvider(nexi).registerProvider(dummy);
-    paypalRefund = vi.fn(async (paymentId: string) => ({
+    // Declares the three parameters, as an IRefundIdempotencyProvider must (isRefundIdempotencyProvider reads length)
+    paypalRefund = vi.fn(async (paymentId: string, _amount?: number, _options?: RefundOptions) => ({
       success: true,
       verified: true,
       paymentId: `REFUND-${paymentId}`,
@@ -280,5 +281,160 @@ describe('Refund idempotency keys: configurator (#44)', () => {
       expect(spy.mock.calls).toEqual([['paypal', 'ORD', 5]]);
       expect(paypalRefund.mock.calls).toEqual([['ORD', 5]]);
     });
+  });
+});
+
+// Release review of 2.2.0 (#44): refund keys are the optional capability IRefundIdempotencyProvider, so that
+// IPaymentProvider and BasePaymentProvider stay exactly 2.1 (the compile-time side is in `npm run typecheck`), and a
+// key reaches a provider only through a refundPayment that can receive it.
+
+/** Valid 2.1 code: an override with the 2.1 signature in a subclass of PayPalProvider (it inherits the flag). */
+class LoggingPayPal extends PayPalProvider {
+  async refundPayment(id: string, amount?: number): Promise<PaymentResult> {
+    return super.refundPayment(id, amount);
+  }
+}
+
+/** The same in a subclass of SatispayProvider. */
+class LoggingSatispay extends SatispayProvider {
+  async refundPayment(id: string, amount?: number): Promise<PaymentResult> {
+    return super.refundPayment(id, amount);
+  }
+}
+
+/** A 2.2 override that passes the options on, as README "Custom Provider" asks. */
+class ForwardingPayPal extends PayPalProvider {
+  async refundPayment(id: string, amount?: number, options?: RefundOptions): Promise<PaymentResult> {
+    return super.refundPayment(id, amount, options);
+  }
+}
+
+/** The documented opt-out. */
+class OptOutPayPal extends PayPalProvider {
+  readonly supportsRefundIdempotency = false;
+}
+
+/** Valid 2.1 code: an override with a third parameter of its own in a subclass of PayPalProvider. */
+class ReasonPayPal extends PayPalProvider {
+  async refundPayment(id: string, amount?: number, reason?: 'duplicate' | 'fraudulent'): Promise<PaymentResult> {
+    return { ...(await super.refundPayment(id, amount)), raw: { reason } };
+  }
+}
+
+describe('Refund idempotency capability: IRefundIdempotencyProvider (#44, release review)', () => {
+  const originalFetch = globalThis.fetch;
+  const credentials = { clientId: 'a', clientSecret: 'b' };
+  let base: ReturnType<typeof vi.spyOn>;
+  let events: any[];
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    globalThis.fetch = vi.fn() as any;
+    // The library's own PayPal refund, reached through super.refundPayment: no SDK call
+    base = vi.spyOn(PayPalProvider.prototype, 'refundPayment').mockResolvedValue({
+      success: true,
+      verified: true,
+      paymentId: 'REFUND-1',
+      status: 'COMPLETED',
+    });
+    events = [];
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function configurator(provider: PayPalProvider | SatispayProvider): CheckoutConfigurator {
+    const checkout = new CheckoutConfigurator();
+    checkout.registerProvider(provider);
+    checkout.events.on('payment.refunded', (payload) => {
+      events.push(payload);
+    });
+    return checkout;
+  }
+
+  it('isRefundIdempotencyProvider is exported: PayPal and Satispay yes; Nexi and providers written for 2.1 no', () => {
+    const guard = (index as Record<string, unknown>).isRefundIdempotencyProvider as (p: unknown) => boolean;
+    expect(typeof guard).toBe('function');
+    expect(guard(new PayPalProvider(credentials))).toBe(true);
+    expect(guard(new SatispayProvider({ keyId: 'k', privateKey: 'unused' }))).toBe(true);
+    expect(guard(new NexiProvider({ merchantId: 'ALIAS_TEST_01', macKey: 'TEST_SECRET_KEY_0001' }))).toBe(false);
+    expect(guard(new DummyProvider())).toBe(false);
+    expect(guard(new ReasonProvider())).toBe(false);
+    for (const value of [null, undefined, 'paypal', 42]) expect(guard(value)).toBe(false);
+  });
+
+  it('isRefundIdempotencyProvider needs exactly supportsRefundIdempotency: true and a refundPayment that can take the options', () => {
+    const guard = (index as Record<string, unknown>).isRefundIdempotencyProvider as (p: unknown) => boolean;
+    const three = async (_id: string, _amount?: number, _options?: RefundOptions) => ({ success: true });
+    expect(guard({ supportsRefundIdempotency: true, refundPayment: three })).toBe(true);
+    // length 0: a rest parameter, or a wrapper that passes every argument on
+    expect(guard({ supportsRefundIdempotency: true, refundPayment: async (..._args: unknown[]) => ({ success: true }) })).toBe(true);
+    // One or two declared parameters cannot receive the options; a default value is not counted by length
+    expect(guard({ supportsRefundIdempotency: true, refundPayment: async (_id: string) => ({ success: true }) })).toBe(false);
+    expect(guard({ supportsRefundIdempotency: true, refundPayment: async (_id: string, _amount?: number) => ({ success: true }) })).toBe(false);
+    expect(
+      guard({ supportsRefundIdempotency: true, refundPayment: async (_id: string, _amount?: number, _o: RefundOptions = {}) => ({ success: true }) }),
+    ).toBe(false);
+    for (const flag of [false, 'true', 1, undefined]) {
+      expect(guard({ supportsRefundIdempotency: flag, refundPayment: three })).toBe(false);
+    }
+    expect(guard({ supportsRefundIdempotency: true })).toBe(false);
+  });
+
+  it("a 2.1 override refundPayment(id, amount) in a PayPalProvider subclass: a key is refused, never dropped", async () => {
+    const checkout = configurator(new LoggingPayPal(credentials));
+    const err = await rejection(checkout.refundPayment('paypal', 'ORD-1', 5, { idempotencyKey: 'refund-SUB-1-R9' }));
+    expect(err.code).toBe('REFUND_IDEMPOTENCY_NOT_SUPPORTED');
+    expect(err.provider).toBe('paypal');
+    expect(err.message).toBe(
+      "Provider 'paypal' does not support refund idempotency keys: its refundPayment declares no options parameter",
+    );
+    expect(base).not.toHaveBeenCalled();
+    expect(events).toHaveLength(0);
+  });
+
+  it('the same override still refunds without a key, with the 2.1 call', async () => {
+    const checkout = configurator(new LoggingPayPal(credentials));
+    const result = await checkout.refundPayment('paypal', 'ORD-1', 5);
+    expect(base.mock.calls).toEqual([['ORD-1', 5]]);
+    expect(result).toMatchObject({ success: true, verified: true, paymentId: 'REFUND-1' });
+    expect(events).toHaveLength(1);
+    // Options without a key are not a key: the 2.1 call too
+    await checkout.refundPayment('paypal', 'ORD-1', 5, {});
+    expect(base.mock.calls[1]).toEqual(['ORD-1', 5]);
+  });
+
+  it('a 2.1 override in a SatispayProvider subclass: a key is refused, and no request is sent', async () => {
+    const checkout = configurator(new LoggingSatispay({ keyId: 'k', privateKey: 'unused' }));
+    const err = await rejection(checkout.refundPayment('satispay', 'pay_1', 19.9, { idempotencyKey: 'refund-pay_1-R1' }));
+    expect(err.code).toBe('REFUND_IDEMPOTENCY_NOT_SUPPORTED');
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(events).toHaveLength(0);
+  });
+
+  it('an override that passes the options on gets the key, and so does the library refund behind it', async () => {
+    const checkout = configurator(new ForwardingPayPal(credentials));
+    const result = await checkout.refundPayment('paypal', 'ORD-1', 5, { idempotencyKey: 'refund-SUB-1-R9' });
+    expect(base.mock.calls).toEqual([['ORD-1', 5, { idempotencyKey: 'refund-SUB-1-R9' }]]);
+    expect(result.success).toBe(true);
+  });
+
+  it('a subclass that sets supportsRefundIdempotency = false: a key is refused', async () => {
+    const checkout = configurator(new OptOutPayPal(credentials));
+    const err = await rejection(checkout.refundPayment('paypal', 'ORD-1', 5, { idempotencyKey: 'refund-SUB-1-R9' }));
+    expect(err.code).toBe('REFUND_IDEMPOTENCY_NOT_SUPPORTED');
+    expect(err.message).toBe("Provider 'paypal' does not support refund idempotency keys");
+    expect(base).not.toHaveBeenCalled();
+  });
+
+  it('a 2.1 override with a third parameter of its own: without a key, the 2.1 call; its own callers unchanged', async () => {
+    const provider = new ReasonPayPal(credentials);
+    const own = vi.spyOn(provider, 'refundPayment');
+    const result = await configurator(provider).refundPayment('paypal', 'ORD-1', 5);
+    expect(own.mock.calls).toEqual([['ORD-1', 5]]);
+    expect(result.raw).toEqual({ reason: undefined });
+    await expect(provider.refundPayment('ORD-2', 5, 'duplicate')).resolves.toMatchObject({ raw: { reason: 'duplicate' } });
   });
 });

@@ -1,7 +1,8 @@
 import { IPaymentProvider, PaymentFlow } from '../interfaces/payment-provider.interface';
 import { PaymentRequest } from '../models/payment-request.model';
 import { PaymentResult } from '../models/payment-result.model';
-import { RefundOptions } from '../models/refund.model';
+import type { RefundOptions } from '../models/refund.model';
+import type { IRefundIdempotencyProvider } from '../interfaces/refund-idempotency-provider.interface';
 
 /**
  * Convenience base class for building custom payment providers.
@@ -23,8 +24,11 @@ export abstract class BasePaymentProvider implements IPaymentProvider {
   abstract createPayment(request: PaymentRequest): Promise<PaymentResult>;
   abstract executePayment(paymentId: string, data?: Record<string, string>): Promise<PaymentResult>;
   abstract getPaymentDetails(paymentId: string): Promise<PaymentResult>;
-  /** `options` since 2.2.0: a subclass written for 2.1 may keep `refundPayment(paymentId, amount?)`. */
-  abstract refundPayment(paymentId: string, amount?: number, options?: RefundOptions): Promise<PaymentResult>;
+  /**
+   * Unchanged from 2.1.0. To take refund idempotency keys (since 2.2.0), also implement `IRefundIdempotencyProvider`:
+   * `refundPayment(paymentId, amount?, options?: RefundOptions)` and `supportsRefundIdempotency`.
+   */
+  abstract refundPayment(paymentId: string, amount?: number): Promise<PaymentResult>;
 
   /**
    * Helper to produce a normalized error PaymentResult.
@@ -53,9 +57,8 @@ declare class SubclassWrittenFor21 extends BasePaymentProvider {
 }
 
 /**
- * Compile-time check only, as above. A subclass written for 2.1 whose `refundPayment` already declared a third
- * parameter of another type does not compile against the 2.2 signature as it is (TS2416): it compiles again once that
- * parameter also accepts `RefundOptions` (README "Custom Provider").
+ * Compile-time check only, as above. A subclass written for 2.1 whose `refundPayment` declared a third parameter of
+ * its own, of any type, must keep compiling unchanged (#44).
  */
 declare class SubclassWithItsOwnThirdParameter extends BasePaymentProvider {
   readonly name: string;
@@ -63,9 +66,19 @@ declare class SubclassWithItsOwnThirdParameter extends BasePaymentProvider {
   createPayment(request: PaymentRequest): Promise<PaymentResult>;
   executePayment(paymentId: string, data?: Record<string, string>): Promise<PaymentResult>;
   getPaymentDetails(paymentId: string): Promise<PaymentResult>;
-  refundPayment(
-    paymentId: string,
-    amount?: number,
-    reason?: 'duplicate' | 'fraudulent' | RefundOptions,
-  ): Promise<PaymentResult>;
+  refundPayment(paymentId: string, amount?: number, reason?: 'duplicate' | 'fraudulent'): Promise<PaymentResult>;
+}
+
+/**
+ * Compile-time check only, as above: a provider written for 2.2 that takes refund idempotency keys (README "Custom
+ * Provider").
+ */
+declare class SubclassWithRefundKeys extends BasePaymentProvider implements IRefundIdempotencyProvider {
+  readonly name: string;
+  readonly flow: PaymentFlow;
+  readonly supportsRefundIdempotency: boolean;
+  createPayment(request: PaymentRequest): Promise<PaymentResult>;
+  executePayment(paymentId: string, data?: Record<string, string>): Promise<PaymentResult>;
+  getPaymentDetails(paymentId: string): Promise<PaymentResult>;
+  refundPayment(paymentId: string, amount?: number, options?: RefundOptions): Promise<PaymentResult>;
 }

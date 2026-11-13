@@ -7,6 +7,10 @@ import { CheckoutEventBus, CheckoutEventName, CheckoutEventPayload } from './eve
 import { IMandateProvider, isMandateProvider } from './interfaces/mandate-provider.interface';
 import { isChargeLookupProvider } from './interfaces/charge-lookup-provider.interface';
 import {
+  IRefundIdempotencyProvider,
+  isRefundIdempotencyProvider,
+} from './interfaces/refund-idempotency-provider.interface';
+import {
   CHARGE_REF_PATTERN,
   ChargeErrorCode,
   ChargeLookupOptions,
@@ -411,15 +415,16 @@ export class CheckoutConfigurator {
    *
    * `options.idempotencyKey` (since 2.2.0, see `RefundOptions`) makes a retry of the same refund safe while the
    * provider keeps the key. The options are validated first, without calling the provider and without emitting an
-   * event (fail closed: a refund asked to be idempotent is never sent without its key):
+   * event (fail closed: a key is passed only to a `refundPayment` that can receive it):
    * - `options` that are not an object, or a key that is not a string matching `REFUND_IDEMPOTENCY_KEY_PATTERN` →
    *   `CheckoutError('INVALID_REFUND_REQUEST')`;
-   * - a key on a provider whose `supportsRefundIdempotency` is not `true` (Nexi, a provider written for 2.1) →
+   * - a key on a provider for which `isRefundIdempotencyProvider` is false (Nexi, a provider written for 2.1, or a
+   *   subclass of PayPal or Satispay whose `refundPayment` override declares only `(paymentId, amount)`) →
    *   `CheckoutError('REFUND_IDEMPOTENCY_NOT_SUPPORTED')` (HTTP 422 through the router).
    * Without `options` (or with `null`) the provider is called with `(paymentId, amount)`, exactly as in 2.1; with
-   * them, with `(paymentId, amount, { idempotencyKey })` (the known field only). A provider whose
-   * `supportsRefundIdempotency` is not `true` always gets `(paymentId, amount)`: options without a key are not passed
-   * on to it, since its own third parameter, if any, may mean something else. Emits `payment.refunded`, unchanged.
+   * them, an `IRefundIdempotencyProvider` is called with `(paymentId, amount, { idempotencyKey })` (the known field
+   * only). Any other provider always gets `(paymentId, amount)`: options without a key are not passed on to it, since
+   * its own third parameter, if any, may mean something else. Emits `payment.refunded`, unchanged.
    */
   async refundPayment(
     providerName: string,
@@ -428,11 +433,11 @@ export class CheckoutConfigurator {
     options?: RefundOptions,
   ): Promise<PaymentResult> {
     const provider = this.getProvider(providerName);
-    const providerOptions = this.refundOptions(providerName, provider, options);
+    const keyed = this.refundOptions(providerName, provider, options);
     const result =
-      providerOptions === undefined
+      keyed === undefined
         ? await provider.refundPayment(paymentId, amount)
-        : await provider.refundPayment(paymentId, amount, providerOptions);
+        : await keyed.provider.refundPayment(paymentId, amount, keyed.options);
     const orderId = this.paymentOrders.get(paymentId);
     if (orderId && !result.orderId) {
       result.orderId = orderId;
@@ -450,22 +455,24 @@ export class CheckoutConfigurator {
   }
 
   /**
-   * Since 2.2.0. Validates the options of `refundPayment` and returns a copy with the known field only, or undefined
-   * when the provider is called without options: no options, or options without a key for a provider whose
-   * `supportsRefundIdempotency` is not `true` (a provider written for 2.1 gets the 2.1 call, whatever its own third
-   * parameter). The key is read once: the provider gets exactly the value that was checked.
+   * Since 2.2.0. Validates the options of `refundPayment` and returns them with the known field only, with the
+   * provider as an `IRefundIdempotencyProvider`, or undefined when the provider is called without options: no
+   * options, or options without a key for a provider for which `isRefundIdempotencyProvider` is false (a provider
+   * written for 2.1 gets the 2.1 call, whatever its own third parameter). The key is read once: the provider gets
+   * exactly the value that was checked.
    */
   private refundOptions(
     providerName: string,
     provider: IPaymentProvider,
     options: RefundOptions | undefined,
-  ): RefundOptions | undefined {
+  ): { provider: IPaymentProvider & IRefundIdempotencyProvider; options: RefundOptions } | undefined {
     if (options === undefined || options === null) return undefined;
     if (typeof options !== 'object') {
       throw new CheckoutError('Invalid refund options', 'INVALID_REFUND_REQUEST', providerName);
     }
     const idempotencyKey: unknown = options.idempotencyKey;
-    if (idempotencyKey === undefined) return provider.supportsRefundIdempotency === true ? {} : undefined;
+    const keyed = isRefundIdempotencyProvider(provider) ? provider : undefined;
+    if (idempotencyKey === undefined) return keyed ? { provider: keyed, options: {} } : undefined;
     if (!isRefundIdempotencyKey(idempotencyKey)) {
       throw new CheckoutError(
         'Invalid idempotencyKey: expected /^[A-Za-z0-9_-]{8,64}$/',
@@ -473,14 +480,18 @@ export class CheckoutConfigurator {
         providerName,
       );
     }
-    if (provider.supportsRefundIdempotency !== true) {
+    if (!keyed) {
+      // Declared, but the refundPayment that is called cannot receive the key (e.g. a 2.1 override in a subclass)
+      const declared = (provider as { supportsRefundIdempotency?: unknown }).supportsRefundIdempotency === true;
       throw new CheckoutError(
-        `Provider '${providerName}' does not support refund idempotency keys`,
+        declared
+          ? `Provider '${providerName}' does not support refund idempotency keys: its refundPayment declares no options parameter`
+          : `Provider '${providerName}' does not support refund idempotency keys`,
         'REFUND_IDEMPOTENCY_NOT_SUPPORTED',
         providerName,
       );
     }
-    return { idempotencyKey };
+    return { provider: keyed, options: { idempotencyKey } };
   }
 
   /**

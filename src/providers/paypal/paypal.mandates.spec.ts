@@ -4,6 +4,7 @@ import { join } from 'path';
 import { PayPalProvider } from './paypal.provider';
 import { CheckoutConfigurator } from '../../checkout-configurator';
 import { isMandateProvider } from '../../interfaces/mandate-provider.interface';
+import type { CheckoutConfig } from '../../models/checkout-config.model';
 import { Mandate, MandatePendingState, MandateSetupRequest } from '../../models/mandate.model';
 
 // Mock of PayPal Server SDK v2.5 (no enum objects: the provider writes string literals)
@@ -784,6 +785,102 @@ describe('PayPalProvider mandates (Vault)', () => {
       const failed = await provider.revokeMandate(mandate);
       expect(failed.revokedAtProvider).toBe(false);
       expect(failed.error).toEqual(expect.any(String));
+    });
+  });
+
+  describe('payment-method hints through the configurator (#46)', () => {
+    /** `completedOrder()` without `paymentSource.paypal.emailAddress`. */
+    function orderWithoutEmail() {
+      const order = completedOrder();
+      const { emailAddress: _emailAddress, ...paypal } = order.paymentSource.paypal;
+      return { ...order, paymentSource: { paypal } };
+    }
+
+    /** Setup on a fresh configurator and provider: the order is read APPROVED, then captured as `captured`. */
+    async function confirmThrough(config: CheckoutConfig, captured: unknown = completedOrder()) {
+      sdk.getOrder.mockResolvedValueOnce({ result: approvedOrder() });
+      sdk.captureOrder.mockResolvedValueOnce({ result: captured });
+      const checkout = new CheckoutConfigurator(config);
+      checkout.registerProvider(new PayPalProvider({ clientId: 'id', clientSecret: 'secret', environment: 'sandbox' }));
+      return checkout.confirmMandate('paypal', pending, { query: { token: ORDER_ID, PayerID: 'P1' } });
+    }
+
+    it("a VAULTED order with emailAddress 'payer@example.com': hints { payerEmail }", async () => {
+      const outcome = await confirmThrough({});
+      expect(outcome).toMatchObject({ success: true, verified: true, terminal: true });
+      expect(outcome.hints).toStrictEqual({ payerEmail: 'payer@example.com' });
+      expect(outcome.mandate!.unverified).toStrictEqual({ payerEmail: 'payer@example.com' });
+
+      const separate = await confirmThrough({ mandateHints: 'separate' });
+      expect(separate.hints).toStrictEqual({ payerEmail: 'payer@example.com' });
+      expect('unverified' in separate.mandate!).toBe(false);
+      expect(JSON.stringify(separate.mandate)).not.toContain('payer@example.com');
+      expect(separate.mandate).toStrictEqual({
+        provider: 'paypal',
+        mandateRef: 'MNDT0000000001',
+        providerMandateId: 'vt_1',
+        status: 'active',
+        createdAt: NOW.toISOString(),
+        providerData: { customerId: 'cus_1' },
+      });
+    });
+
+    it.each([
+      ['default', {}],
+      ["'inline'", { mandateHints: 'inline' }],
+      ["'separate'", { mandateHints: 'separate' }],
+    ] as [string, CheckoutConfig][])(
+      '%s: the same order without emailAddress gives no hints and no unverified key',
+      async (_label, config) => {
+        const outcome = await confirmThrough(config, orderWithoutEmail());
+        expect(outcome).toMatchObject({ success: true, verified: true, terminal: true });
+        expect(outcome.hints).toBeUndefined();
+        expect('hints' in outcome).toBe(false);
+        expect('unverified' in outcome.mandate!).toBe(false);
+        expect(outcome.mandate!.providerData).toStrictEqual({ customerId: 'cus_1' });
+      },
+    );
+
+    it('a separate-mode mandate, JSON round-tripped, charges, reads and revokes with the same vaultId and customId', async () => {
+      const persisted = async (config: CheckoutConfig) =>
+        JSON.parse(JSON.stringify((await confirmThrough(config)).mandate)) as Mandate;
+      const separate = await persisted({ mandateHints: 'separate' });
+      const legacy = await persisted({}); // what 2.1 returned and apps persisted: it still has unverified
+      // What 2.1 persisted for a payer without an email ({ payerEmail: undefined } serializes as {})
+      const legacyWithoutEmail: Mandate = { ...separate, unverified: {} };
+      expect('unverified' in separate).toBe(false);
+      expect(legacy.unverified).toStrictEqual({ payerEmail: 'payer@example.com' });
+
+      /** The provider requests of chargeMandate, getMandate and revokeMandate on a fresh configurator. */
+      const requests = async (persistedMandate: Mandate) => {
+        sdk.createOrder.mockClear();
+        sdk.getPaymentToken.mockClear();
+        sdk.deletePaymentToken.mockClear();
+        sdk.createOrder.mockResolvedValueOnce({ result: chargeOrder('COMPLETED', 'COMPLETED') });
+        sdk.getPaymentToken.mockResolvedValueOnce({ statusCode: 200, result: { id: 'vt_1' } });
+        sdk.deletePaymentToken.mockResolvedValueOnce({ statusCode: 204, result: undefined });
+        const checkout = new CheckoutConfigurator();
+        checkout.registerProvider(new PayPalProvider({ clientId: 'id', clientSecret: 'secret', environment: 'sandbox' }));
+        const charged = await checkout.chargeMandate('paypal', persistedMandate, charge);
+        expect(charged).toMatchObject({ status: 'succeeded', verified: true, providerPaymentId: 'PAYPAL-ORD-2' });
+        expect(await checkout.getMandate('paypal', persistedMandate)).toStrictEqual({ status: 'active', verified: true });
+        expect((await checkout.revokeMandate('paypal', persistedMandate)).revokedAtProvider).toBe(true);
+        return {
+          createOrder: sdk.createOrder.mock.calls,
+          getPaymentToken: sdk.getPaymentToken.mock.calls,
+          deletePaymentToken: sdk.deletePaymentToken.mock.calls,
+        };
+      };
+
+      const sent = structuredClone(await requests(separate));
+      expect(sent.createOrder).toHaveLength(1);
+      expect(sent.createOrder[0][0].body.paymentSource.paypal.vaultId).toBe('vt_1');
+      expect(sent.createOrder[0][0].body.purchaseUnits[0].customId).toBe('MNDT0000000001');
+      expect(sent.createOrder[0][0].paypalRequestId).toBe('SUB-0001-2026-12');
+      expect(sent.getPaymentToken).toEqual([['vt_1']]);
+      expect(sent.deletePaymentToken).toEqual([['vt_1']]);
+      expect(structuredClone(await requests(legacy))).toStrictEqual(sent);
+      expect(structuredClone(await requests(legacyWithoutEmail))).toStrictEqual(sent);
     });
   });
 

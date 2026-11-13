@@ -6,6 +6,7 @@ import { BasePaymentProvider } from './abstract/base-payment-provider.abstract';
 import { PaymentRequest } from './models/payment-request.model';
 import { PaymentResult, WebhookResult } from './models/payment-result.model';
 import { CheckoutError } from './models/errors';
+import type { CheckoutConfig } from './models/checkout-config.model';
 import { CheckoutEventName, CheckoutEventPayload, CheckoutListenerError } from './events/checkout-event-bus';
 import { IMandateProvider, isMandateProvider } from './interfaces/mandate-provider.interface';
 import {
@@ -13,6 +14,7 @@ import {
   ChargeResult,
   Mandate,
   MandateCallbackInput,
+  MandateHints,
   MandatePendingState,
   MandateSetupOutcome,
   MandateSetupRequest,
@@ -1002,6 +1004,342 @@ describe('Mandates: configurator', () => {
       again.registerProvider(new MandateDummyProvider());
       const result = await again.chargeMandate('dummy', mandate, charge());
       expect(result).toMatchObject({ status: 'succeeded', verified: true, chargeRef: 'SUB-0001-2026-12' });
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unsigned payment-method hints out of the persisted mandate (#46)
+// ---------------------------------------------------------------------------
+
+describe('Mandates: unsigned payment-method hints (#46)', () => {
+  /** A fresh configurator, with a fresh scriptable provider and an event recorder. */
+  function setup(config: CheckoutConfig = {}) {
+    const checkout = new CheckoutConfigurator(config);
+    const provider = new MandateDummyProvider();
+    checkout.registerProvider(provider);
+    return { checkout, provider, events: recordEvents(checkout) };
+  }
+
+  /**
+   * A verified success (active mandate, first charge succeeded), built fresh on every call. A test puts the hints where
+   * a provider does: `outcome.hints` (since 2.2.0) or `mandate.unverified` (the 2.1 placement).
+   */
+  const success =
+    (outcome: Partial<MandateSetupOutcome> = {}, mandate: Partial<Mandate> = {}) =>
+    (pending: MandatePendingState): MandateSetupOutcome => ({
+      success: true,
+      verified: true,
+      terminal: true,
+      mandate: { ...activeMandate({ providerData: { customerId: 'cus_1' } }), ...mandate },
+      firstCharge: {
+        status: 'succeeded',
+        verified: true,
+        chargeRef: pending.orderId,
+        providerPaymentId: 'PAY-FIRST',
+        amount: pending.amount,
+        currency: pending.currency,
+      },
+      ...outcome,
+    });
+
+  const MODES: [string, CheckoutConfig][] = [
+    ['default', {}],
+    ["'inline'", { mandateHints: 'inline' }],
+    ["'separate'", { mandateHints: 'separate' }],
+  ];
+
+  describe('a verified success', () => {
+    it('default config: the hints are in outcome.hints and, deprecated, in outcome.mandate.unverified (2.1)', async () => {
+      const { checkout, provider } = setup();
+      provider.nextConfirm = success({}, { unverified: { payerEmail: 'x@y.z' } });
+      const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome).toMatchObject({ success: true, verified: true, terminal: true });
+      expect(outcome.hints).toStrictEqual({ payerEmail: 'x@y.z' });
+      expect(outcome.mandate!.unverified).toStrictEqual({ payerEmail: 'x@y.z' });
+      // Two objects: changing one never changes the other
+      expect(outcome.hints).not.toBe(outcome.mandate!.unverified);
+    });
+
+    it("{ mandateHints: 'inline' } is the default", async () => {
+      const results: MandateSetupOutcome[] = [];
+      for (const config of [{}, { mandateHints: 'inline' }] as CheckoutConfig[]) {
+        const { checkout, provider } = setup(config);
+        provider.nextConfirm = success({}, { unverified: { cardExpiry: '203012', maskedPan: '453997******0006' } });
+        results.push(await checkout.confirmMandate('dummy', pendingState(), {}));
+      }
+      expect(results[1]).toStrictEqual(results[0]);
+      expect(results[1].hints).toStrictEqual({ cardExpiry: '203012', maskedPan: '453997******0006' });
+      expect(results[1].mandate!.unverified).toStrictEqual({ cardExpiry: '203012', maskedPan: '453997******0006' });
+    });
+
+    it("{ mandateHints: 'separate' }: hints only in outcome.hints, a mandate without unverified that keeps every other field", async () => {
+      const { checkout, provider } = setup({ mandateHints: 'separate' });
+      // A field that a later minor may add to Mandate (cast): it survives, unlike a field-by-field copy
+      provider.nextConfirm = success({}, { unverified: { payerEmail: 'x@y.z' }, laterField: 'kept' } as Partial<Mandate>);
+      const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome).toMatchObject({ success: true, verified: true, terminal: true });
+      expect(outcome.hints).toStrictEqual({ payerEmail: 'x@y.z' });
+      expect('unverified' in outcome.mandate!).toBe(false);
+      expect(outcome.mandate).toStrictEqual({
+        provider: 'dummy',
+        mandateRef: 'MNDT0000000001',
+        providerMandateId: VAULT_ID,
+        status: 'active',
+        createdAt: CREATED_AT,
+        providerData: { customerId: 'cus_1' },
+        laterField: 'kept',
+      });
+      expect(JSON.stringify(outcome.mandate)).not.toContain('x@y.z');
+    });
+
+    it('a provider that sets only outcome.hints: the default config copies them to mandate.unverified', async () => {
+      const inline = setup();
+      inline.provider.nextConfirm = success({ hints: { maskedPan: '453997******0006' } });
+      const outcome = await inline.checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome.hints).toStrictEqual({ maskedPan: '453997******0006' });
+      expect(outcome.mandate!.unverified).toStrictEqual({ maskedPan: '453997******0006' });
+
+      const separate = setup({ mandateHints: 'separate' });
+      separate.provider.nextConfirm = success({ hints: { maskedPan: '453997******0006' } });
+      const kept = await separate.checkout.confirmMandate('dummy', pendingState(), {});
+      expect(kept.hints).toStrictEqual({ maskedPan: '453997******0006' });
+      expect('unverified' in kept.mandate!).toBe(false);
+    });
+
+    it('outcome.hints wins over mandate.unverified, without merging the two', async () => {
+      const { checkout, provider } = setup();
+      provider.nextConfirm = success({ hints: { payerEmail: 'a@b.c' } }, { unverified: { maskedPan: '453997******0006' } });
+      const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome.hints).toStrictEqual({ payerEmail: 'a@b.c' });
+      expect(outcome.mandate!.unverified).toStrictEqual({ payerEmail: 'a@b.c' });
+    });
+
+    it.each([
+      ['null', null],
+      ['a string', 'x@y.z'],
+    ])('an outcome.hints that is %s (cast) falls back to mandate.unverified', async (_label, hints) => {
+      const { checkout, provider } = setup();
+      provider.nextConfirm = success({ hints: hints as unknown as MandateHints }, { unverified: { payerEmail: 'x@y.z' } });
+      const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome.hints).toStrictEqual({ payerEmail: 'x@y.z' });
+      expect(outcome.mandate!.unverified).toStrictEqual({ payerEmail: 'x@y.z' });
+    });
+
+    it.each(MODES)('%s: an outcome.hints object with nothing valid in it does not fall back to mandate.unverified', async (_label, config) => {
+      const { checkout, provider } = setup(config);
+      provider.nextConfirm = success({ hints: {} }, { unverified: { payerEmail: 'x@y.z' } });
+      const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome.success).toBe(true);
+      expect('hints' in outcome).toBe(false);
+      expect('unverified' in outcome.mandate!).toBe(false);
+    });
+
+    describe("provider hints { payerEmail: '', maskedPan: 42, extra: 'x' } (cast)", () => {
+      const BAD = { payerEmail: '', maskedPan: 42, extra: 'x' } as unknown as MandateHints;
+
+      it.each(MODES)('%s: in outcome.hints, no hints and no unverified key', async (_label, config) => {
+        const { checkout, provider } = setup(config);
+        provider.nextConfirm = success({ hints: BAD });
+        const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+        expect(outcome.success).toBe(true);
+        expect(outcome.hints).toBeUndefined();
+        expect('hints' in outcome).toBe(false);
+        expect('unverified' in outcome.mandate!).toBe(false);
+      });
+
+      it.each(MODES)('%s: in mandate.unverified, no hints and no unverified key', async (_label, config) => {
+        const { checkout, provider } = setup(config);
+        provider.nextConfirm = success({}, { unverified: BAD });
+        const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+        expect(outcome.success).toBe(true);
+        expect(outcome.hints).toBeUndefined();
+        expect('hints' in outcome).toBe(false);
+        expect('unverified' in outcome.mandate!).toBe(false);
+      });
+    });
+
+    it('keeps only cardExpiry, maskedPan and payerEmail with non-empty string values, verbatim', async () => {
+      const { checkout, provider } = setup();
+      const mixed = { cardExpiry: '203012', maskedPan: 42, payerEmail: ' x@y.z ', extra: 'x', cardBrand: 'VISA' };
+      provider.nextConfirm = success({}, { unverified: mixed as unknown as MandateHints });
+      const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome.hints).toStrictEqual({ cardExpiry: '203012', payerEmail: ' x@y.z ' });
+      expect(outcome.mandate!.unverified).toStrictEqual({ cardExpiry: '203012', payerEmail: ' x@y.z ' });
+    });
+
+    it.each(['bogus', 'Separate', ''])("mandateHints %j (cast) behaves as 'inline'", async (mode) => {
+      const results: MandateSetupOutcome[] = [];
+      for (const config of [{}, { mandateHints: mode as CheckoutConfig['mandateHints'] }]) {
+        const { checkout, provider } = setup(config);
+        provider.nextConfirm = success({}, { unverified: { payerEmail: 'x@y.z' } });
+        results.push(await checkout.confirmMandate('dummy', pendingState(), {}));
+      }
+      expect(results[1]).toStrictEqual(results[0]);
+      expect(results[1].hints).toStrictEqual({ payerEmail: 'x@y.z' });
+      expect(results[1].mandate!.unverified).toStrictEqual({ payerEmail: 'x@y.z' });
+    });
+
+    describe('never mutates the objects returned by the provider (deep-frozen outcome)', () => {
+      const frozen = () => {
+        const hints = Object.freeze({ payerEmail: 'x@y.z', extra: 'x' }) as MandateHints;
+        const unverified = Object.freeze({ payerEmail: 'x@y.z' });
+        const mandate = Object.freeze({ ...activeMandate(), providerData: Object.freeze({ customerId: 'cus_1' }), unverified });
+        const outcome: MandateSetupOutcome = Object.freeze({
+          success: true,
+          verified: true,
+          terminal: true,
+          hints,
+          mandate,
+          firstCharge: Object.freeze({ status: 'succeeded' as const, verified: true, chargeRef: 'SUB-0001-INIT' }),
+        });
+        return { outcome, mandate, hints, unverified };
+      };
+
+      it('default config', async () => {
+        const scripted = frozen();
+        const { checkout, provider } = setup();
+        provider.nextConfirm = () => scripted.outcome;
+        const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+        expect(outcome.hints).toStrictEqual({ payerEmail: 'x@y.z' });
+        expect(outcome.hints).not.toBe(scripted.hints);
+        expect(outcome.mandate).not.toBe(scripted.mandate);
+        expect(outcome.mandate!.unverified).toStrictEqual({ payerEmail: 'x@y.z' });
+        expect(outcome.mandate!.unverified).not.toBe(scripted.unverified);
+        expect(scripted.outcome.hints).toBe(scripted.hints);
+        expect(scripted.hints).toStrictEqual({ payerEmail: 'x@y.z', extra: 'x' });
+        expect(scripted.mandate.unverified).toBe(scripted.unverified);
+      });
+
+      it("{ mandateHints: 'separate' }", async () => {
+        const scripted = frozen();
+        const { checkout, provider } = setup({ mandateHints: 'separate' });
+        provider.nextConfirm = () => scripted.outcome;
+        const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+        expect(outcome.hints).toStrictEqual({ payerEmail: 'x@y.z' });
+        expect('unverified' in outcome.mandate!).toBe(false);
+        expect(scripted.outcome.hints).toBe(scripted.hints);
+        expect(scripted.mandate.unverified).toBe(scripted.unverified);
+        expect(scripted.unverified).toStrictEqual({ payerEmail: 'x@y.z' });
+      });
+    });
+
+    it.each(MODES)('%s: events are unchanged, no payload carries the hints', async (_label, config) => {
+      const { checkout, provider, events } = setup(config);
+      provider.nextConfirm = success({ hints: { payerEmail: 'x@y.z' } }, { unverified: { maskedPan: '453997******0006' } });
+      const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome.success).toBe(true);
+      expect(events.map((e) => e.name)).toEqual(['mandate.created', 'charge.succeeded']);
+      const payloads = JSON.stringify(events.map((e) => e.payload));
+      expect(payloads).not.toContain('x@y.z');
+      expect(payloads).not.toContain('453997');
+    });
+  });
+
+  describe('every other outcome has hints undefined', () => {
+    it.each(MODES)('%s: an unverified outcome with hints and mandate.unverified: hints and mandate undefined', async (_label, config) => {
+      const { checkout, provider, events } = setup(config);
+      provider.nextConfirm = (pending) => ({
+        verified: false,
+        success: true,
+        terminal: true,
+        hints: { payerEmail: 'x@y.z' },
+        mandate: { ...activeMandate(), unverified: { payerEmail: 'x@y.z' } },
+        firstCharge: { status: 'succeeded', verified: true, chargeRef: pending.orderId },
+      });
+      const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome).toMatchObject({ success: false, verified: false, terminal: false });
+      expect(outcome.hints).toBeUndefined();
+      expect(outcome.mandate).toBeUndefined();
+      expect(JSON.stringify(outcome)).not.toContain('x@y.z');
+      expect(events).toHaveLength(0);
+    });
+
+    it.each(MODES)('%s: a verified terminal refusal carrying hints: hints undefined', async (_label, config) => {
+      const { checkout, provider } = setup(config);
+      provider.nextConfirm = (pending) => ({
+        success: false,
+        verified: true,
+        terminal: true,
+        error: 'Payment refused',
+        hints: { maskedPan: '453997******0006' },
+        firstCharge: { status: 'failed', verified: true, chargeRef: pending.orderId, error: 'KO' },
+      });
+      const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome).toMatchObject({ success: false, verified: true, terminal: true, error: 'Payment refused' });
+      expect(outcome.hints).toBeUndefined();
+      expect(outcome.mandate).toBeUndefined();
+      expect(JSON.stringify(outcome)).not.toContain('453997');
+    });
+
+    it.each(MODES)('%s: a verified non-terminal failure carrying hints: hints undefined', async (_label, config) => {
+      const { checkout, provider } = setup(config);
+      provider.nextConfirm = (pending) => ({
+        success: false,
+        verified: true,
+        terminal: false,
+        error: 'AUTHORIZATION_PENDING',
+        hints: { payerEmail: 'x@y.z' },
+        firstCharge: { status: 'unknown', verified: false, chargeRef: pending.orderId },
+      });
+      const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome).toMatchObject({ success: false, verified: true, terminal: false, error: 'AUTHORIZATION_PENDING' });
+      expect(outcome.hints).toBeUndefined();
+    });
+
+    it.each(MODES)('%s: a terminal success: false with a succeeded first charge, hints and a mandate: hints undefined', async (_label, config) => {
+      const { checkout, provider } = setup(config);
+      provider.nextConfirm = (pending) => ({
+        success: false,
+        verified: true,
+        terminal: true,
+        error: 'MANDATE_NOT_VAULTED',
+        hints: { payerEmail: 'x@y.z' },
+        mandate: { ...activeMandate(), unverified: { payerEmail: 'x@y.z' } },
+        firstCharge: { status: 'succeeded', verified: true, chargeRef: pending.orderId, providerPaymentId: 'ORDER-1', amount: 19.9, currency: 'EUR' },
+      });
+      const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome).toMatchObject({ success: false, verified: true, terminal: true, error: 'MANDATE_NOT_VAULTED' });
+      expect(outcome.firstCharge.status).toBe('succeeded');
+      expect(outcome.hints).toBeUndefined();
+      expect(outcome.mandate).toBeUndefined();
+    });
+
+    it.each(MODES)("%s: a verified outcome whose mandate.mandateRef differs from pending's: hints undefined", async (_label, config) => {
+      const { checkout, provider } = setup(config);
+      provider.nextConfirm = (pending) => ({
+        success: true,
+        verified: true,
+        terminal: true,
+        hints: { payerEmail: 'x@y.z' },
+        mandate: { ...activeMandate({ mandateRef: 'MNDT9999999999' }), unverified: { payerEmail: 'x@y.z' } },
+        firstCharge: { status: 'succeeded', verified: true, chargeRef: pending.orderId },
+      });
+      const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome).toMatchObject({
+        success: false,
+        verified: false,
+        terminal: false,
+        error: 'Mandate outcome does not match the pending setup',
+      });
+      expect(outcome.hints).toBeUndefined();
+      expect(outcome.mandate).toBeUndefined();
+    });
+
+    it.each(MODES)('%s: success: true without an active mandate, carrying hints: hints undefined', async (_label, config) => {
+      const { checkout, provider } = setup(config);
+      provider.nextConfirm = (pending) => ({
+        success: true,
+        verified: true,
+        terminal: true,
+        hints: { payerEmail: 'x@y.z' },
+        mandate: { ...activeMandate({ status: 'revoked' }), unverified: { payerEmail: 'x@y.z' } },
+        firstCharge: { status: 'succeeded', verified: true, chargeRef: pending.orderId },
+      });
+      const outcome = await checkout.confirmMandate('dummy', pendingState(), {});
+      expect(outcome).toMatchObject({ success: false, verified: false, terminal: false });
+      expect(outcome.hints).toBeUndefined();
+      expect(outcome.mandate).toBeUndefined();
     });
   });
 });

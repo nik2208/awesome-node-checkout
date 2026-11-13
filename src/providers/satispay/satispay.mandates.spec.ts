@@ -3,6 +3,7 @@ import * as crypto from 'crypto';
 import { SatispayProvider } from './satispay.provider';
 import { CheckoutConfigurator } from '../../checkout-configurator';
 import { isMandateProvider } from '../../interfaces/mandate-provider.interface';
+import type { CheckoutConfig } from '../../models/checkout-config.model';
 import { Mandate, MandatePendingState, MandateSetupRequest } from '../../models/mandate.model';
 
 const API = 'https://staging.authservices.satispay.com/g_business/v1';
@@ -772,6 +773,90 @@ describe('SatispayProvider mandates (pre-authorized payment tokens)', () => {
           'The customer can revoke it from the Satispay app.',
       });
       expect(fetchMock()).not.toHaveBeenCalled();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // #46 — unsigned payment-method hints out of the persisted Mandate
+  // ---------------------------------------------------------------------------
+
+  describe('payment-method hints through the configurator (#46)', () => {
+    beforeEach(() => {
+      routes({
+        [`GET ${TOKENS}/tok_1`]: () => resp(200, { id: 'tok_1', status: 'ACCEPTED' }),
+        // The first charge (external_code = orderId) and the renewal below
+        [`POST ${PAYMENTS}`]: (init) => {
+          const externalCode = String(bodyOf(init).external_code);
+          return resp(200, { ...acceptedPayment, id: externalCode === 'SUB-0001-INIT' ? 'pay_1' : 'pay_2', external_code: externalCode });
+        },
+      });
+    });
+
+    /** A fresh configurator with a fresh provider. */
+    function fresh(config: CheckoutConfig = {}): CheckoutConfigurator {
+      const checkout = new CheckoutConfigurator(config);
+      checkout.registerProvider(
+        new SatispayProvider({ keyId: 'test-key', privateKey: validFakePrivateKey, environment: 'sandbox', serverUrl: 'http://localhost' }),
+      );
+      return checkout;
+    }
+
+    it.each([
+      ['default', {}],
+      ["'separate'", { mandateHints: 'separate' }],
+    ] as [string, CheckoutConfig][])('%s: an ACCEPTED authorization gives no hints and no unverified', async (_label, config) => {
+      const outcome = await fresh(config).confirmMandate('satispay', pending, {
+        query: { mandate_ref: 'MNDT0000000001', token_id: 'tok_1' },
+      });
+      expect(outcome).toMatchObject({ success: true, verified: true, terminal: true });
+      expect(outcome.hints).toBeUndefined();
+      expect('hints' in outcome).toBe(false);
+      expect('unverified' in outcome.mandate!).toBe(false);
+    });
+
+    it('a separate-mode mandate, JSON round-tripped, charges, reads and revokes with the requests of the 2.1-shaped one', async () => {
+      const separate = JSON.parse(
+        JSON.stringify((await fresh({ mandateHints: 'separate' }).confirmMandate('satispay', pending, {})).mandate),
+      ) as Mandate;
+      expect('unverified' in separate).toBe(false);
+
+      /**
+       * The provider requests of chargeMandate, getMandate and revokeMandate on a fresh configurator. `Date` and
+       * `Authorization` are left out: they depend on the clock.
+       */
+      const requests = async (persistedMandate: Mandate) => {
+        fetchMock().mockClear();
+        const checkout = fresh();
+        const charged = await checkout.chargeMandate('satispay', persistedMandate, {
+          chargeRef: 'SUB-0001-2026-12',
+          amount: 19.9,
+          currency: 'EUR',
+        });
+        expect(charged).toMatchObject({ status: 'succeeded', verified: true, providerPaymentId: 'pay_2' });
+        expect(await checkout.getMandate('satispay', persistedMandate)).toMatchObject({ status: 'active', verified: true });
+        const callsBeforeRevoke = fetchMock().mock.calls.length;
+        expect((await checkout.revokeMandate('satispay', persistedMandate)).revokedAtProvider).toBe(false);
+        expect(fetchMock().mock.calls.length).toBe(callsBeforeRevoke); // revokeMandate sends nothing
+        return calls().map(({ key, init }) => ({
+          key,
+          body: init.body === undefined ? undefined : bodyOf(init),
+          idempotencyKey: headersOf(init)['Idempotency-Key'],
+          digest: headersOf(init)['Digest'],
+        }));
+      };
+
+      const sent = await requests(separate);
+      expect(sent.map(({ key, body, idempotencyKey }) => ({ key, body, idempotencyKey }))).toStrictEqual([
+        {
+          key: `POST ${PAYMENTS}`,
+          body: { flow: 'PRE_AUTHORIZED', token: 'tok_1', amount_unit: 1990, currency: 'EUR', external_code: 'SUB-0001-2026-12' },
+          idempotencyKey: 'SUB-0001-2026-12',
+        },
+        { key: `GET ${TOKENS}/tok_1`, body: undefined, idempotencyKey: undefined },
+      ]);
+      // The 2.1 fixture mandate, and one persisted with an unverified hint by a 2.1 integration
+      expect(await requests(mandate)).toStrictEqual(sent);
+      expect(await requests({ ...mandate, unverified: { payerEmail: 'x@y.z' } })).toStrictEqual(sent);
     });
   });
 

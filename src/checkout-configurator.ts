@@ -18,6 +18,7 @@ import {
   MANDATE_REF_PATTERN,
   Mandate,
   MandateCallbackInput,
+  MandateHints,
   MandatePendingState,
   MandateRevokeResult,
   MandateSetupOutcome,
@@ -144,6 +145,31 @@ function chargedAmountMatches(result: ChargeResult, amount: number, currency: st
     }
   }
   return true;
+}
+
+/** Since 2.2.0: the keys of `MandateHints`, the only ones a setup outcome reports. */
+const HINT_KEYS = ['cardExpiry', 'maskedPan', 'payerEmail'] as const;
+
+/**
+ * The unsigned payment-method hints of a provider's setup outcome (since 2.2.0), as a new object. The source is
+ * `outcome.hints` when it is an object, otherwise `outcome.mandate.unverified` (the 2.1 placement) when that is an
+ * object, never a merge of the two. Only the `MandateHints` keys with a non-empty string value are kept, verbatim.
+ * `undefined` when nothing is left.
+ */
+function setupHints(source: Partial<MandateSetupOutcome>): MandateHints | undefined {
+  const mandate: unknown = source.mandate;
+  const from: unknown = isObject(source.hints)
+    ? source.hints
+    : isObject(mandate) && isObject(mandate.unverified)
+      ? mandate.unverified
+      : undefined;
+  if (!isObject(from)) return undefined;
+  const hints: MandateHints = {};
+  for (const key of HINT_KEYS) {
+    const value = from[key];
+    if (typeof value === 'string' && value !== '') hints[key] = value;
+  }
+  return Object.keys(hints).length > 0 ? hints : undefined;
 }
 
 /**
@@ -802,7 +828,12 @@ export class CheckoutConfigurator {
    * - a verified outcome whose `firstCharge.chargeRef` is not `pending.orderId`, or whose `mandate`
    *   does not match `pending` (mandateRef, provider), becomes an unverified, non-terminal failure
    *   'Mandate outcome does not match the pending setup';
-   * - `terminal` is the provider's value AND `verified`; it is always `true` with `success: true`.
+   * - `terminal` is the provider's value AND `verified`; it is always `true` with `success: true`;
+   * - since 2.2.0, only a verified outcome with `success: true` has `hints` (`MandateHints`: the provider's
+   *   `outcome.hints`, else its `mandate.unverified`, reduced to `cardExpiry`, `maskedPan` and `payerEmail` with
+   *   non-empty string values; no key when none is left). Every other outcome has `hints: undefined`. With
+   *   `config.mandateHints: 'separate'` the returned mandate has no `unverified` key; otherwise (the default,
+   *   'inline') its `unverified` is a copy of `hints`, and absent without hints.
    *
    * Events are emitted only for terminal outcomes: `mandate.created` (success) or
    * `mandate.setup_failed`, then `charge.*` for the first charge. A non-terminal outcome emits
@@ -896,6 +927,8 @@ export class CheckoutConfigurator {
         verified: false,
         terminal: false,
         mandate: undefined,
+        // Since 2.2.0: `...source` would carry a provider-set `hints`
+        hints: undefined,
         firstCharge,
         error: source.error ?? 'Mandate outcome could not be verified',
       };
@@ -905,6 +938,7 @@ export class CheckoutConfigurator {
       success: false,
       verified: false,
       terminal: false,
+      hints: undefined,
       firstCharge: { status: 'unknown', verified: false, chargeRef: pending.orderId, error: SETUP_MISMATCH },
       error: SETUP_MISMATCH,
       raw: source.raw,
@@ -927,14 +961,31 @@ export class CheckoutConfigurator {
     }
 
     const firstCharge = this.normalizeCharge(providerCharge, pending.orderId, pending.amount, pending.currency);
-    return {
+    // Since 2.2.0: only a success reports hints (`hints: undefined` overrides a provider-set one otherwise)
+    const hints = success ? setupHints(source) : undefined;
+    const normalized: MandateSetupOutcome = {
       ...source,
       success,
       verified: true,
       terminal: success || source.terminal === true,
-      mandate: success && isObject(mandate) ? { ...mandate } : undefined,
+      mandate: success && isObject(mandate) ? this.setupMandate(mandate, hints) : undefined,
+      hints,
       firstCharge,
     };
+    // A success without hints has no `hints` key
+    if (success && hints === undefined) delete normalized.hints;
+    return normalized;
+  }
+
+  /**
+   * The mandate of a successful setup, as a new object (since 2.2.0): every field of the provider's mandate except
+   * `unverified`, which 'inline' mode (the default) sets again to a copy of the sanitized `hints`, only when there are
+   * some. Never a field-by-field copy, so a field that a later minor adds to `Mandate` is kept.
+   */
+  private setupMandate(mandate: Mandate, hints: MandateHints | undefined): Mandate {
+    const { unverified: _unverified, ...copy } = mandate;
+    if (this.config.mandateHints === 'separate' || hints === undefined) return copy;
+    return { ...copy, unverified: { ...hints } };
   }
 
   /**

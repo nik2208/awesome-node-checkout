@@ -34,8 +34,9 @@ export interface NexiProviderConfig {
   /** @default 'sandbox' */
   environment?: 'sandbox' | 'production';
   /**
-   * Timeout of the recurring-payment and contract API calls (`pagamentoRicorrente`,
-   * `situazioneOrdine` replay guard, `dettagliContratto`, `cancellaContratto`), in ms.
+   * Timeout of the recurring-payment, contract and charge lookup API calls (`pagamentoRicorrente`,
+   * `situazioneOrdine` for the replay guard and for `getCharge`, `dettagliContratto`,
+   * `cancellaContratto`), in ms. `getPaymentDetails` and `refundPayment` do not use it.
    * @default 30000
    */
   timeoutMs?: number;
@@ -101,22 +102,29 @@ function nexiEntryKind(entry: Record<string, unknown>): NexiEntryKind {
 }
 
 /**
- * Classifies every `situazioneOrdine` report entry for `codTrans` and selects the entry the result reports. Nexi may
- * list a code more than once (it accepts up to 2 retries of a code after a KO), so one charged entry means the
- * customer was charged, whatever the order of the entries, and one entry that is not final means the code may still
- * be charged:
- * - `paid`: some entry took the money. Selected: the first one whose `stato` maps to a `ChargeProviderState`
- *   (refunded, partly refunded, partly captured: the most specific fact), otherwise the first paid one;
+ * Classifies every `situazioneOrdine` report entry for `codTrans`. Nexi may list a code more than once (it accepts up
+ * to 2 retries of a code after a KO), so one charged entry means the customer was charged, whatever the order of the
+ * entries, and one entry that is not final means the code may still be charged:
+ * - `paid`: some entry took the money;
  * - `pending`: otherwise, some entry is not final (`In Corso`, an unrecognised or missing `stato`). Fail safe: it is
- *   never reported as refused. Selected: the first such entry;
- * - `refused`: every entry is a clear refusal. Selected: the first entry;
+ *   never reported as refused;
+ * - `refused`: every entry is a clear refusal;
  * - `absent`: no entry for `codTrans`, and nothing selected.
+ *
+ * Two entries are selected:
+ * - `entry`: the first entry of that kind. The replay guard reports it, as in 2.1.0 (its `stato` in `raw.stato`, its
+ *   amount and currency), and so does `getPaymentDetails` since 2.2.0. A report whose first entry is paid therefore
+ *   keeps its 2.1.0 result: the selection only turns a wrong "not paid" into the right answer;
+ * - `specific` (`paid` only): the first paid entry whose `stato` maps to a `ChargeProviderState` (refunded, partly
+ *   refunded, partly captured), the most specific fact, when there is one. `getCharge` reports it instead of `entry`,
+ *   and the replay guard reports its state as `providerState`. It may be another entry than `entry`.
+ *
  * Pure: shared by the replay guard (`lookupTransaction`), `getCharge` and `getPaymentDetails`.
  */
 function classifyNexiReport(
   report: readonly unknown[],
   codTrans: string,
-): { kind: NexiEntryKind | 'absent'; entry?: Record<string, unknown> } {
+): { kind: NexiEntryKind | 'absent'; entry?: Record<string, unknown>; specific?: Record<string, unknown> } {
   const entries = report.filter(
     (r): r is Record<string, unknown> =>
       r !== null && typeof r === 'object' && (r as Record<string, unknown>)['codiceTransazione'] === codTrans,
@@ -125,7 +133,21 @@ function classifyNexiReport(
   const kind = (['paid', 'pending'] as const).find((k) => entries.some((e) => nexiEntryKind(e) === k)) ?? 'refused';
   const candidates = entries.filter((e) => nexiEntryKind(e) === kind);
   const specific = kind === 'paid' ? candidates.find((e) => nexiProviderState(e['stato']) !== undefined) : undefined;
-  return { kind, entry: specific ?? candidates[0] };
+  return { kind, entry: candidates[0], ...(specific !== undefined ? { specific } : {}) };
+}
+
+/** What a result reports of one report entry: its `stato` (verbatim, when a string), amount and currency. */
+type NexiEntryFacts = { stato?: string; amount?: number; currency?: string };
+
+function nexiEntryFacts(entry: Record<string, unknown>): NexiEntryFacts {
+  const stato = typeof entry['stato'] === 'string' ? entry['stato'] : undefined;
+  const amount = parseAmountFromCents(entry['importo']);
+  const currency = parseNexiCurrency(entry['divisa']);
+  return {
+    ...(stato !== undefined ? { stato } : {}),
+    ...(amount !== undefined ? { amount } : {}),
+    ...(currency !== undefined ? { currency } : {}),
+  };
 }
 
 /** Nexi XPay numeric code of EUR, the only currency `pagamentoRicorrente` accepts. */
@@ -162,10 +184,15 @@ interface NexiOutcomeFields {
 
 type LookupResult = {
   kind: 'paid' | 'refused' | 'pending' | 'absent' | 'error';
-  /** `stato` of the selected report entry, verbatim. */
+  /** `stato` of the selected report entry (`classifyNexiReport`'s `entry`: the first of its kind), verbatim. */
   stato?: string;
   amount?: number;
   currency?: string;
+  /**
+   * Since 2.2.0, `paid` only: the first paid entry refunded or partly captured (`classifyNexiReport`'s `specific`),
+   * when there is one. `stato`, `amount` and `currency` above stay the first paid entry's, as in 2.1.0.
+   */
+  specific?: NexiEntryFacts;
   /**
    * The response carried a MAC and it was valid (`responseMacValid`). The replay guard ignores it: it keeps treating
    * an unsigned KO "not found" as `absent`. `getCharge` reports such an answer as `unknown`.
@@ -479,6 +506,8 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
    *   `authenticated` tells them apart);
    * - `error`: anything else (HTTP, network, timeout, non-JSON, bad MAC, a missing MAC on OK, no
    *   `report` array, any other KO).
+   * `stato`, `amount` and `currency` are the first entry of the kind's, as in 2.1.0; `specific` is
+   * the first paid entry refunded or partly captured, when there is one.
    */
   private async lookupTransaction(codTrans: string): Promise<LookupResult> {
     const timeStamp = String(Date.now());
@@ -501,28 +530,27 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
     }
     if (json['esito'] !== 'OK' || !Array.isArray(json['report'])) return { kind: 'error', authenticated, json };
 
-    const { kind, entry } = classifyNexiReport(json['report'] as unknown[], codTrans);
+    const { kind, entry, specific } = classifyNexiReport(json['report'] as unknown[], codTrans);
     if (kind === 'absent' || entry === undefined) return { kind: 'absent', authenticated, json };
-    const stato = typeof entry['stato'] === 'string' ? entry['stato'] : undefined;
-    const amount = parseAmountFromCents(entry['importo']);
-    const currency = parseNexiCurrency(entry['divisa']);
     return {
       kind,
       authenticated,
       json,
-      ...(stato !== undefined ? { stato } : {}),
-      ...(amount !== undefined ? { amount } : {}),
-      ...(currency !== undefined ? { currency } : {}),
+      ...nexiEntryFacts(entry),
+      ...(specific !== undefined ? { specific: nexiEntryFacts(specific) } : {}),
     };
   }
 
   /**
    * Since 2.2.0 (`IChargeLookupProvider`). Read-only lookup of `chargeRef` (= `codiceTransazione`, also the setup's
    * `orderId` = `codTrans`) with `situazioneOrdine`, bounded by `timeoutMs`. Every report entry for the code counts,
-   * as for the replay guard of `chargeMandate`. `options` are ignored. Never charges, never refunds, never throws.
+   * classified as for the replay guard of `chargeMandate`. `options` are ignored. Never charges, never refunds, never
+   * throws.
    *
-   * - money taken → `succeeded` with `providerPaymentId` (= chargeRef), the selected entry's `amount`, `currency`,
-   *   `providerStatus` (its `stato`, trimmed) and `providerState` (refunded, partly refunded, partly captured).
+   * - money taken → `succeeded` with `providerPaymentId` (= chargeRef), and the reported entry's `amount`, `currency`,
+   *   `providerStatus` (its `stato`, trimmed) and `providerState` (refunded, partly refunded, partly captured). The
+   *   reported entry is the most specific fact: the first paid entry refunded or partly captured, otherwise the first
+   *   paid one (the replay guard keeps reporting the first paid one, as in 2.1.0, and flags the state).
    *   `refundedAmount` is `0` for a paid state without a refund (`Autorizzato`, `Contabilizzato`, `Catturato`,
    *   `Contabilizzato Parz.`) and absent for `Rimborsato` / `Rimborsato Parz.`: `situazioneOrdine` documents no
    *   refunded amount, so compare `providerState` and reconcile partial refunds in the Nexi back office;
@@ -551,17 +579,19 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
       const providerStatus = lookup.stato !== undefined ? { providerStatus: lookup.stato.trim() } : {};
       switch (lookup.kind) {
         case 'paid': {
-          const providerState = nexiProviderState(lookup.stato);
+          // The most specific fact: a refunded or partly captured entry when there is one, else the first paid one
+          const reported: NexiEntryFacts = lookup.specific ?? lookup;
+          const providerState = nexiProviderState(reported.stato);
           // A paid state without a refund reports 0; Rimborsato / Rimborsato Parz. report no amount
-          const notRefunded = NEXI_NOT_REFUNDED_STATUSES.has(String(lookup.stato).trim().toLowerCase());
+          const notRefunded = NEXI_NOT_REFUNDED_STATUSES.has(String(reported.stato).trim().toLowerCase());
           return {
             status: 'succeeded',
             verified: true,
             chargeRef,
             providerPaymentId: chargeRef,
-            ...(lookup.amount !== undefined ? { amount: lookup.amount } : {}),
-            ...(lookup.currency !== undefined ? { currency: lookup.currency } : {}),
-            ...providerStatus,
+            ...(reported.amount !== undefined ? { amount: reported.amount } : {}),
+            ...(reported.currency !== undefined ? { currency: reported.currency } : {}),
+            ...(reported.stato !== undefined ? { providerStatus: reported.stato.trim() } : {}),
             ...(providerState !== undefined ? { providerState } : {}),
             ...(notRefunded ? { refundedAmount: 0 } : {}),
             ...raw,
@@ -834,7 +864,8 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
 
       const report = Array.isArray(result['report']) ? result['report'] : [];
       // Since 2.2.0, every entry for the code counts, as for the replay guard (Nexi can list a code more than once,
-      // e.g. a KO then an OK after a retry): the entry is the one `classifyNexiReport` selects
+      // e.g. a KO then an OK after a retry): the entry is the first of its kind (`classifyNexiReport`'s `entry`), so
+      // a report whose first entry is paid keeps its 2.1.0 result
       const item = classifyNexiReport(report, paymentId).entry;
       if (!item) {
         return {
@@ -1124,7 +1155,10 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
    * Replay guard: `situazioneOrdine` is read first. A transaction that took the money (paid,
    * partly captured, refunded or partly refunded) is returned as `succeeded` without charging
    * again, with its `stato` in `providerStatus` (trimmed; verbatim in `raw.stato`, as in 2.1.0) and,
-   * when refunded or partly captured, `providerState`; one that only Nexi refused (`Negato`, `Annullato`,
+   * when refunded or partly captured, `providerState`. With several entries that took the money,
+   * `amount`, `currency`, `raw.stato` and `providerStatus` are the first one's (as in 2.1.0), and
+   * `providerState` is set when any of them is refunded or partly captured (the first such one);
+   * one that only Nexi refused (`Negato`, `Annullato`,
    * `Non Creato`) is `failed` (a dunning retry needs a new `chargeRef`: Nexi's own retries of a
    * code after a KO are not used); one still in progress (`In Corso`) or with an unrecognised
    * `stato` is `unknown`, and so is a lookup error: nothing is charged. A Nexi "transaction
@@ -1141,7 +1175,9 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
       ...(providerCode !== undefined ? { providerCode } : {}),
     });
     const fromLookup = (lookup: LookupResult): ChargeResult => {
-      const providerState = nexiProviderState(lookup.stato);
+      // The first paid entry's facts, as in 2.1.0; the state of a paid entry refunded or partly captured, which may
+      // be another one, so providerStatus and providerState can come from different entries
+      const providerState = nexiProviderState(lookup.specific?.stato);
       return {
         status: 'succeeded',
         verified: true,

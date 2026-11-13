@@ -195,6 +195,22 @@ describe('NexiProvider.getCharge (#40)', () => {
     expect(result.providerStatus).toBe('Rimborsato');
   });
 
+  it('[Autorizzato 19.90, Contabilizzato Parz. 10.00] reports the partial capture entry: its amount and state', async () => {
+    fetchMock().mockResolvedValueOnce(
+      reportResponse([PAID_ENTRY, { ...PAID_ENTRY, stato: 'Contabilizzato Parz.', importo: 1000 }]),
+    );
+    const result = await provider.getCharge(CHARGE);
+    expect(result).toMatchObject({
+      status: 'succeeded',
+      verified: true,
+      amount: 10,
+      currency: 'EUR',
+      providerStatus: 'Contabilizzato Parz.',
+      providerState: 'partially_captured',
+      refundedAmount: 0,
+    });
+  });
+
   describe('absent', () => {
     it('an OK with an empty report is absent and verified', async () => {
       fetchMock().mockResolvedValueOnce(jsonResponse({ ...OK_RESP, report: [] }));
@@ -379,7 +395,9 @@ describe('NexiProvider.getPaymentDetails reads every report entry (#40 §5)', ()
     expect(result.error).toBe('Payment status is Rimborsato');
   });
 
-  it('[Autorizzato, Rimborsato] selects the refunded entry: a one-off flow never fulfils a refunded order', async () => {
+  // A report whose first entry is paid keeps its 2.1.0 result: the fix only turns a wrong "not paid" into the right
+  // answer, never a 2.1.0 "paid" into "not paid" (getCharge reports the refund or partial capture as providerState)
+  it("[Autorizzato, Rimborsato] keeps the 2.1.0 result: success true, status 'Autorizzato'", async () => {
     fetchMock().mockResolvedValueOnce(
       reportResponse([
         { ...PAID_ENTRY, stato: 'Autorizzato' },
@@ -387,9 +405,29 @@ describe('NexiProvider.getPaymentDetails reads every report entry (#40 §5)', ()
       ]),
     );
     const result = await provider.getPaymentDetails(CHARGE);
+    expect(result.success).toBe(true);
+    expect(result.status).toBe('Autorizzato');
+    expect(result.amount).toBe(19.9);
+    expect(result.verified).toBe(true);
+  });
+
+  it("[Autorizzato 19.90, Contabilizzato Parz. 10.00] keeps the 2.1.0 result: success true, 'Autorizzato', 19.9", async () => {
+    fetchMock().mockResolvedValueOnce(
+      reportResponse([PAID_ENTRY, { ...PAID_ENTRY, stato: 'Contabilizzato Parz.', importo: 1000 }]),
+    );
+    const result = await provider.getPaymentDetails(CHARGE);
+    expect(result.success).toBe(true);
+    expect(result.status).toBe('Autorizzato');
+    expect(result.amount).toBe(19.9);
+    expect(result.currency).toBe('EUR');
+    expect(result.error).toBeUndefined();
+  });
+
+  it("[Rimborsato, Autorizzato] reports the first paid entry, as in 2.1.0: success false, 'Rimborsato'", async () => {
+    fetchMock().mockResolvedValueOnce(reportResponse([{ ...PAID_ENTRY, stato: 'Rimborsato' }, PAID_ENTRY]));
+    const result = await provider.getPaymentDetails(CHARGE);
     expect(result.success).toBe(false);
     expect(result.status).toBe('Rimborsato');
-    expect(result.verified).toBe(true);
   });
 
   it("[Negato, In Corso] reports the attempt that is not final: 'In Corso'", async () => {

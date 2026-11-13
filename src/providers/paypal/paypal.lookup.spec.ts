@@ -294,6 +294,52 @@ describe('PayPalProvider.getCharge (#40)', () => {
     });
   });
 
+  // "Every attempt was refused" relies on no other attempt being listed, like "absent": within the indexing delay a
+  // later attempt may not be listed yet
+  describe('a capture found within the indexing delay (now - until < 4 h)', () => {
+    const RECENT_UNTIL = '2026-11-12T09:30:00.000Z';
+
+    it.each(['DECLINED', 'FAILED'])('a %s capture is unknown, never failed: a later attempt may not be listed yet', async (status) => {
+      happyPath({ status });
+      const result = await provider.getCharge(CHARGE, { since: SINCE, until: RECENT_UNTIL });
+      expect(result).toEqual({
+        status: 'unknown',
+        verified: false,
+        chargeRef: CHARGE,
+        error: 'PayPal transaction search may not list this charge yet',
+      });
+      expect(sdk.getCapturedPayment).toHaveBeenCalledWith({ captureId: 'CAP-1' });
+    });
+
+    it('a DECLINED capture exactly 4 hours after until is failed', async () => {
+      happyPath({ status: 'DECLINED' });
+      const result = await provider.getCharge(CHARGE, { since: SINCE, until: '2026-11-12T06:00:00.000Z' });
+      expect(result.status).toBe('failed');
+      expect(result.verified).toBe(true);
+    });
+
+    it('a COMPLETED capture stays succeeded and a PENDING one pending: both are facts about money', async () => {
+      happyPath();
+      const succeeded = await provider.getCharge(CHARGE, { since: SINCE, until: RECENT_UNTIL });
+      expect(succeeded.status).toBe('succeeded');
+      expect(succeeded.verified).toBe(true);
+
+      happyPath({ status: 'PENDING' });
+      const pending = await provider.getCharge(CHARGE, { since: SINCE, until: RECENT_UNTIL });
+      expect(pending.status).toBe('pending');
+      expect(pending.verified).toBe(true);
+    });
+
+    it('through the configurator too: a recent DECLINED capture is unknown', async () => {
+      happyPath({ status: 'DECLINED' });
+      const checkout = new CheckoutConfigurator({ emitEvents: false }).registerProvider(provider);
+      const result = await checkout.getCharge('paypal', CHARGE, { since: SINCE, until: RECENT_UNTIL });
+      expect(result.status).toBe('unknown');
+      expect(result.verified).toBe(false);
+      expect(result.error).toBe('PayPal transaction search may not list this charge yet');
+    });
+  });
+
   describe('re-reading the matching records', () => {
     it('a second matching record that is not a capture (404) is skipped', async () => {
       sdk.searchTransactions.mockResolvedValueOnce(searchPage([record('CAP-1'), record('REFUND-1')]));
@@ -392,8 +438,47 @@ describe('PayPalProvider.getCharge (#40)', () => {
       expect((await provider.getCharge(CHARGE, { since: SINCE })).status).toBe('unknown');
       sdk.searchTransactions.mockResolvedValueOnce({ result: { transactionDetails: [], totalPages: 'many' } });
       expect((await provider.getCharge(CHARGE, { since: SINCE })).status).toBe('unknown');
-      sdk.searchTransactions.mockResolvedValueOnce({ result: { transactionDetails: [], totalPages: 0 } });
+      sdk.searchTransactions.mockResolvedValueOnce({ result: { transactionDetails: [], totalPages: -1 } });
       expect((await provider.getCharge(CHARGE, { since: SINCE })).status).toBe('unknown');
+      sdk.searchTransactions.mockResolvedValueOnce({ result: { transactionDetails: [], totalPages: 1.5 } });
+      expect((await provider.getCharge(CHARGE, { since: SINCE })).status).toBe('unknown');
+    });
+
+    // PayPal's schema (reporting_transactions_v1 search_response.total_pages) has a minimum of 0: an empty window
+    // has 0 pages
+    it('totalPages: 0 on an empty first page is an empty window: absent, after a single call', async () => {
+      sdk.searchTransactions.mockResolvedValueOnce({
+        result: { transactionDetails: [], page: 1, totalItems: 0, totalPages: 0 },
+      });
+      const result = await provider.getCharge(CHARGE, { since: SINCE });
+      expect(result).toEqual({ status: 'absent', verified: true, chargeRef: CHARGE });
+      expect(sdk.searchTransactions).toHaveBeenCalledTimes(1);
+
+      sdk.searchTransactions.mockResolvedValueOnce({ result: { totalItems: 0, totalPages: 0 } });
+      expect((await provider.getCharge(CHARGE, { since: SINCE })).status).toBe('absent');
+      expect(sdk.searchTransactions).toHaveBeenCalledTimes(2);
+    });
+
+    it('totalPages: 0 on an empty first page within the indexing delay is still unknown', async () => {
+      sdk.searchTransactions.mockResolvedValueOnce({ result: { transactionDetails: [], totalPages: 0 } });
+      const result = await provider.getCharge(CHARGE, { since: SINCE, until: '2026-11-12T09:30:00.000Z' });
+      expect(result.status).toBe('unknown');
+      expect(result.error).toBe('PayPal transaction search may not list this charge yet');
+    });
+
+    it('totalPages: 0 with records, or on a later page, is unknown (inconsistent)', async () => {
+      sdk.searchTransactions.mockResolvedValueOnce({ result: { transactionDetails: [record('CAP-1')], totalPages: 0 } });
+      const withRecords = await provider.getCharge(CHARGE, { since: SINCE });
+      expect(withRecords.status).toBe('unknown');
+      expect(withRecords.error).toBe('Unexpected PayPal transaction search response');
+      expect(sdk.getCapturedPayment).not.toHaveBeenCalled();
+
+      sdk.searchTransactions
+        .mockResolvedValueOnce(searchPage([], 2))
+        .mockResolvedValueOnce({ result: { transactionDetails: [], totalPages: 0 } });
+      const laterPage = await provider.getCharge(CHARGE, { since: SINCE });
+      expect(laterPage.status).toBe('unknown');
+      expect(laterPage.error).toBe('Unexpected PayPal transaction search response');
     });
   });
 
@@ -549,6 +634,27 @@ describe('PayPalProvider.getCharge (#40)', () => {
       expect(sdk.getOrder).not.toHaveBeenCalled();
     });
 
+    // A refunded capture whose order lists no COMPLETED refund: 0 ("no refund") would contradict the capture status
+    it('a REFUNDED capture whose order lists no refund gives no refundedAmount, never 0', async () => {
+      happyPath({ status: 'REFUNDED' });
+      sdk.getOrder.mockResolvedValueOnce({ result: chargeOrder({ status: 'REFUNDED' }) });
+      const result = await provider.getCharge(CHARGE, { since: SINCE });
+      expect(result.status).toBe('succeeded');
+      expect(result.providerState).toBe('refunded');
+      expect('refundedAmount' in result).toBe(false);
+      expect(sdk.getOrder).toHaveBeenCalledWith({ id: 'ORDER-9' });
+    });
+
+    it('a PARTIALLY_REFUNDED capture whose order lists only PENDING refunds gives no refundedAmount', async () => {
+      happyPath({ status: 'PARTIALLY_REFUNDED' });
+      sdk.getOrder.mockResolvedValueOnce({
+        result: chargeOrder({ status: 'PARTIALLY_REFUNDED' }, [refund('R1', '5.00', 'PENDING')]),
+      });
+      const result = await provider.getCharge(CHARGE, { since: SINCE });
+      expect(result.providerState).toBe('partially_refunded');
+      expect('refundedAmount' in result).toBe(false);
+    });
+
     it('a pending or failed capture has no refundedAmount', async () => {
       for (const status of ['PENDING', 'DECLINED']) {
         happyPath({ status });
@@ -593,6 +699,18 @@ describe('PayPalProvider.getPaymentDetails refundedAmount (#41)', () => {
     const result = await provider.getPaymentDetails('ORDER-9');
     expect(result.success).toBe(true);
     expect(result.refundedAmount).toBe(0);
+  });
+
+  it('a PARTIALLY_REFUNDED or REFUNDED capture with no COMPLETED refund listed gives no field, never 0', async () => {
+    sdk.getOrder.mockResolvedValueOnce({ result: partiallyRefunded() });
+    const noList = await provider.getPaymentDetails('ORDER-9');
+    expect(noList.status).toBe('PARTIALLY_REFUNDED');
+    expect('refundedAmount' in noList).toBe(false);
+
+    sdk.getOrder.mockResolvedValueOnce({ result: chargeOrder({ status: 'REFUNDED' }, [refund('R1', '19.90', 'PENDING')]) });
+    const onlyPending = await provider.getPaymentDetails('ORDER-9');
+    expect(onlyPending.status).toBe('REFUNDED');
+    expect('refundedAmount' in onlyPending).toBe(false);
   });
 
   it("a refund in 'USD' gives no field", async () => {

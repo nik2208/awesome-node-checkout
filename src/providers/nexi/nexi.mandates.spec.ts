@@ -850,6 +850,68 @@ describe('NexiProvider mandates (#31)', () => {
         expect('providerStatus' in result).toBe(false);
       }
     });
+
+    // Several money-taking entries: amount, currency, raw.stato and providerStatus are the first paid entry's, as in
+    // 2.1.0; providerState flags any paid entry that is refunded or partly captured, so the two can come from
+    // different entries
+    it('[Autorizzato, Rimborsato] keeps the 2.1.0 replay (raw.stato Autorizzato) and adds providerState refunded', async () => {
+      fetchMock().mockResolvedValueOnce(
+        jsonResponse({ ...OK_RESP, report: [PAID_ENTRY, { ...PAID_ENTRY, stato: 'Rimborsato' }] }),
+      );
+      const result = await provider.chargeMandate(mandate(), charge);
+      expect(result).toEqual({
+        status: 'succeeded',
+        verified: true,
+        chargeRef: CHARGE_REF,
+        providerPaymentId: CHARGE_REF,
+        amount: 19.9,
+        currency: 'EUR',
+        providerStatus: 'Autorizzato',
+        providerState: 'refunded',
+        raw: { stato: 'Autorizzato' },
+      });
+      expect(fetchMock()).toHaveBeenCalledTimes(1);
+    });
+
+    it('[Autorizzato 19.90, Contabilizzato Parz. 10.00] keeps the first paid amount and flags partially_captured', async () => {
+      fetchMock().mockResolvedValueOnce(
+        jsonResponse({
+          ...OK_RESP,
+          report: [PAID_ENTRY, { ...PAID_ENTRY, stato: 'Contabilizzato Parz.', importo: 1000 }],
+        }),
+      );
+      const result = await provider.chargeMandate(mandate(), charge);
+      expect(result.status).toBe('succeeded');
+      expect(result.amount).toBe(19.9);
+      expect(result.raw).toEqual({ stato: 'Autorizzato' });
+      expect(result.providerStatus).toBe('Autorizzato');
+      expect(result.providerState).toBe('partially_captured');
+    });
+
+    it('[Rimborsato, Autorizzato] reports the first paid entry, Rimborsato, as in 2.1.0', async () => {
+      fetchMock().mockResolvedValueOnce(
+        jsonResponse({ ...OK_RESP, report: [{ ...PAID_ENTRY, stato: 'Rimborsato' }, PAID_ENTRY] }),
+      );
+      const result = await provider.chargeMandate(mandate(), charge);
+      expect(result.raw).toEqual({ stato: 'Rimborsato' });
+      expect(result.providerStatus).toBe('Rimborsato');
+      expect(result.providerState).toBe('refunded');
+    });
+
+    it('the KO 9 re-read selects the same way: [Autorizzato, Rimborsato] keeps raw.stato Autorizzato', async () => {
+      fetchMock()
+        .mockResolvedValueOnce(emptyLookup())
+        .mockResolvedValueOnce(ko(9))
+        .mockResolvedValueOnce(
+          jsonResponse({ ...OK_RESP, report: [PAID_ENTRY, { ...PAID_ENTRY, stato: 'Rimborsato' }] }),
+        );
+      const result = await provider.chargeMandate(mandate(), charge);
+      expect(fetchMock()).toHaveBeenCalledTimes(3);
+      expect(result.status).toBe('succeeded');
+      expect(result.raw).toEqual({ stato: 'Autorizzato' });
+      expect(result.providerStatus).toBe('Autorizzato');
+      expect(result.providerState).toBe('refunded');
+    });
   });
 
   // ---------------------------------------------------------------------------

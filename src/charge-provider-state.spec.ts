@@ -148,6 +148,22 @@ describe('providerState / providerStatus through CheckoutConfigurator.chargeMand
     expect(events[0].payload.data.providerState).toBe('refunded');
   });
 
+  it('a replay of [Autorizzato 19.90, Contabilizzato Parz. 10.00] for 19.90 EUR stays succeeded, as in 2.1.0, flagged', async () => {
+    fetchMock().mockResolvedValueOnce(
+      jsonResponse({ ...OK_RESP, report: [PAID_ENTRY, { ...PAID_ENTRY, stato: 'Contabilizzato Parz.', importo: 1000 }] }),
+    );
+    const result = await checkout.chargeMandate('nexi', mandate(), { chargeRef: CHARGE_REF, amount: 19.9, currency: 'EUR' });
+    expect(result.status).toBe('succeeded');
+    expect(result.verified).toBe(true);
+    expect(result.amount).toBe(19.9);
+    expect(result.raw).toEqual({ stato: 'Autorizzato' });
+    expect(result.providerStatus).toBe('Autorizzato');
+    expect(result.providerState).toBe('partially_captured');
+    expect('error' in result).toBe(false);
+    expect(events.map((e) => e.name)).toEqual(['charge.succeeded']);
+    expect(events[0].payload.data.providerState).toBe('partially_captured');
+  });
+
   it("a replay of 'Contabilizzato Parz.' stays succeeded with partially_captured", async () => {
     fetchMock().mockResolvedValueOnce(
       jsonResponse({ ...OK_RESP, report: [{ ...PAID_ENTRY, stato: 'Contabilizzato Parz.' }] }),

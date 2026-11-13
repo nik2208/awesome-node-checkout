@@ -79,6 +79,7 @@ const SEARCH_MAX_PAGES = 10;
 const LOOKUP_MAX_RECORDS = 5;
 const CAPTURE_NOT_MATCHING = 'PayPal capture does not match the charge';
 const UNEXPECTED_SEARCH = 'Unexpected PayPal transaction search response';
+const NOT_LISTED_YET = 'PayPal transaction search may not list this charge yet';
 
 /** Capture status → lookup status and state. Any other value is `pending`: fail safe, like Nexi's unknown `stato`. */
 const CAPTURE_LOOKUP = new Map<string, { status: ChargeLookupStatus; providerState?: ChargeProviderState }>([
@@ -156,6 +157,19 @@ function completedRefundTotal(order: unknown, currency: unknown): number | undef
     }
   }
   return minor / 10 ** currencyExponent(code);
+}
+
+/** Capture statuses that say part or all of the capture was refunded. */
+const REFUNDED_CAPTURE_STATUSES: ReadonlySet<unknown> = new Set(['REFUNDED', 'PARTIALLY_REFUNDED']);
+
+/**
+ * The `refundedAmount` of a capture with `captureStatus`: `completedRefundTotal`, except that a `REFUNDED` or
+ * `PARTIALLY_REFUNDED` capture whose order lists no COMPLETED refund (no refunds list, or only PENDING ones) gives
+ * undefined. `0` would say "no refund" against the capture's own status: the total is not known.
+ */
+function captureRefundTotal(order: unknown, captureStatus: unknown, currency: unknown): number | undefined {
+  const total = completedRefundTotal(order, currency);
+  return total === 0 && REFUNDED_CAPTURE_STATUSES.has(captureStatus) ? undefined : total;
 }
 
 /**
@@ -306,7 +320,7 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
       const isCaptureCompleted = captureStatus === 'COMPLETED' && amount !== undefined && amount > 0 && !!currency && currency.trim() !== '';
       const status = captureStatus ?? 'NO_CAPTURE';
       // Since 2.2.0: the order's COMPLETED refunds, from the same read (no extra API call)
-      const refundedAmount = capture ? completedRefundTotal(order, currency) : undefined;
+      const refundedAmount = capture ? captureRefundTotal(order, captureStatus, currency) : undefined;
 
       return {
         success: isCaptureCompleted,
@@ -924,13 +938,17 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
    * comes from the authenticated re-read of that capture. Never charges, never refunds, never throws.
    *
    * - `options.since` is required (`until` defaults to `since`, at most 30 days later). The search window is
-   *   `since - 1 h` .. `min(now, until + 1 h)`, read in pages of 500, at most 10 pages.
+   *   `since - 1 h` .. `min(now, until + 1 h)`, read in pages of 500, at most 10 pages (`total_pages: 0` on an empty
+   *   first page is an empty window).
    * - No record with this invoice_id: `absent` once `now - until >= 4 h` (the 1-hour margin plus PayPal's 3-hour
    *   indexing delay), `unknown` before.
    * - Every matching record is re-read with `getCapturedPayment`; a 404 (not a capture, e.g. a refund of the same
    *   invoice) is skipped. One capture maps its status: `COMPLETED` `succeeded`, `PARTIALLY_REFUNDED` / `REFUNDED`
    *   `succeeded` with that `providerState`, `PENDING` `pending`, `DECLINED` / `FAILED` `failed`, anything else
    *   `pending`. `providerPaymentId` is the order id (`refundPayment` takes it) and `raw` the captured payment.
+   * - Before that 4-hour horizon a later attempt may not be listed yet: a `DECLINED` / `FAILED` capture is then
+   *   `unknown` like no record, and the double-charge check below only sees the captures already listed (a
+   *   `succeeded` or `pending` capture is still reported: money moved, or may).
    * - `unknown`: a capture of another invoice_id or (with `options.mandate`) another `custom_id`, more than one
    *   distinct capture (a possible double charge: reconcile it in PayPal), more than 5 matching records, more than
    *   10 pages, any error. Error results carry only PayPal's error body, never the SDK error (it carries the bearer
@@ -978,9 +996,12 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
         }
         const pages: unknown = response?.totalPages ?? 1;
         const details: unknown = response?.transactionDetails ?? [];
-        if (typeof pages !== 'number' || !Number.isInteger(pages) || pages < 1 || !Array.isArray(details)) {
+        if (typeof pages !== 'number' || !Number.isInteger(pages) || pages < 0 || !Array.isArray(details)) {
           return unknown(UNEXPECTED_SEARCH);
         }
+        // PayPal's schema allows total_pages 0 (total_items 0 divided into pages): an empty window. Only an empty
+        // first page can say so; anything else is inconsistent
+        if (pages === 0 && (page !== 1 || details.length > 0)) return unknown(UNEXPECTED_SEARCH);
         if (pages > SEARCH_MAX_PAGES) return unknown('Too many PayPal transactions in the lookup window');
         totalPages = pages;
         // 4. Matching records
@@ -992,11 +1013,10 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
         }
       }
 
-      // 5. No matching record
+      // 5. No matching record. PayPal lists a transaction up to 3 hours after it executed
+      const indexed = now - untilMs >= LOOKUP_ABSENT_AFTER_MS;
       if (records.length === 0) {
-        return now - untilMs >= LOOKUP_ABSENT_AFTER_MS
-          ? { status: 'absent', verified: true, chargeRef }
-          : unknown('PayPal transaction search may not list this charge yet');
+        return indexed ? { status: 'absent', verified: true, chargeRef } : unknown(NOT_LISTED_YET);
       }
 
       // 6. Re-read every matching record (a capture can be listed more than once: one read per id)
@@ -1030,7 +1050,12 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
 
       // 7. One capture
       const [capture] = captures.values();
-      return await this.captureLookup(chargeRef, capture);
+      const result = await this.captureLookup(chargeRef, capture);
+      // "Every attempt was refused" relies on no other attempt being listed, like `absent`: before the indexing
+      // horizon a later attempt (a new order after the request-id window) may not be listed yet. A `succeeded` or
+      // `pending` capture is a fact about money either way
+      if (result.status === 'failed' && !indexed) return unknown(NOT_LISTED_YET);
+      return result;
     } catch {
       return unknown('PayPal charge lookup failed');
     }
@@ -1041,7 +1066,8 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
    *
    * `refundedAmount` (`succeeded` only): `0` for a `COMPLETED` capture, with no other API call; for `REFUNDED` and
    * `PARTIALLY_REFUNDED`, the COMPLETED refunds of its order (`getOrder` on the order id), only when that order's
-   * first capture is this one. Absent when the order id is missing, `getOrder` fails, or the total is not certain.
+   * first capture is this one. Absent when the order id is missing, `getOrder` fails, the order lists no COMPLETED
+   * refund (a refunded capture is never `0`), or the total is not certain.
    */
   private async captureLookup(chargeRef: string, capture: CapturedPayment): Promise<ChargeLookupResult> {
     const captureStatus: string | undefined = typeof capture.status === 'string' ? capture.status : undefined;
@@ -1055,8 +1081,8 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
     let refundedAmount: number | undefined;
     if (captureStatus === 'COMPLETED') {
       refundedAmount = 0;
-    } else if ((captureStatus === 'REFUNDED' || captureStatus === 'PARTIALLY_REFUNDED') && providerPaymentId !== undefined) {
-      refundedAmount = await this.orderRefundTotal(providerPaymentId, capture.id, currency);
+    } else if (REFUNDED_CAPTURE_STATUSES.has(captureStatus) && providerPaymentId !== undefined) {
+      refundedAmount = await this.orderRefundTotal(providerPaymentId, capture.id, captureStatus, currency);
     }
     return {
       status: mapped.status,
@@ -1072,16 +1098,20 @@ export class PayPalProvider extends BasePaymentProvider implements IMandateProvi
     };
   }
 
-  /** The COMPLETED refunds of `orderId`, when its first capture is `captureId`; undefined on any doubt. Never throws. */
+  /**
+   * The COMPLETED refunds of `orderId` (`captureRefundTotal` for a capture of `captureStatus`), when its first capture
+   * is `captureId`; undefined on any doubt. Never throws.
+   */
   private async orderRefundTotal(
     orderId: string,
     captureId: string | undefined,
+    captureStatus: string | undefined,
     currency: string | undefined,
   ): Promise<number | undefined> {
     try {
       const { result: order } = await this.ordersController.getOrder({ id: orderId });
       if (captureId === undefined || firstCapture(order)?.id !== captureId) return undefined;
-      return completedRefundTotal(order, currency);
+      return captureRefundTotal(order, captureStatus, currency);
     } catch {
       return undefined;
     }

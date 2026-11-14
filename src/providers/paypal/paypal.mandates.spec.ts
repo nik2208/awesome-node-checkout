@@ -741,6 +741,36 @@ describe('PayPalProvider mandates (Vault)', () => {
       expect(result.providerCode).toBe(String(status));
     });
 
+    it("an API 401 (PayPal refused the access token) has errorCode 'PROVIDER_AUTH_FAILED'; 403 and 429 have none (#53)", async () => {
+      sdk.createOrder.mockRejectedValueOnce(apiError(401));
+      expect(await provider.chargeMandate(mandate, charge)).toEqual({
+        status: 'unknown',
+        verified: false,
+        chargeRef: 'SUB-0001-2026-12',
+        providerCode: '401',
+        errorCode: 'PROVIDER_AUTH_FAILED',
+        error: 'PayPal refused the request (HTTP 401)',
+        raw: { name: 'INTERNAL_SERVER_ERROR', message: 'error', debug_id: 'dbg-1' },
+      });
+      for (const status of [403, 429]) {
+        sdk.createOrder.mockRejectedValueOnce(apiError(status));
+        const result = await provider.chargeMandate(mandate, charge);
+        expect(result).toMatchObject({ status: 'unknown', verified: false, providerCode: String(status) });
+        expect('errorCode' in result).toBe(false);
+      }
+    });
+
+    it('an API 4xx that is not a token failure is still a verified refusal, without errorCode (#53)', async () => {
+      sdk.createOrder.mockRejectedValueOnce(apiError(404));
+      const result = await provider.chargeMandate(mandate, charge);
+      expect(result).toMatchObject({
+        status: 'failed',
+        verified: true,
+        error: 'PayPal refused the charge (HTTP 404 INTERNAL_SERVER_ERROR)',
+      });
+      expect('errorCode' in result).toBe(false);
+    });
+
     it('reads the issue from a JSON body when result is not parsed', async () => {
       const err = new ApiError(422);
       err.body = JSON.stringify({ name: 'UNPROCESSABLE_ENTITY', details: [{ issue: 'DUPLICATE_INVOICE_ID' }] });
@@ -785,6 +815,37 @@ describe('PayPalProvider mandates (Vault)', () => {
       const failed = await provider.revokeMandate(mandate);
       expect(failed.revokedAtProvider).toBe(false);
       expect(failed.error).toEqual(expect.any(String));
+    });
+
+    it('an API 404 from the vault (not a token failure) is still revoked, verified, without errorCode (#53)', async () => {
+      sdk.getPaymentToken.mockRejectedValueOnce(apiError(404, 'INVALID_RESOURCE_ID'));
+      expect(await provider.getMandate(mandate)).toEqual({ status: 'revoked', verified: true });
+      sdk.deletePaymentToken.mockRejectedValueOnce(apiError(404, 'INVALID_RESOURCE_ID'));
+      expect(await provider.revokeMandate(mandate)).toEqual({ revokedAtProvider: true });
+    });
+
+    it("an API 401 from the vault is unknown / not revoked, with errorCode 'PROVIDER_AUTH_FAILED' (#53)", async () => {
+      sdk.getPaymentToken.mockRejectedValueOnce(apiError(401));
+      expect(await provider.getMandate(mandate)).toEqual({
+        status: 'unknown',
+        verified: false,
+        errorCode: 'PROVIDER_AUTH_FAILED',
+        raw: { name: 'INTERNAL_SERVER_ERROR', message: 'error', debug_id: 'dbg-1' },
+      });
+      sdk.deletePaymentToken.mockRejectedValueOnce(apiError(401));
+      expect(await provider.revokeMandate(mandate)).toEqual({
+        revokedAtProvider: false,
+        errorCode: 'PROVIDER_AUTH_FAILED',
+        error: 'PayPal could not delete the vault token (HTTP 401 INTERNAL_SERVER_ERROR)',
+        raw: { name: 'INTERNAL_SERVER_ERROR', message: 'error', debug_id: 'dbg-1' },
+      });
+      // 403 and 500 have no errorCode
+      for (const status of [403, 500]) {
+        sdk.getPaymentToken.mockRejectedValueOnce(apiError(status));
+        expect('errorCode' in (await provider.getMandate(mandate))).toBe(false);
+        sdk.deletePaymentToken.mockRejectedValueOnce(apiError(status));
+        expect('errorCode' in (await provider.revokeMandate(mandate))).toBe(false);
+      }
     });
   });
 

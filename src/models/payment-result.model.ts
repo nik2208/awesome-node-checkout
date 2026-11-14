@@ -1,3 +1,16 @@
+/**
+ * Since 2.3.0. Stable reason set by the library when the call failed to authenticate to the provider. Compare this,
+ * never `error`. More codes may be added in minor releases: treat an unknown code like no code.
+ * - 'PROVIDER_AUTH_FAILED': the provider rejected the merchant's credentials or access token (PayPal: the OAuth token
+ *   request answered 400 or 401, or the API call itself answered 401). Check the credentials and the environment.
+ * - 'PROVIDER_AUTH_UNAVAILABLE': the access token could not be obtained for another reason (PayPal: the token request
+ *   answered another HTTP status, failed on the network or timed out). Transient.
+ * Neither is a decline. When the token request failed (either code), this call sent nothing to the API: it charged,
+ * captured, refunded, created and deleted nothing. After an API 401 the call was sent and refused, and its result keeps
+ * the operation's usual meaning (a refund, for example, stays uncertain).
+ */
+export type ProviderErrorCode = 'PROVIDER_AUTH_FAILED' | 'PROVIDER_AUTH_UNAVAILABLE';
+
 /** Unified result returned by all payment operations */
 export interface PaymentResult {
   /** True when payment is confirmed/completed with a valid captured amount */
@@ -37,6 +50,13 @@ export interface PaymentResult {
   error?: string;
 
   /**
+   * Since 2.3.0. Set by a built-in provider when it could not authenticate (see `ProviderErrorCode`). With a failed
+   * token request a PayPal refund is `status: 'REFUND_FAILED'` (nothing was sent); after an API 401 it has no `status`
+   * and stays uncertain.
+   */
+  errorCode?: ProviderErrorCode;
+
+  /**
    * True only when this outcome was authenticated: by a provider signature/MAC checked by
    * the library (e.g. the Nexi 7-field outcome MAC) or by an authenticated server-to-server
    * read from the provider API (e.g. PayPal capture, Satispay `GET /payments/{id}`).
@@ -73,4 +93,17 @@ export interface WebhookResult {
 
   error?: string;
   raw?: any;
+}
+
+/**
+ * Compile-time check only (`npm run typecheck`): ambient and not exported, so it emits no code and no declaration.
+ * A `PaymentResult` written for 2.2.0, without `errorCode`, keeps compiling (#53).
+ */
+declare class PaymentResultWrittenFor22 implements PaymentResult {
+  success: boolean;
+  paymentId?: string;
+  status?: string;
+  error?: string;
+  verified?: boolean;
+  raw?: unknown;
 }

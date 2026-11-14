@@ -13,7 +13,7 @@ export { isRefundIdempotencyProvider } from './interfaces/refund-idempotency-pro
 
 // ---- Models ----------------------------------------------------------------
 export type { PaymentRequest } from './models/payment-request.model';
-export type { PaymentResult, WebhookResult } from './models/payment-result.model';
+export type { PaymentResult, WebhookResult, ProviderErrorCode } from './models/payment-result.model';
 export type { CheckoutConfig } from './models/checkout-config.model';
 export type {
   MandateSetupRequest,

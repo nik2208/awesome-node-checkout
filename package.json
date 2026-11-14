@@ -13,7 +13,8 @@
     "./express": {
       "types": "./dist/adapters/express/index.d.ts",
       "default": "./dist/adapters/express/index.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "scripts": {
     "build": "tsc",

@@ -682,8 +682,11 @@ describe('NexiProvider', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // refundPayment — MAC must NOT include the raw macKey
+  // refundPayment — MAC must NOT include the raw macKey. Since 2.3.0 (#51) the default refund API is bo/storna
+  // (nexi.refund.spec.ts): these 2.2.0 request tests run with refundApi: 'legacy'
   // ---------------------------------------------------------------------------
+
+  const legacyRefunds = () => new NexiProvider({ ...config, refundApi: 'legacy' });
 
   it('should call refund API with a computed MAC, not the raw macKey', async () => {
     (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -691,7 +694,7 @@ describe('NexiProvider', () => {
       json: vi.fn().mockResolvedValue({ esito: 'OK' }),
     });
 
-    await provider.refundPayment('ORD-001', 9.99);
+    await legacyRefunds().refundPayment('ORD-001', 9.99);
 
     const [, options] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     const body = new URLSearchParams(options.body as string);
@@ -708,7 +711,7 @@ describe('NexiProvider', () => {
       json: vi.fn().mockResolvedValue({ esito: 'OK' }),
     });
 
-    const result = await provider.refundPayment('ORD-001');
+    const result = await legacyRefunds().refundPayment('ORD-001');
 
     expect(result.success).toBe(true);
     expect(result.status).toBe('REFUNDED');
@@ -720,7 +723,7 @@ describe('NexiProvider', () => {
       json: vi.fn().mockResolvedValue({ esito: 'KO' }),
     });
 
-    const result = await provider.refundPayment('ORD-001');
+    const result = await legacyRefunds().refundPayment('ORD-001');
 
     expect(result.success).toBe(false);
     expect(result.status).toBe('REFUND_FAILED');
@@ -729,7 +732,7 @@ describe('NexiProvider', () => {
   it('should handle network errors in refundPayment', async () => {
     (global.fetch as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Network failure'));
 
-    const result = await provider.refundPayment('ORD-001');
+    const result = await legacyRefunds().refundPayment('ORD-001');
 
     expect(result.success).toBe(false);
     expect(result.error).toContain('Network failure');
@@ -748,14 +751,14 @@ describe('NexiProvider', () => {
       expect(detailsResult.success).toBe(false);
       expect(detailsResult.error).toBe('Invalid provider response');
 
-      // refundPayment non-JSON 200
+      // refundPayment non-JSON 200 (the 2.2.0 request, refundApi: 'legacy'; bo/storna in nexi.refund.spec.ts)
       (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
         ok: true,
         status: 200,
         json: vi.fn().mockRejectedValue(new SyntaxError('Unexpected token < in JSON at position 0')),
       });
 
-      const refundResult = await provider.refundPayment('ORD-001');
+      const refundResult = await legacyRefunds().refundPayment('ORD-001');
       expect(refundResult.success).toBe(false);
       expect(refundResult.error).toBe('Invalid provider response');
     });

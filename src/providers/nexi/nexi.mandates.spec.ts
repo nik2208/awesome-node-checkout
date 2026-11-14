@@ -1113,9 +1113,11 @@ describe('NexiProvider mandates (#31)', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // AC 8 — refund of a mandate charge
+  // AC 8 — refund of a mandate charge. Since 2.3.0 (#51) the default refund API is bo/storna (nexi.refund.spec.ts):
+  // the 2.2.0 endpoint tests run with refundApi: 'legacy'
   // ---------------------------------------------------------------------------
-  it('refundPayment(chargeRef, amount) refunds a mandate charge through the existing endpoint (AC 8)', async () => {
+  it("refundPayment(chargeRef, amount) refunds a mandate charge through the 2.2.0 endpoint with refundApi: 'legacy' (AC 8)", async () => {
+    provider = new NexiProvider({ ...baseConfig, refundApi: 'legacy' });
     fetchMock().mockResolvedValueOnce(jsonResponse({ esito: 'OK' }));
     const result = await provider.refundPayment('SUB-0001-2026-12', 19.9);
     expect(callUrl(0)).toBe('https://int-ecommerce.nexi.it/ecomm/api/vas/igfs/storno/plain');
@@ -1155,7 +1157,8 @@ describe('NexiProvider mandates (#31)', () => {
     expect(fetchMock()).not.toHaveBeenCalled();
   });
 
-  it('refundPayment with options but no key sends the storno as before (#44)', async () => {
+  it("refundPayment with options but no key sends the storno as before, with refundApi: 'legacy' (#44)", async () => {
+    provider = new NexiProvider({ ...baseConfig, refundApi: 'legacy' });
     fetchMock().mockResolvedValueOnce(jsonResponse({ esito: 'OK' }));
     const result = await provider.refundPayment('SUB-0001-2026-12', 19.9, {});
     expect(fetchMock()).toHaveBeenCalledTimes(1);

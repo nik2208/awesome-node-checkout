@@ -36,8 +36,9 @@ export interface NexiProviderConfig {
   environment?: 'sandbox' | 'production';
   /**
    * Timeout of the recurring-payment, contract and charge lookup API calls (`pagamentoRicorrente`,
-   * `situazioneOrdine` for the replay guard and for `getCharge`, `dettagliContratto`,
-   * `cancellaContratto`), in ms. `getPaymentDetails` and `refundPayment` do not use it.
+   * `situazioneOrdine` for the replay guard, for `getCharge` and, since 2.3.0, for the read before a full refund,
+   * `dettagliContratto`, `cancellaContratto`), in ms. `getPaymentDetails` does not use it, and `refundPayment` uses
+   * it only for the read before a full refund: the storno itself has no timeout.
    * @default 30000
    */
   timeoutMs?: number;
@@ -46,6 +47,28 @@ export interface NexiProviderConfig {
    * included in the setup MAC. Only needed when the terminal is enabled for both kinds.
    */
   contractType?: 'S' | 'U';
+  /**
+   * Since 2.3.0. The API that `refundPayment` calls:
+   * - 'storna' (default): the documented back-office API `POST /ecomm/api/bo/storna` (manual v20.4, pp. 613-616). Its
+   *   answer is MAC-checked;
+   * - 'legacy' (deprecated, removed in 3.0.0): the request of 1.0.0-2.2.0, `POST /ecomm/api/vas/igfs/storno/plain`
+   *   (form-encoded). No Nexi documentation lists it, and its answer carries no checked MAC. Use it only on a terminal
+   *   where it was confirmed to work.
+   * Any other value throws a TypeError in the constructor.
+   */
+  refundApi?: 'storna' | 'legacy';
+  /**
+   * Since 2.3.0. How XPay captures ("contabilizza") an authorized transaction:
+   * - 'profile' (default): no `TCONTAB` is sent and the terminal profile decides, as in 2.2.0. Nexi's standard profile
+   *   captures at midnight of the transaction day; a deferred profile captures or voids it after up to 5 days;
+   * - 'immediate': `TCONTAB=C` on the hosted payment (`createPayment`), the mandate setup (`createMandate`) and every
+   *   `pagamentoRicorrente` (`chargeMandate`), so XPay captures the transaction as soon as it is authorized, whatever
+   *   the profile.
+   * The MACs are unchanged: TCONTAB is in none of them. On the hosted page it is an unsigned URL parameter, so a
+   * customer can remove it, and the payment then follows the profile.
+   * Any other value throws a TypeError in the constructor.
+   */
+  captureMode?: 'profile' | 'immediate';
 }
 
 /** Nexi XPay paid statuses (`situazioneOrdine` report `stato`, lower-case). */
@@ -159,6 +182,20 @@ const EUR_ONLY = 'Nexi mandates support EUR only';
 /** `pagamentoRicorrente` `importo`: cents, at most 8 digits (pp. 188-193). */
 const NEXI_RECURRING_MAX_IMPORTO_DIGITS = 8;
 
+/** Since 2.3.0. `bo/storna` `importo`: cents, at most 8 digits ("N MAX 8", pp. 613-614; fragment 39). */
+const NEXI_STORNA_MAX_IMPORTO_DIGITS = 8;
+
+/**
+ * Since 2.3.0. Codes of a signed storno KO that do not prove that nothing was refunded: 97 "Errore generico" and 100
+ * "Errore interno" (pp. 883-885). Every other numeric code is an authenticated refusal.
+ */
+const NEXI_STORNA_UNKNOWN_ERRORS = new Set([97, 100]);
+
+/** A response field for an error message: `'missing'` when absent, otherwise the value as a string. */
+function shownField(value: unknown): string {
+  return value === undefined || value === null ? 'missing' : String(value);
+}
+
 /** Hosted-page `esito` values that are a final refusal of the setup. */
 const NEXI_SETUP_REFUSALS = new Set(['KO', 'ANNULLO', 'ERRORE']);
 
@@ -208,7 +245,16 @@ type LookupResult = {
 /** A parsed JSON response of the XPay REST API, or why there is none. */
 type ApiCallResult =
   | { ok: true; json: Record<string, unknown> }
-  | { ok: false; error: string };
+  | {
+      ok: false;
+      error: string;
+      /**
+       * Since 2.3.0, so that a caller tells the failures apart without parsing `error`: `fetch` rejected (a network
+       * error or a timeout), a non-2xx answer (with its `status`), or a body that is not a JSON object.
+       */
+      failure: 'network' | 'http' | 'invalid';
+      status?: number;
+    };
 
 /**
  * Nexi eCommerce provider.
@@ -222,6 +268,9 @@ type ApiCallResult =
  *
  * Charge lookup (`IChargeLookupProvider`, since 2.2.0): `getCharge` reads `situazioneOrdine`.
  *
+ * Refunds (since 2.3.0): the documented `bo/storna` API with a MAC-checked outcome (`refundApi`, see
+ * `refundPayment`). Capture (since 2.3.0, opt-in): `captureMode: 'immediate'` sends `TCONTAB=C`.
+ *
  * Note: Nexi XPay mandates SHA-1 for MAC computation. This is a requirement of
  * the Nexi API and cannot be changed on the client side.
  */
@@ -234,6 +283,14 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
 
   constructor(private readonly config: NexiProviderConfig) {
     super();
+    // Since 2.3.0. Unlike timeoutMs, which falls back on a bad value, these two shape a money request: a typo such as
+    // 'immediately' must not silently leave capture to the profile, or send the refund to another API
+    if (config.refundApi !== undefined && config.refundApi !== 'storna' && config.refundApi !== 'legacy') {
+      throw new TypeError("Invalid NexiProviderConfig.refundApi: expected 'storna' or 'legacy'");
+    }
+    if (config.captureMode !== undefined && config.captureMode !== 'profile' && config.captureMode !== 'immediate') {
+      throw new TypeError("Invalid NexiProviderConfig.captureMode: expected 'profile' or 'immediate'");
+    }
     this.apiUrl =
       config.environment === 'production'
         ? 'https://ecommerce.nexi.it'
@@ -273,7 +330,7 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
   }
 
   /**
-   * Computes the SHA-1 MAC for the refund (storno) API call.
+   * Computes the SHA-1 MAC of the 1.0.0-2.2.0 refund request (`vas/igfs/storno/plain`, `refundApi: 'legacy'`).
    * Format: `alias={alias}codTrans={codTrans}importo={importo}timestamp={timestamp}{macKey}`
    */
   private generateRefundMac(
@@ -283,6 +340,18 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
     timestamp: string,
   ): string {
     return this.sha1(`alias=${alias}codTrans=${codTrans}importo=${importo}timestamp=${timestamp}${this.config.macKey}`);
+  }
+
+  /**
+   * Since 2.3.0. Computes the SHA-1 MAC of the storno (`bo/storna`, manual v20.4 p. 614; fragment 39). `divisa` comes
+   * before `importo`, the reverse of the body:
+   * `apiKey={alias}codiceTransazione={codTrans}divisa=978importo={importo}timeStamp={timeStamp}{macKey}`
+   */
+  private generateStornaMac(codiceTransazione: string, importo: string, timeStamp: string): string {
+    return this.sha1(
+      `apiKey=${this.config.merchantId}codiceTransazione=${codiceTransazione}` +
+        `divisa=${NEXI_EUR_NUMERIC}importo=${importo}timeStamp=${timeStamp}${this.config.macKey}`,
+    );
   }
 
   /**
@@ -462,36 +531,42 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
   }
 
   /**
-   * POSTs a JSON body to an XPay REST endpoint with the configured timeout. Never throws; the
+   * POSTs a JSON body to an XPay REST endpoint with the configured timeout, or with none when `options.timeout` is
+   * `false` (since 2.3.0: the storno, see `refundPayment`; the request then has no `signal`). Never throws; the
    * error never contains the response body.
    */
-  private async postApi(path: string, body: Record<string, string>): Promise<ApiCallResult> {
+  private async postApi(
+    path: string,
+    body: Record<string, unknown>,
+    options: { timeout?: boolean } = {},
+  ): Promise<ApiCallResult> {
     let response: Response;
     try {
       response = await fetch(`${this.apiUrl}${path}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(this.timeoutMs),
+        ...(options.timeout === false ? {} : { signal: AbortSignal.timeout(this.timeoutMs) }),
       });
     } catch (err) {
       const name = err instanceof Error ? err.name : '';
       return {
         ok: false,
+        failure: 'network',
         error: name === 'TimeoutError' || name === 'AbortError' ? 'Nexi API timeout' : 'Nexi API network error',
       };
     }
     if (!response || !response.ok) {
-      return { ok: false, error: `Nexi API error: HTTP ${response?.status}` };
+      return { ok: false, failure: 'http', status: response?.status, error: `Nexi API error: HTTP ${response?.status}` };
     }
     try {
       const json = (await response.json()) as unknown;
       if (json === null || typeof json !== 'object' || Array.isArray(json)) {
-        return { ok: false, error: 'Invalid provider response' };
+        return { ok: false, failure: 'invalid', error: 'Invalid provider response' };
       }
       return { ok: true, json: json as Record<string, unknown> };
     } catch {
-      return { ok: false, error: 'Invalid provider response' };
+      return { ok: false, failure: 'invalid', error: 'Invalid provider response' };
     }
   }
 
@@ -647,6 +722,12 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
 
       if (this.config.group) {
         params.gruppo = this.config.group;
+      }
+
+      // Since 2.3.0, opt-in: XPay captures the transaction as soon as it is authorized, whatever the terminal profile
+      // (manual v20.4 pp. 24-25, 158). Not in the MAC, so the customer can strip it: the payment then follows the profile
+      if (this.config.captureMode === 'immediate') {
+        params.TCONTAB = 'C';
       }
 
       const approvalUrl = `${this.apiUrl}/ecomm/ecomm/DispatcherServlet?${new URLSearchParams(params)}`;
@@ -915,6 +996,24 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
    * (`REFUND_IDEMPOTENCY_NOT_SUPPORTED`). Called directly with one (since 2.2.0), it returns `REFUND_FAILED` without
    * any request, and so it does for `options` that are not `undefined`, `null` or `{ idempotencyKey? }` (typed
    * `unknown` so that a subclass written for 2.1 whose override declared a third parameter of its own keeps compiling).
+   *
+   * Since 2.3.0, by default (`refundApi: 'storna'`), the documented "Storno/rimborso" API (manual v20.4, pp. 613-616):
+   * `POST /ecomm/api/bo/storna`, JSON `{ apiKey, codiceTransazione, importo, divisa: '978', timeStamp, mac }`, EUR only.
+   * - `paymentId` is sent as it is. A partial refund sends `amount` in cents: an invalid amount (`FAILED`) or more than
+   *   8 digits of cents (`REFUND_FAILED`) sends nothing.
+   * - A full refund first reads `situazioneOrdine` (`importo` is mandatory), bounded by `timeoutMs`. Only a paid entry
+   *   (`Autorizzato`, `Contabilizzato`, `Catturato`) with an amount in EUR, and no refunded or partly captured entry,
+   *   is refunded in full, for that amount; anything else is `REFUND_FAILED` without `raw` (the report can contain
+   *   card data), and sends nothing.
+   * - The storno has no timeout: without an idempotency key, a refund that times out could not be retried safely.
+   * - `{ success: true, verified: true, status: 'REFUNDED' }` only for a MAC-verified `esito: 'OK'`; a MAC-verified
+   *   KO with a numeric code other than 97 and 100 is an authenticated refusal (`verified: true`, `REFUND_FAILED`,
+   *   nothing was refunded). Anything else (network or HTTP error, no JSON object, a missing or invalid answer MAC
+   *   whatever the `esito`, a KO 97, 100 or without a numeric code, another `esito`) is uncertain: `success: false`
+   *   with neither `verified` nor `status`, and the refund may exist. Read the order (`getCharge`) or the Nexi back
+   *   office before any retry.
+   *
+   * With `refundApi: 'legacy'` (deprecated, removed in 3.0.0), the 1.0.0-2.2.0 request and result mapping, unchanged.
    */
   async refundPayment(paymentId: string, amount?: number, options?: unknown): Promise<PaymentResult> {
     if (
@@ -929,6 +1028,10 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
     if (!read.ok) {
       return { success: false, status: 'REFUND_FAILED', error: read.error };
     }
+    if (this.config.refundApi !== 'legacy') {
+      return this.refundWithStorna(paymentId, amount);
+    }
+    // refundApi: 'legacy' (deprecated, removed in 3.0.0): the request and result mapping of 1.0.0-2.2.0, unchanged
     try {
       const timestamp = new Date().toISOString();
       // The refund API carries no currency. createPayment accepts only 2-decimal currencies,
@@ -971,6 +1074,136 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
       }
       return this.errorResult(error, 'Failed to refund Nexi payment');
     }
+  }
+
+  /**
+   * Since 2.3.0, `refundApi: 'storna'` (the default): the documented storno, as described on `refundPayment`, called
+   * once the options were checked. Never throws.
+   */
+  private async refundWithStorna(paymentId: string, amount: number | undefined): Promise<PaymentResult> {
+    try {
+      let importo: string;
+      if (amount !== undefined) {
+        // createPayment accepts only 2-decimal currencies, so a partial amount is always in hundredths. Only an omitted
+        // (undefined) amount means a full refund: 0 and null are rejected by toMinorUnits like any invalid amount
+        try {
+          importo = String(toMinorUnits(amount, 'EUR'));
+        } catch (error) {
+          if (isInvalidAmountError(error)) return { success: false, error: error.message, status: 'FAILED' };
+          throw error;
+        }
+      } else {
+        const full = await this.fullRefundImporto(paymentId);
+        if (!full.ok) return full.result;
+        importo = full.importo;
+      }
+      if (importo.length > NEXI_STORNA_MAX_IMPORTO_DIGITS) {
+        return {
+          success: false,
+          status: 'REFUND_FAILED',
+          error: 'Amount exceeds the Nexi limit (8 digits of cents): no refund was sent',
+        };
+      }
+
+      const timeStamp = String(Date.now());
+      const res = await this.postApi(
+        '/ecomm/api/bo/storna',
+        {
+          apiKey: this.config.merchantId,
+          codiceTransazione: paymentId,
+          importo,
+          // The only documented value; a payment in another currency must not be refunded through the library
+          divisa: NEXI_EUR_NUMERIC,
+          timeStamp,
+          mac: this.generateStornaMac(paymentId, importo, timeStamp),
+        },
+        // No idempotency key: a timeout would turn a slow success into an unknown outcome that cannot be retried
+        { timeout: false },
+      );
+      return this.stornaOutcome(res, paymentId);
+    } catch {
+      // Not reached in practice (postApi and the mapping never throw); the refund may have been sent
+      return { success: false, error: 'Nexi refund outcome unknown (unexpected error)' };
+    }
+  }
+
+  /**
+   * Since 2.3.0. `importo` of a full storno, which the API requires: the order's amount, read with `situazioneOrdine`
+   * (`lookupTransaction`, bounded by `timeoutMs`). Only a paid entry (`NEXI_PAID_STATUSES`) with an amount > 0 in EUR,
+   * and no refunded or partly captured entry (`specific`), is refunded in full. The refusals carry no `raw`: the report
+   * can contain card data.
+   */
+  private async fullRefundImporto(
+    paymentId: string,
+  ): Promise<{ ok: true; importo: string } | { ok: false; result: PaymentResult }> {
+    const lookup = await this.lookupTransaction(paymentId);
+    if (lookup.kind === 'error' || lookup.kind === 'absent') {
+      return {
+        ok: false,
+        result: { success: false, status: 'REFUND_FAILED', error: 'Nexi payment could not be read: no refund was sent' },
+      };
+    }
+    // The reported entry, as for getCharge: the first refunded or partly captured one, otherwise the selected one
+    const stato = (lookup.specific?.stato ?? lookup.stato)?.trim();
+    const refused = (): { ok: false; result: PaymentResult } => ({
+      ok: false,
+      result: {
+        success: false,
+        status: 'REFUND_FAILED',
+        error: `Nexi payment cannot be refunded in full (stato ${stato || 'unknown'}): pass the amount; no refund was sent`,
+      },
+    });
+    const paid =
+      lookup.kind === 'paid' &&
+      lookup.specific === undefined &&
+      typeof lookup.stato === 'string' &&
+      NEXI_PAID_STATUSES.has(lookup.stato.trim().toLowerCase());
+    if (!paid || lookup.amount === undefined || !(lookup.amount > 0) || lookup.currency !== 'EUR') return refused();
+    try {
+      return { ok: true, importo: String(toMinorUnits(lookup.amount, 'EUR')) };
+    } catch {
+      return refused();
+    }
+  }
+
+  /**
+   * Since 2.3.0. The answer of `bo/storna`, mapped as documented on `refundPayment`. The answer MAC
+   * (`esito=…idOperazione=…timeStamp=…`, `responseMacValid`) is required whatever the `esito`, a KO included: the
+   * manual marks it mandatory (p. 615), so `responseAuthentic`'s tolerance of an unsigned KO does not apply here.
+   */
+  private stornaOutcome(res: ApiCallResult, paymentId: string): PaymentResult {
+    if (!res.ok) {
+      // The refund may exist: neither verified nor status
+      const why =
+        res.failure === 'http' ? `HTTP ${res.status}` : res.failure === 'invalid' ? 'invalid response' : 'network error';
+      return { success: false, error: `Nexi refund outcome unknown (${why})` };
+    }
+    const json = res.json;
+    if (!this.responseMacValid(json)) {
+      return { success: false, error: 'Nexi refund outcome unknown (response MAC missing or invalid)', raw: json };
+    }
+    const esito = json['esito'];
+    if (esito === 'OK') {
+      // paymentId stays the codTrans, as in 2.2.0 (Nexi's idOperazione is in raw); the answer carries no amount
+      return { success: true, verified: true, paymentId, status: 'REFUNDED', raw: json };
+    }
+    if (esito !== 'KO') {
+      return { success: false, error: `Nexi refund outcome unknown (esito ${shownField(esito)})`, raw: json };
+    }
+    const { codice, messaggio } = this.apiError(json);
+    if (typeof codice !== 'number' || !Number.isInteger(codice) || NEXI_STORNA_UNKNOWN_ERRORS.has(codice)) {
+      // A generic or internal error, or no numeric code: nothing proves that the storno was not made
+      return { success: false, error: `Nexi refund outcome unknown (code ${shownField(codice)})`, raw: json };
+    }
+    // An authenticated refusal: nothing was refunded
+    return {
+      success: false,
+      verified: true,
+      paymentId,
+      status: 'REFUND_FAILED',
+      error: messaggio !== undefined && messaggio.trim() !== '' ? messaggio : `Nexi refused the refund (code ${codice})`,
+      raw: json,
+    };
   }
 
   /**
@@ -1025,6 +1258,8 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
       if (contractType !== undefined) params.tipo_contratto = contractType;
       if (request.notifyUrl) params.urlpost = appendMandateRef(request.notifyUrl, request.mandateRef);
       if (this.config.group) params.gruppo = this.config.group;
+      // Since 2.3.0, opt-in (fragment 426): as on createPayment, unsigned and in none of the setup MACs
+      if (this.config.captureMode === 'immediate') params.TCONTAB = 'C';
 
       return {
         success: true,
@@ -1254,7 +1489,7 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
 
       const numeroContratto = mandate.providerMandateId;
       const timeStamp = String(Date.now());
-      const body: Record<string, string> = {
+      const body: Record<string, unknown> = {
         apiKey: this.config.merchantId,
         numeroContratto,
         codiceTransazione: chargeRef,
@@ -1264,6 +1499,8 @@ export class NexiProvider extends BasePaymentProvider implements IMandateProvide
         mac: this.generateRecurringMac(numeroContratto, chargeRef, importo, timeStamp),
       };
       if (this.config.group) body.codiceGruppo = this.config.group;
+      // Since 2.3.0, opt-in: a field of the parametriAggiuntivi object (p. 190, fragment 427), not in the MAC
+      if (this.config.captureMode === 'immediate') body.parametriAggiuntivi = { TCONTAB: 'C' };
 
       const res = await this.postApi('/ecomm/api/recurring/pagamentoRicorrente', body);
       if (!res.ok) return unknown(res.error);

@@ -156,9 +156,13 @@ describe('money utils (Issue #29)', () => {
       const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: vi.fn().mockResolvedValue({ esito: 'OK' }) });
       globalThis.fetch = fetchMock as any;
       try {
-        await nexi.refundPayment('ORD-1', 5);
+        // The 2.2.0 request, a form body: since 2.3.0 (#51) behind refundApi: 'legacy'
+        await new NexiProvider({ merchantId: 'M', macKey: 'K', refundApi: 'legacy' }).refundPayment('ORD-1', 5);
         const body = fetchMock.mock.calls[0][1].body as URLSearchParams;
         expect(body.get('importo')).toBe('500');
+        // The default since 2.3.0, bo/storna: a JSON body
+        await nexi.refundPayment('ORD-1', 5);
+        expect(JSON.parse(String(fetchMock.mock.calls[1][1].body)).importo).toBe('500');
       } finally {
         globalThis.fetch = originalFetch;
       }
